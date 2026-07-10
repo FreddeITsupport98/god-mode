@@ -273,6 +273,7 @@ if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
 
 $SidAdmin = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
 $SidSystem = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
+$SidUsers = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
 # Network UI restrictions are USER policies (HKCU) -- they gray out the adapter properties UI
 $GpoPath = "HKCU:\Software\Policies\Microsoft\Windows\Network Connections"
 
@@ -637,12 +638,12 @@ function Enable-DNSLock {
         Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid"
         Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
     }
-    Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
-    Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
-    Harden-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
-    Harden-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
-    Harden-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
-    Harden-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
+    $null = Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    $null = Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
+    $null = Harden-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
+    $null = Harden-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
+    $null = Harden-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
+    $null = Harden-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
 
     # Final status verification
     $FailedCount = 0
@@ -704,15 +705,15 @@ function Disable-DNSLock {
     if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
     foreach ($Adapter in $Adapters) {
         $Guid = $Adapter.InterfaceGuid
-        Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid"
-        Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
+        $null = Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid"
+        $null = Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
     }
-    Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
-    Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
-    Restore-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
-    Restore-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
-    Restore-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
-    Restore-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
+    $null = Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    $null = Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
+    $null = Restore-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
+    $null = Restore-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
+    $null = Restore-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
+    $null = Restore-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
 
     foreach ($Adapter in $Adapters) {
         $Guid = $Adapter.InterfaceGuid
@@ -1968,7 +1969,16 @@ function Enable-DangerousMode {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name ConsentPromptBehaviorAdmin -Value 0 -Force
         Write-Log -Message "UAC and Admin Consent prompts disabled." -Type "INFO" -Color Gray
-    } catch { Write-Log -Message "Error disabling UAC: $_" -Type "WARN" -Color Yellow }
+    } catch {
+        Write-Log -Message "Direct UAC disable failed: $_. Trying SYSTEM fallback..." -Type "WARN" -Color Yellow
+        $UacFallback = "reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`" /v EnableLUA /t REG_DWORD /d 0 /f & reg add `"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System`" /v ConsentPromptBehaviorAdmin /t REG_DWORD /d 0 /f"
+        $UacResult = Invoke-AsSystem -Command $UacFallback
+        if ($UacResult.Success) {
+            Write-Log -Message "UAC disabled via SYSTEM fallback." -Type "INFO" -Color Gray
+        } else {
+            Write-Log -Message "SYSTEM fallback for UAC disable failed: $($UacResult.Output)" -Type "WARN" -Color Yellow
+        }
+    }
 
     # 6. Block Windows Update from re-enabling Defender
     try {
@@ -2028,7 +2038,7 @@ function Enable-DangerousMode {
         "SYSTEM\CurrentControlSet\Control\Lsa"
     )
     foreach ($Key in $GodModeRegistryKeys) {
-        Harden-RegistryKey -Path $Key
+        $null = Harden-RegistryKey -Path $Key
     }
     Write-DebugLog -FunctionName "Enable-DangerousMode" -Action "EXIT" -Message "Complete"
 }
@@ -2053,7 +2063,7 @@ function Disable-DangerousMode {
         "SYSTEM\CurrentControlSet\Control\Lsa"
     )
     foreach ($Key in $GodModeRegistryKeys) {
-        Restore-RegistryKey -Path $Key
+        $null = Restore-RegistryKey -Path $Key
     }
 
     # 1. Restore Tamper Protection registry
