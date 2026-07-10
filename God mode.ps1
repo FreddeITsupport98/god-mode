@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode - Aggressive Auto Elevation (When Toggle is ON)
+    God Mode - MAXIMUM Aggressive (Elevates All Programs + System Tools)
 #>
 
 param(
@@ -13,9 +13,8 @@ param(
 )
 
 $ToggleFile   = "C:\Windows\GodMode_Enabled.flag"
-$LastScanFile = "C:\Windows\GodMode_LastScan.txt"
 $LogFile      = "C:\Windows\GodMode_Log.txt"
-$WatcherTask  = "GodMode_AggressiveWatcher"
+$WatcherTask  = "GodMode_MaxAggressive"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -28,8 +27,8 @@ function Set-Toggle {
     param([bool]$Enabled)
     if ($Enabled) {
         "ON" | Out-File $ToggleFile -Force
-        Write-Log "God Mode ENABLED (Aggressive Mode)" "OK"
-        Start-AggressiveWatcher
+        Write-Log "God Mode MAXIMUM AGGRESSIVE ENABLED" "WARN"
+        Start-MaxAggressiveWatcher
     } else {
         Remove-Item $ToggleFile -Force -ErrorAction SilentlyContinue
         Write-Log "God Mode DISABLED" "WARN"
@@ -39,30 +38,30 @@ function Set-Toggle {
 
 function Get-Status {
     if (Test-Path $ToggleFile) {
-        Write-Host "God Mode: ON (Aggressive)" -ForegroundColor Green
+        Write-Host "God Mode: ON (MAXIMUM AGGRESSIVE)" -ForegroundColor Red
     } else {
         Write-Host "God Mode: OFF" -ForegroundColor Yellow
     }
 }
 
-function Start-AggressiveWatcher {
+function Start-MaxAggressiveWatcher {
     Unregister-ScheduledTask -TaskName $WatcherTask -Confirm:$false -ErrorAction SilentlyContinue
 
     $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
-    $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 3) -RepetitionDuration (New-TimeSpan -Days 365)
+    $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 2)
     $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
     Register-ScheduledTask -TaskName $WatcherTask -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
-    Write-Log "Aggressive watcher started (checks every 3 minutes)" "OK"
+    Write-Log "MAXIMUM Aggressive watcher started (every 2 minutes)" "WARN"
 }
 
-function Get-Win32Programs {
+function Get-AllExecutables {
     $paths = @("\( env:ProgramFiles", " \){env:ProgramFiles(x86)}")
     $list = @()
     foreach ($p in $paths) {
         if (Test-Path $p) {
             Get-ChildItem $p -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -gt 100KB } |
+                Where-Object { $_.Length -gt 80KB } |
                 Select-Object -ExpandProperty FullName |
                 ForEach-Object { $list += $_ }
         }
@@ -71,19 +70,15 @@ function Get-Win32Programs {
 }
 
 function Run-AsSystem {
-    param([string]$Path, [string]$Type = "Win32")
-    Write-Log "Auto-elevating as SYSTEM: $Path" "WARN"
-    if ($Type -eq "UWP") {
-        Start-Process explorer.exe -ArgumentList $Path
-    } else {
-        $Action = New-ScheduledTaskAction -Execute $Path
-        $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        \( temp = "GodMode_Temp_ \)([Guid]::NewGuid())"
-        Register-ScheduledTask -TaskName $temp -Action $Action -Principal $Principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $temp
-        Start-Sleep -Seconds 1
-        Unregister-ScheduledTask -TaskName $temp -Confirm:$false
-    }
+    param([string]$Path)
+    Write-Log "MAX ELEVATE: $Path" "WARN"
+    $Action = New-ScheduledTaskAction -Execute $Path
+    $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    \( temp = "GodMode_Temp_ \)([Guid]::NewGuid())"
+    Register-ScheduledTask -TaskName $temp -Action $Action -Principal $Principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $temp
+    Start-Sleep -Milliseconds 600
+    Unregister-ScheduledTask -TaskName $temp -Confirm:$false
 }
 
 function Start-GodMode {
@@ -92,31 +87,27 @@ function Start-GodMode {
         return
     }
 
-    # === Aggressive Auto Elevation ===
-    $programs = Get-Win32Programs
+    Write-Log "MAX AGGRESSIVE SCAN - Elevating all programs + system tools..." "WARN"
 
-    # Elevate new programs
-    if (Test-Path $LastScanFile) {
-        $old = Get-Content $LastScanFile
-        $new = $programs | Where-Object { $_ -notin $old }
-        foreach ($prog in $new) {
-            Run-AsSystem $prog "Win32"
-        }
+    # Elevate ALL existing programs
+    $allPrograms = Get-AllExecutables
+    foreach ($prog in $allPrograms) {
+        Run-AsSystem $prog
     }
-    $programs | Out-File $LastScanFile -Force
 
-    # Also try to elevate important system tools periodically
+    # Also elevate important system tools
     $systemTools = @(
         "$env:SystemRoot\explorer.exe",
         "$env:SystemRoot\System32\cmd.exe",
         "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
         "$env:SystemRoot\regedit.exe",
-        "$env:SystemRoot\System32\taskmgr.exe"
+        "$env:SystemRoot\System32\taskmgr.exe",
+        "$env:SystemRoot\System32\services.msc"
     )
 
     foreach ($tool in $systemTools) {
         if (Test-Path $tool) {
-            Run-AsSystem $tool "Win32"
+            Run-AsSystem $tool
         }
     }
 }
@@ -129,12 +120,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE (Aggressive) ===" -ForegroundColor Red
+    Write-Host "`n=== GOD MODE - MAXIMUM AGGRESSIVE ===" -ForegroundColor Red
     Write-Host "Commands:"
-    Write-Host "  -ToggleOn     Enable aggressive auto-elevation"
-    Write-Host "  -ToggleOff    Disable God Mode"
+    Write-Host "  -ToggleOn     Enable MAXIMUM aggressive mode"
+    Write-Host "  -ToggleOff    Disable"
     Write-Host "  -Status       Check status"
-    Write-Host "  -Launch       Manual trigger of aggressive elevation"
+    Write-Host "  -Launch       Manual aggressive elevation of ALL programs"
     Write-Host ""
-    Write-Host "When ON: Auto-elevates new programs + important system tools every 3 minutes." -ForegroundColor Yellow
+    Write-Host "WARNING: This will try to elevate almost everything as SYSTEM every 2 minutes." -ForegroundColor Yellow
 }
