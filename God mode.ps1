@@ -2,15 +2,14 @@
 
 <#
 .SYNOPSIS
-    God Mode v12.3 - Weaknesses Improved
+    God Mode v12.4 - With Auto-Recovery
 #>
 
 param(
     [switch]$ToggleOn,
     [switch]$ToggleOff,
     [switch]$Status,
-    [switch]$Launch,
-    [switch]$Verbose
+    [switch]$Launch
 )
 
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
@@ -24,7 +23,7 @@ function Test-BuiltInAdmin {
 }
 
 if (-not (Test-BuiltInAdmin) -and -not $Status) {
-    Write-Host "`n[ACCESS DENIED] Only Built-in Administrator can use this tool.`n" -ForegroundColor Red
+    Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use this tool.`n" -ForegroundColor Red
     exit 1
 }
 
@@ -32,13 +31,9 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
-    
-    if ($Verbose -or $Level -in @("ERROR", "WARN")) {
-        Write-Host "[$timestamp] [$Level] $Message"
-    }
 }
 
-# Dangerous Settings
+# Dangerous Mode
 function Enable-DangerousMode {
     Write-Log "Enabling dangerous mode..." "WARN"
     try {
@@ -89,7 +84,7 @@ function Unregister-StealthTask {
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# Improved Elevation with Duplicate Prevention
+# Elevation
 function Elevate-Process {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return }
@@ -111,21 +106,21 @@ function Elevate-Process {
     }
 }
 
-# Improved Monitoring Loop
+# Monitoring Loop with Auto-Recovery
 function Start-Monitoring {
     if (-not (Test-Path $FlagFile)) {
         Write-Log "God Mode is not enabled." "ERROR"
         return
     }
 
-    Write-Log "Monitoring started." "INFO"
+    Write-Log "Monitoring started with auto-recovery." "INFO"
 
     $lastElevated = @{}
 
     while ($true) {
-        Start-Sleep -Seconds 2
-
         try {
+            Start-Sleep -Seconds 2
+
             $newProcesses = Get-WmiObject Win32_Process | Where-Object {
                 $_.CreationDate -and 
                 ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-10)
@@ -135,7 +130,6 @@ function Start-Monitoring {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
                     $path = $proc.ExecutablePath
 
-                    # Improved duplicate prevention (30-second cooldown)
                     if (-not $lastElevated.ContainsKey($path) -or 
                         $lastElevated[$path] -lt (Get-Date).AddSeconds(-30)) {
 
@@ -146,7 +140,7 @@ function Start-Monitoring {
             }
         }
         catch {
-            Write-Log "Monitoring error (recovering...): $_" "ERROR"
+            Write-Log "Monitoring crashed. Restarting in 5 seconds... Error: $_" "ERROR"
             Start-Sleep -Seconds 5
         }
     }
@@ -175,10 +169,10 @@ function Show-Status {
     }
 }
 
-# Interactive Menu
+# Menu
 function Show-Menu {
     Clear-Host
-    Write-Host "=== GOD MODE v12.3 ===" -ForegroundColor Cyan
+    Write-Host "=== GOD MODE v12.4 ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "1. Enable God Mode"
     Write-Host "2. Disable God Mode"
