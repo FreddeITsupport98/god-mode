@@ -1054,13 +1054,13 @@ function Invoke-AsSystem {
 cd /d $CommonTemp
 $Command
 if %errorlevel% equ 0 (
-    echo ___SUCCESS___ > "$ResultFile"
+    echo ___SUCCESS___
 ) else (
-    echo ___FAILED___ > "$ResultFile"
+    echo ___FAILED___
 )
 "@
         $BatchContent | Out-File -FilePath $BatchFile -Encoding ASCII -Force
-        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile`""
+        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile`" > `"$ResultFile`" 2>&1"
         $Principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $TempTaskName -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $TempTaskName
@@ -1353,7 +1353,7 @@ function Uninstall-GodModePersistence {
             Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop
         } catch {
             Write-Log -Message "Direct deletion failed for $GodModeInstallDir. Trying SYSTEM cleanup..." -Type "INFO" -Color Yellow
-            $SystemCmd = "cmd /c del /f /q `"$GodModeInstallScript`" 2>nul & cmd /c rd /s /q `"$GodModeInstallDir`" 2>nul"
+            $SystemCmd = "takeown /F `"$GodModeInstallDir`" /R /D Y & icacls `"$GodModeInstallDir`" /reset /T /C /Q & cmd /c rd /s /q `"$GodModeInstallDir`" 2>nul"
             $Result = Invoke-AsSystem -Command $SystemCmd
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $GodModeInstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
@@ -1478,7 +1478,7 @@ function Uninstall-Persistence {
             Write-Log -Message "Installation directory removed." -Type "INFO" -Color Gray
         } catch {
             Write-Log -Message "Direct deletion failed (hardened ACLs). Spawning SYSTEM cleanup task..." -Type "INFO" -Color Yellow
-            $SystemCmd = "cmd /c del /f /q `"$InstallScript`" 2>nul & cmd /c rd /s /q `"$InstallDir`" 2>nul"
+            $SystemCmd = "takeown /F `"$InstallDir`" /R /D Y & icacls `"$InstallDir`" /reset /T /C /Q & cmd /c rd /s /q `"$InstallDir`" 2>nul"
             $Result = Invoke-AsSystem -Command $SystemCmd
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $InstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
