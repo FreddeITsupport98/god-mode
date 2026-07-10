@@ -946,51 +946,59 @@ function Install-Persistence {
 }
 
 function Invoke-AsSystem {
-    param([string]$Command)
-    $TempTaskName = "DNSGuard-Uninstall-Helper"
+    param(
+        [string]$Command,
+        [int]$MaxWaitSeconds = 30
+    )
+    $TaskId = Get-Random -Minimum 10000 -Maximum 99999
+    $TempTaskName = "DNSGuard-Helper_$TaskId"
     $CommonTemp = "C:\Windows\Temp"
-    $ResultFile = "$CommonTemp\DNSGuard_CleanupResult.txt"
-    $TempScript = "$CommonTemp\DNSGuard_Cleanup.ps1"
-    Write-Log -Message "[DEBUG] Invoke-AsSystem called. CommonTemp=$CommonTemp" -Type "INFO" -Color Yellow
+    $ResultFile = "$CommonTemp\DNSGuard_Result_$TaskId.txt"
+    $TempScript = "$CommonTemp\DNSGuard_Script_$TaskId.ps1"
+    Write-Log -Message "[DEBUG] Invoke-AsSystem called (TaskId=$TaskId)." -Type "INFO" -Color Yellow
     try {
-        # Ensure SYSTEM can write to the common temp directory
-        $TempAcl = Get-Acl -Path $CommonTemp
-        $SystemSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-18")
-        $TempAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SystemSid, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
-        Set-Acl -Path $CommonTemp -AclObject $TempAcl -ErrorAction SilentlyContinue
-        # Write the cleanup command to a temporary script file with error capture
-        $ScriptContent = "try { `$ErrorActionPreference = 'Stop'; $Command; 'SUCCESS' | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Force } catch { `$_.Exception.Message | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Force }"
+        $ScriptContent = @"
+try { `$ErrorActionPreference = 'Stop'; $Command; '___SUCCESS___' | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Append -Force } catch { `$_.Exception.Message | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Force }
+"@
         $ScriptContent | Out-File -FilePath $TempScript -Encoding UTF8 -Force
-        Write-Log -Message "[DEBUG] Temp script written to $TempScript" -Type "INFO" -Color Yellow
-        # Use full PowerShell path and execute the temp script
         $Action = New-ScheduledTaskAction -Execute "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$TempScript`""
         $Principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $TempTaskName -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $TempTaskName
-        Write-Log -Message "[DEBUG] SYSTEM task started. Waiting for completion..." -Type "INFO" -Color Yellow
-        # Wait up to 30 seconds, checking every 2 seconds if the task is still registered
-        $MaxWait = 30
         $Waited = 0
-        while ($Waited -lt $MaxWait) {
-            Start-Sleep -Seconds 2
-            $Waited += 2
-            $Task = Get-ScheduledTask -TaskName $TempTaskName -ErrorAction SilentlyContinue
-            if (-not $Task) { break }
+        $Completed = $false
+        while ($Waited -lt $MaxWaitSeconds) {
+            Start-Sleep -Seconds 1
+            $Waited++
+            if (Test-Path $ResultFile) {
+                $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
+                if ($ResultText -and $ResultText.Contains("___SUCCESS___")) {
+                    $Completed = $true
+                    break
+                }
+            }
         }
-        Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false | Out-Null
-        Write-Log -Message "[DEBUG] SYSTEM task completed and unregistered." -Type "INFO" -Color Yellow
-        # Read and display the result
+        Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        $Output = ""
         if (Test-Path $ResultFile) {
-            $Result = Get-Content -Path $ResultFile -Raw
-            Write-Log -Message "[DEBUG] SYSTEM task result: $Result" -Type "INFO" -Color Yellow
+            $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
+            $Output = ($ResultText -replace "___SUCCESS___", "").Trim()
             Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
-        } else {
-            Write-Log -Message "[DEBUG] No result file found at $ResultFile" -Type "ERROR" -Color Red
         }
-        # Clean up the temp script
         Remove-Item -Path $TempScript -Force -ErrorAction SilentlyContinue
+        if ($Completed) {
+            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName completed successfully." -Type "INFO" -Color Yellow
+            return [PSCustomObject]@{ Success = $true; Output = $Output }
+        } else {
+            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName did not complete within $MaxWaitSeconds seconds. Output: $Output" -Type "ERROR" -Color Red
+            return [PSCustomObject]@{ Success = $false; Output = $Output }
+        }
     } catch {
         Write-Log -Message "SYSTEM helper task failed: $_" -Type "ERROR" -Color Red
+        Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+        Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $TempScript -Force -ErrorAction SilentlyContinue
+        return [PSCustomObject]@{ Success = $false; Output = "" }
     }
 }
 
@@ -1196,7 +1204,10 @@ function Uninstall-GodModePersistence {
             Set-Acl -Path $GodModeCmdPath -AclObject $CmdAcl -ErrorAction Stop
             Remove-Item -Path $GodModeCmdPath -Force -ErrorAction Stop
         } catch {
-            Invoke-AsSystem -Command "takeown.exe /F $GodModeCmdPath; icacls.exe $GodModeCmdPath /reset; Remove-Item -Path $GodModeCmdPath -Force -ErrorAction Stop"
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$GodModeCmdPath`"; icacls.exe `"$GodModeCmdPath`" /reset; cmd /c del /f /q `"$GodModeCmdPath`""
+            if (-not $Result.Success) {
+                Write-Log -Message "SYSTEM cleanup failed for $GodModeCmdPath. Output: $($Result.Output)" -Type "ERROR" -Color Red
+            }
         }
         if (Test-Path $GodModeCmdPath) {
             Write-Log -Message "Failed to remove godmode CLI." -Type "ERROR" -Color Red
@@ -1220,8 +1231,10 @@ function Uninstall-GodModePersistence {
         try {
             Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop
         } catch {
-            Invoke-AsSystem -Command "takeown.exe /F $GodModeInstallDir /R /D Y; icacls.exe $GodModeInstallDir /reset /T; Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop"
-            Start-Sleep -Seconds 3
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$GodModeInstallDir`" /R /D Y; icacls.exe `"$GodModeInstallDir`" /reset /T; cmd /c rd /s /q `"$GodModeInstallDir`""
+            if (-not $Result.Success) {
+                Write-Log -Message "SYSTEM cleanup failed for $GodModeInstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
+            }
         }
         if (Test-Path $GodModeInstallDir) {
             Write-Log -Message "SYSTEM cleanup failed: $GodModeInstallDir still exists." -Type "ERROR" -Color Red
@@ -1301,7 +1314,10 @@ function Uninstall-Persistence {
             Remove-Item -Path $CmdPath -Force -ErrorAction Stop
         } catch {
             Write-Log -Message "Direct deletion failed for $CmdPath. Spawning SYSTEM cleanup task..." -Type "INFO" -Color Yellow
-            Invoke-AsSystem -Command "takeown.exe /F $CmdPath; icacls.exe $CmdPath /reset; Remove-Item -Path $CmdPath -Force -ErrorAction Stop"
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$CmdPath`"; icacls.exe `"$CmdPath`" /reset; cmd /c del /f /q `"$CmdPath`""
+            if (-not $Result.Success) {
+                Write-Log -Message "SYSTEM cleanup failed for $CmdPath. Output: $($Result.Output)" -Type "ERROR" -Color Red
+            }
         }
         if (Test-Path $CmdPath) {
             Write-Log -Message "Failed to remove 'dnslock' CLI Alias at $CmdPath." -Type "ERROR" -Color Red
@@ -1332,8 +1348,10 @@ function Uninstall-Persistence {
             Write-Log -Message "Installation directory removed." -Type "INFO" -Color Gray
         } catch {
             Write-Log -Message "Direct deletion failed (hardened ACLs). Spawning SYSTEM cleanup task..." -Type "INFO" -Color Yellow
-            Invoke-AsSystem -Command "takeown.exe /F $InstallDir /R /D Y; icacls.exe $InstallDir /reset /T; Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction Stop"
-            Start-Sleep -Seconds 3
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$InstallDir`" /R /D Y; icacls.exe `"$InstallDir`" /reset /T; cmd /c rd /s /q `"$InstallDir`""
+            if (-not $Result.Success) {
+                Write-Log -Message "SYSTEM cleanup failed for $InstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
+            }
             if (Test-Path $InstallDir) {
                 Write-Log -Message "SYSTEM cleanup failed: $InstallDir still exists." -Type "ERROR" -Color Red
                 Write-Log -Message "[DEBUG] Directory contents: $(Get-ChildItem -Path $InstallDir -Force | Select-Object Name | Out-String)" -Type "ERROR" -Color Red
@@ -1377,6 +1395,27 @@ function Uninstall-Persistence {
 function Test-BuiltInAdmin {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     return ($sid -like "*-500")
+}
+
+function Test-SystemContext {
+    Write-Host "`n[VERIFY] Running whoami as SYSTEM..." -ForegroundColor Cyan
+    $Result = Invoke-AsSystem -Command "whoami; whoami /groups"
+    if ($Result.Success -and $Result.Output) {
+        Write-Host "[SUCCESS] SYSTEM context verified:" -ForegroundColor Green
+        Write-Host $Result.Output -ForegroundColor Green
+    } else {
+        Write-Host "[FAIL] Could not verify SYSTEM context." -ForegroundColor Red
+        if ($Result.Output) { Write-Host "Output: $($Result.Output)" -ForegroundColor Yellow }
+    }
+    Write-Host "`n[NOTE] Your current session runs as Administrator. God Mode does not change your user account." -ForegroundColor DarkGray
+    Write-Host "       The SYSTEM context is only used for background tasks and hardened cleanup operations." -ForegroundColor DarkGray
+}
+
+function Get-CurrentUserSidInfo {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $isAdmin = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+    $adminCheck = $isAdmin.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    return [PSCustomObject]@{ SID = $sid; IsAdmin = $adminCheck; IsBuiltInAdmin = ($sid -like "*-500") }
 }
 
 # --- Helper: Add Defender Exclusion ---
@@ -2726,14 +2765,18 @@ if ($Uninstall) {
 # God Mode CLI Handlers
 if ($ToggleOn) {
     if (-not (Test-BuiltInAdmin)) {
-        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
         Exit 1
     }
     Enable-GodMode; Exit
 }
 if ($ToggleOff) {
     if (-not (Test-BuiltInAdmin)) {
-        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
         Exit 1
     }
     Disable-GodMode; Exit
@@ -2741,21 +2784,27 @@ if ($ToggleOff) {
 if ($GodModeStatus) { Show-GodModeStatus; Exit }
 if ($Launch) {
     if (-not (Test-BuiltInAdmin)) {
-        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
         Exit 1
     }
     Start-Monitoring; Exit
 }
 if ($InstallGodMode) {
     if (-not (Test-BuiltInAdmin)) {
-        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can install God Mode.`n" -ForegroundColor Red
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can install God Mode.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
         Exit 1
     }
     Install-GodModePersistence; Exit
 }
 if ($UninstallGodMode) {
     if (-not (Test-BuiltInAdmin)) {
-        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can uninstall God Mode.`n" -ForegroundColor Red
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can uninstall God Mode.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
         Exit 1
     }
     Uninstall-GodModePersistence; Exit
@@ -2826,8 +2875,10 @@ do {
     Write-Host "[11] DUMP LOGS TO DESKTOP" -ForegroundColor Cyan
     Write-Host "[12] EXIT TERMINAL" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[13] VERIFY SYSTEM CONTEXT" -ForegroundColor Cyan
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-12)"
+    $Choice = Read-Host "Select an administrative action (1-13)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -2868,7 +2919,9 @@ do {
         }
         "6" {
             if (-not (Test-BuiltInAdmin)) {
-                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
                 if (-not (Test-Path $GodModeInstallDir)) {
                     Install-GodModePersistence
@@ -2882,7 +2935,9 @@ do {
         }
         "7" {
             if (-not (Test-BuiltInAdmin)) {
-                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
                 Enable-GodMode
                 Write-Host "God Mode enabled." -ForegroundColor Green
@@ -2891,7 +2946,9 @@ do {
         }
         "8" {
             if (-not (Test-BuiltInAdmin)) {
-                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
                 Disable-GodMode
                 Write-Host "God Mode disabled." -ForegroundColor Yellow
@@ -2899,9 +2956,12 @@ do {
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "9" { Show-GodModeStatus; Start-Sleep -Seconds 2 }
+        "13" { Test-SystemContext; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "10" {
             if (-not (Test-BuiltInAdmin)) {
-                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can launch the God Mode Monitor.`n" -ForegroundColor Red
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can launch the God Mode Monitor.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
                 Write-Host "`n[WARNING] Launching God Mode Monitor will start a persistent loop that elevates" -ForegroundColor Yellow
                 Write-Host "          all new processes and kills security services. This is IRREVERSIBLE" -ForegroundColor Yellow

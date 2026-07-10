@@ -35,6 +35,13 @@ All notable changes to this project will be documented in this file.
 - `reagentc` calls replaced with `cmd /c "reagentc.exe /disable"` and `cmd /c "reagentc.exe /enable"` to fix "not recognized" errors in PowerShell 7.
 - `Get-BitLockerVolume` call in `Disable-BitLocker` now guarded with `Get-Command` to skip suspension when the BitLocker module is not present.
 - `Invoke-StealthMode` removed the read-only `$Proc.MainWindowTitle` assignment, which caused a runtime property-assignment error.
+- `Invoke-AsSystem` completely rewritten for reliability: unique task/script/result IDs per invocation, result-file polling instead of fixed 30-second waits, explicit `[PSCustomObject]@{Success; Output}` return value, and robust cleanup of temp artifacts even on failure.
+- All `Invoke-AsSystem` callers (`Uninstall-GodModePersistence`, `Uninstall-Persistence`) updated to check the returned success flag and log output on failure.
+- Hardened-file cleanup commands switched from `Remove-Item` to `cmd /c del /f /q` (files) and `cmd /c rd /s /q` (directories) for better reliability when SYSTEM executes them.
+- Added `Test-SystemContext` function and menu option `[13] VERIFY SYSTEM CONTEXT` — runs `whoami` and `whoami /groups` as SYSTEM via `Invoke-AsSystem` and displays the live output, proving SYSTEM execution works.
+- Added `Get-CurrentUserSidInfo` helper that returns current SID, `IsAdmin`, and `IsBuiltInAdmin` flags.
+- All `Test-BuiltInAdmin` access-denied messages (CLI handlers and interactive menu) now print the actual SID, admin status, and built-in admin status so users can see exactly why they are blocked.
+- Menu prompt updated from `(1-12)` to `(1-13)` to reflect the new option.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.
