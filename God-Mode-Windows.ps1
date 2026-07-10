@@ -2342,7 +2342,189 @@ function Show-GodModeStatus {
         Write-Host "  Original Payload        : UNKNOWN" -ForegroundColor DarkGray
     }
 
+    # Stealth Mode
+    try {
+        $Sbl = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -ErrorAction SilentlyContinue
+        $Trans = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "EnableTranscripting" -ErrorAction SilentlyContinue
+        $ModLog = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Name "EnableModuleLogging" -ErrorAction SilentlyContinue
+        if (($Sbl -and $Sbl.EnableScriptBlockLogging -eq 0) -and ($Trans -and $Trans.EnableTranscripting -eq 0) -and ($ModLog -and $ModLog.EnableModuleLogging -eq 0)) {
+            Write-Host "  Stealth Mode            : ACTIVE (Logging suppressed)" -ForegroundColor Green
+        } else {
+            Write-Host "  Stealth Mode            : INACTIVE" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Stealth Mode            : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Deep Persistence
+    try {
+        $DeepReg1 = Get-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -ErrorAction SilentlyContinue
+        $DeepReg2 = Get-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -ErrorAction SilentlyContinue
+        $DeepTaskCount = 0
+        foreach ($Prefix in @("WindowsDefenderSigUpdates_*", "OneDriveStandaloneUpdater_*", "EdgeWebView2Updater_*")) {
+            $DeepTaskCount += (Get-ScheduledTask -TaskName $Prefix -ErrorAction SilentlyContinue | Measure-Object).Count
+        }
+        $DeepWmi = Get-WmiObject -Class __EventFilter -Namespace "root\subscription" -Filter "Name='Win32BootHealthCheck'" -ErrorAction SilentlyContinue
+        if ($DeepReg1 -or $DeepReg2 -or $DeepTaskCount -gt 0 -or $DeepWmi) {
+            Write-Host "  Deep Persistence        : ACTIVE ($DeepTaskCount tasks, WMI:$([bool]$DeepWmi))" -ForegroundColor Green
+        } else {
+            Write-Host "  Deep Persistence        : NOT ACTIVE" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Deep Persistence        : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Broader Security Subsystems
+    # AppLocker
+    try {
+        $AppL = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2" -Name "EnforcementMode" -ErrorAction SilentlyContinue
+        if ($AppL -and $AppL.EnforcementMode -eq 0) {
+            Write-Host "  AppLocker               : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  AppLocker               : ENFORCED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  AppLocker               : UNKNOWN" -ForegroundColor DarkGray }
+
+    # Windows Sandbox / HVCI
+    try {
+        $Hvci = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "Enabled" -ErrorAction SilentlyContinue
+        if ($Hvci -and $Hvci.Enabled -eq 0) {
+            Write-Host "  Windows Sandbox / HVCI  : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  Windows Sandbox / HVCI  : ENABLED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  Windows Sandbox / HVCI  : UNKNOWN" -ForegroundColor DarkGray }
+
+    # LSA Protection
+    try {
+        $LsaPPL = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -ErrorAction SilentlyContinue
+        if ($LsaPPL -and $LsaPPL.RunAsPPL -eq 0) {
+            Write-Host "  LSA Protection          : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  LSA Protection          : ENABLED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  LSA Protection          : UNKNOWN" -ForegroundColor DarkGray }
+
+    # BitLocker
+    try {
+        $BlOn = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.ProtectionStatus -eq 'On' }
+        if ($BlOn) {
+            Write-Host "  BitLocker               : PROTECTED (On)" -ForegroundColor Red
+        } else {
+            Write-Host "  BitLocker               : SUSPENDED / OFF" -ForegroundColor Green
+        }
+    } catch { Write-Host "  BitLocker               : UNKNOWN" -ForegroundColor DarkGray }
+
+    # ASR
+    try {
+        $Asr = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($Asr -and ($Asr.AttackSurfaceReductionRules_Actions -eq $null -or $Asr.AttackSurfaceReductionRules_Actions.Count -eq 0)) {
+            Write-Host "  ASR Rules               : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  ASR Rules               : ENABLED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  ASR Rules               : UNKNOWN" -ForegroundColor DarkGray }
+
+    # Controlled Folder Access
+    try {
+        $Cfa = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($Cfa -and $Cfa.EnableControlledFolderAccess -eq 'Disabled') {
+            Write-Host "  Controlled Folder Access: DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  Controlled Folder Access: ENABLED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  Controlled Folder Access: UNKNOWN" -ForegroundColor DarkGray }
+
+    # Exploit Guard / Network Protection
+    try {
+        $Np = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($Np -and ($Np.EnableNetworkProtection -eq 'AuditMode' -or $Np.EnableNetworkProtection -eq 0)) {
+            Write-Host "  Exploit Guard / NetProt : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  Exploit Guard / NetProt : ENABLED" -ForegroundColor Red
+        }
+    } catch { Write-Host "  Exploit Guard / NetProt : UNKNOWN" -ForegroundColor DarkGray }
+
+    # Anti-Forensics
+    try {
+        $Shadows = (& vssadmin list shadows 2>$null) | Out-String
+        $ShadowsCleared = ($Shadows -notmatch "Shadow Copy")
+        $UsnCleared = $false
+        try { $Usn = (& fsutil usn queryjournal C: 2>$null); if (-not $Usn) { $UsnCleared = $true } } catch { $UsnCleared = $true }
+        $DumpsExist = (Test-Path "C:\Windows\Minidump\*") -or (Test-Path "C:\Windows\Memory.dmp")
+        $HistPath = $null
+        try { $HistPath = (Get-PSReadlineOption -ErrorAction SilentlyContinue).HistorySavePath } catch {}
+        $HistoryExists = $HistPath -and (Test-Path $HistPath)
+        $RecentExists = (Test-Path "$env:APPDATA\Microsoft\Windows\Recent\*")
+        if ($ShadowsCleared -and $UsnCleared -and -not $DumpsExist -and -not $HistoryExists -and -not $RecentExists) {
+            Write-Host "  Anti-Forensics          : CLEARED (Shadows, USN, Dumps, History, Recent)" -ForegroundColor Green
+        } else {
+            $AFParts = @()
+            if (-not $ShadowsCleared) { $AFParts += "Shadows" }
+            if (-not $UsnCleared) { $AFParts += "USN" }
+            if ($DumpsExist) { $AFParts += "Dumps" }
+            if ($HistoryExists) { $AFParts += "History" }
+            if ($RecentExists) { $AFParts += "Recent" }
+            Write-Host "  Anti-Forensics          : PARTIAL (present: $($AFParts -join ', '))" -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  Anti-Forensics          : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Registry ACL Hardening (representative check)
+    try {
+        $RepKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection"
+        $HasDeny = $false
+        if (Test-Path $RepKey) {
+            $Acl = Get-Acl -Path $RepKey -ErrorAction SilentlyContinue
+            if ($Acl) {
+                foreach ($Rule in $Acl.Access) {
+                    if ($Rule.AccessControlType -eq 'Deny' -and ($Rule.IdentityReference.Value -match 'Administrators|Everyone|Authenticated Users')) {
+                        $HasDeny = $true
+                        break
+                    }
+                }
+            }
+        }
+        if ($HasDeny) {
+            Write-Host "  Registry ACL Hardening  : ACTIVE (Deny rules present)" -ForegroundColor Green
+        } else {
+            Write-Host "  Registry ACL Hardening  : INACTIVE" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Registry ACL Hardening  : UNKNOWN" -ForegroundColor DarkGray
+    }
+
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+}
+
+function Get-QuickDNSLockStatus {
+    $Adapters = Get-NetAdapter -IncludeHidden:$false -ErrorAction SilentlyContinue
+    if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
+    $SidAdmin = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    foreach ($Adapter in $Adapters) {
+        $Guid = $Adapter.InterfaceGuid
+        $SubKeyPaths = @(
+            "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid",
+            "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
+        )
+        foreach ($SubKeyPath in $SubKeyPaths) {
+            try {
+                $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey($SubKeyPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadSubTree, [System.Security.AccessControl.RegistryRights]::ReadPermissions)
+                if ($RegKey) {
+                    $Acl = $RegKey.GetAccessControl()
+                    foreach ($Rule in $Acl.Access) {
+                        try {
+                            $RuleSid = $Rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+                            if (($RuleSid.Value -eq $SidAdmin.Value) -and $Rule.AccessControlType -eq "Deny") { return $true }
+                        } catch {}
+                    }
+                    $RegKey.Close()
+                }
+            } catch {}
+        }
+    }
+    return $false
 }
 
 # ============================================================================
@@ -2463,7 +2645,27 @@ do {
     Write-Host "   ENTERPRISE DNS LOCKOUT SUITE (INSTALLER EDITION)  " -ForegroundColor Cyan
     Write-Host "=====================================================" -ForegroundColor Cyan
 
-    $CurrentStatus = Get-DNSLockStatus
+    # Quick system status header
+    $QuickGodMode = if (Test-Path $GodModeFlagFile) { "ACTIVE" } else { "INACTIVE" }
+    $QuickGodModeColor = if (Test-Path $GodModeFlagFile) { "Red" } else { "Green" }
+    $QuickDNS = Get-QuickDNSLockStatus
+    $QuickDNSText = if ($QuickDNS) { "LOCKED" } else { "UNLOCKED" }
+    $QuickDNSColor = if ($QuickDNS) { "Red" } else { "Green" }
+    $QuickIntegrity = Test-IntegrityStatus
+    $QuickIntColor = "DarkGray"; $QuickIntText = "N/A"
+    if ($QuickIntegrity -eq $true) { $QuickIntColor = "Green"; $QuickIntText = "VERIFIED" }
+    if ($QuickIntegrity -eq $false) { $QuickIntColor = "Red"; $QuickIntText = "TAMPERED" }
+    $QuickAdmin = if (Test-BuiltInAdmin) { "YES" } else { "NO" }
+    $QuickAdminColor = if (Test-BuiltInAdmin) { "Green" } else { "Yellow" }
+    Write-Host "  God Mode: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $QuickGodMode -NoNewline -ForegroundColor $QuickGodModeColor
+    Write-Host "  |  DNS Lock: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $QuickDNSText -NoNewline -ForegroundColor $QuickDNSColor
+    Write-Host "  |  Integrity: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $QuickIntText -NoNewline -ForegroundColor $QuickIntColor
+    Write-Host "  |  Built-in Admin: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $QuickAdmin -ForegroundColor $QuickAdminColor
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
     Write-Host "`n-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  DNS PROTECTION    " -ForegroundColor Cyan
@@ -2532,7 +2734,11 @@ do {
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "4" { Uninstall-Persistence; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
-        "5" { Start-Sleep -Milliseconds 200 }
+        "5" {
+            Show-GodModeStatus
+            Get-DNSLockStatus | Out-Null
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
         "6" {
             if (-not (Test-BuiltInAdmin)) {
                 Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
