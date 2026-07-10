@@ -1291,12 +1291,26 @@ function Uninstall-GodModePersistence {
                 Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
         } catch { }
     }
+    # Remove deep persistence backup tasks
+    $DeepPrefixes = @("WindowsDefenderSigUpdates_", "OneDriveStandaloneUpdater_", "EdgeWebView2Updater_")
+    foreach ($Prefix in $DeepPrefixes) {
+        try {
+            Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue |
+                Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        } catch { }
+    }
 
     # Remove registry persistence
     try {
         Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
         Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
     } catch { Write-Log -Message "Failed to remove registry persistence: $_" -Type "WARN" -Color Yellow }
+
+    # Remove deep persistence registry keys
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Failed to remove deep persistence registry: $_" -Type "WARN" -Color Yellow }
 
     # Remove global CLI
     if (Test-Path $GodModeCmdPath) {
@@ -2397,6 +2411,15 @@ function Disable-GodMode {
         Write-Log -Message "WMI persistence removed." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "WMI cleanup failed: $_" -Type "WARN" -Color Yellow }
 
+    # --- Cleanup deep persistence WMI ---
+    try {
+        $DeepWmiName = "Win32BootHealthCheck"
+        Get-WmiObject -Class __EventFilter -Namespace "root\subscription" -Filter "Name='$DeepWmiName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Get-WmiObject -Class CommandLineEventConsumer -Namespace "root\subscription" -Filter "Name='$DeepWmiName'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Get-WmiObject -Class __FilterToConsumerBinding -Namespace "root\subscription" -Filter "__PATH LIKE '%$DeepWmiName%'" -ErrorAction SilentlyContinue | Remove-WmiObject -ErrorAction SilentlyContinue
+        Write-Log -Message "Deep persistence WMI removed." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Deep persistence WMI cleanup failed: $_" -Type "WARN" -Color Yellow }
+
     Write-Log -Message "God Mode DISABLED" -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Disable-GodMode" -Action "EXIT" -Message "Success"
 }
@@ -2433,6 +2456,17 @@ function Show-GodModeStatus {
     }
 
     # Stealth task status
+    # Main God Mode tasks
+    $MainTask = Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue
+    $GuardianTask = Get-ScheduledTask -TaskName $GodModeGuardianName -ErrorAction SilentlyContinue
+    if ($MainTask -and $GuardianTask) {
+        Write-Host "  Main Task + Guardian    : INSTALLED" -ForegroundColor Cyan
+    } elseif ($MainTask -or $GuardianTask) {
+        Write-Host "  Main Task + Guardian    : PARTIAL (1 missing)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Main Task + Guardian    : NOT INSTALLED" -ForegroundColor DarkGray
+    }
+
     $StealthTasks = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue
     if ($StealthTasks) {
         Write-Host "  Stealth Task            : INSTALLED ($($StealthTasks.Count) found)" -ForegroundColor Cyan
@@ -2684,7 +2718,8 @@ function Show-GodModeStatus {
         }
         $DeepWmi = Get-WmiObject -Class __EventFilter -Namespace "root\subscription" -Filter "Name='Win32BootHealthCheck'" -ErrorAction SilentlyContinue
         if ($DeepReg1 -or $DeepReg2 -or $DeepTaskCount -gt 0 -or $DeepWmi) {
-            Write-Host "  Deep Persistence        : ACTIVE ($DeepTaskCount tasks, WMI:$([bool]$DeepWmi))" -ForegroundColor Green
+            $Color = if ($DeepTaskCount -gt 5) { "Yellow" } else { "Green" }
+            Write-Host "  Deep Persistence        : ACTIVE ($DeepTaskCount tasks, WMI:$([bool]$DeepWmi))" -ForegroundColor $Color
         } else {
             Write-Host "  Deep Persistence        : NOT ACTIVE" -ForegroundColor Red
         }
