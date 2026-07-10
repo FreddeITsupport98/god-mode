@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode v4 - Win32 + Windows Apps Auto Elevation + Easy Menu (VM Testing)
+    God Mode - Clean Single List (All Programs + System Apps)
 #>
 
 param(
@@ -67,17 +67,28 @@ function Get-Win32Programs {
     return $list | Sort-Object | Get-Unique
 }
 
+function Get-CommonSystemTools {
+    return @(
+        "$env:SystemRoot\explorer.exe",
+        "$env:SystemRoot\System32\cmd.exe",
+        "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "$env:SystemRoot\regedit.exe",
+        "$env:SystemRoot\System32\taskmgr.exe",
+        "$env:SystemRoot\System32\services.msc"
+    )
+}
+
 function Get-WindowsApps {
     try {
         return Get-AppxPackage | Where-Object { $_.InstallLocation } |
-            Select-Object @{Name="Name"; Expression={$_.Name}}, 
-                          @{Name="FullName"; Expression={"shell:AppsFolder\$($_.PackageFamilyName)!App"}}
+            Select-Object @{Name="DisplayName"; Expression={ $_.Name }},
+                          @{Name="LaunchString"; Expression={ "shell:AppsFolder\$($_.PackageFamilyName)!App" }}
     } catch { return @() }
 }
 
 function Run-AsSystem {
     param([string]$Path, [string]$Type = "Win32")
-    Write-Log "Launching as SYSTEM ($Type): $Path" "OK"
+    Write-Log "Running as SYSTEM: $Path" "OK"
     if ($Type -eq "UWP") {
         Start-Process explorer.exe -ArgumentList $Path
     } else {
@@ -86,75 +97,80 @@ function Run-AsSystem {
         \( temp = "GodMode_Temp_ \)([Guid]::NewGuid())"
         Register-ScheduledTask -TaskName $temp -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $temp
-        Start-Sleep -Seconds 1
+        Start-Sleep -Seconds 1.5
         Unregister-ScheduledTask -TaskName $temp -Confirm:$false
     }
 }
 
 function Start-GodMode {
     if (-not (Test-Path $ToggleFile)) {
-        Write-Log "God Mode is OFF. Enable it first." "ERROR"
+        Write-Log "God Mode is OFF. Enable it with -ToggleOn" "ERROR"
         return
     }
 
-    # === Auto elevate new Win32 programs ===
+    # Auto elevate new Win32 programs
     $currentWin32 = Get-Win32Programs
     if (Test-Path $LastScanFile) {
         $old = Get-Content $LastScanFile
-        $newWin32 = $currentWin32 | Where-Object { $_ -notin $old }
-        foreach ($prog in $newWin32) {
-            Write-Log "New Win32 app detected → Elevating: $prog" "WARN"
+        $newPrograms = $currentWin32 | Where-Object { $_ -notin $old }
+        foreach ($prog in $newPrograms) {
+            Write-Log "New program detected → Auto elevating: $prog" "WARN"
             Run-AsSystem $prog "Win32"
         }
     }
     $currentWin32 | Out-File $LastScanFile -Force
 
-    # === Try to auto elevate some Windows Apps ===
-    $uwpApps = Get-WindowsApps
-    $importantUWP = $uwpApps | Where-Object { 
-        $_.Name -match "Microsoft.WindowsCalculator|Microsoft.WindowsStore|Microsoft.Windows.Photos|Microsoft.Windows.Settings"
-    }
-    foreach ($app in $importantUWP) {
-        Write-Log "Attempting to elevate Windows App: $($app.Name)" "INFO"
-        Run-AsSystem $app.FullName "UWP"
-    }
+    # Build combined clean list
+    $systemTools = Get-CommonSystemTools
+    $uwpApps = Get-WindowsApps | Select-Object -First 15
+    $installedPrograms = Get-Win32Programs | Select-Object -First 25
 
-    # === Easy Menu ===
-    Write-Host "`n=== GOD MODE MENU ===" -ForegroundColor Cyan
-    Write-Host "[1] Windows Explorer as SYSTEM"
-    Write-Host "[2] Command Prompt as SYSTEM"
-    Write-Host "[3] PowerShell as SYSTEM"
-    Write-Host "[4] Registry Editor as SYSTEM"
-    Write-Host "[5] Task Manager as SYSTEM"
-    Write-Host "[6] Windows Settings as SYSTEM"
-    Write-Host "[7] Microsoft Store as SYSTEM"
-    Write-Host "[8] Calculator as SYSTEM"
-    Write-Host "[9] Photos as SYSTEM"
-    Write-Host "[10] Scan & Elevate All Programs"
-    Write-Host "[11] Exit"
+    $allItems = @()
 
-    $choice = Read-Host "`nSelect option (1-11)"
-    switch ($choice) {
-        "1"  { Run-AsSystem "$env:SystemRoot\explorer.exe" }
-        "2"  { Run-AsSystem "$env:SystemRoot\System32\cmd.exe" }
-        "3"  { Run-AsSystem "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" }
-        "4"  { Run-AsSystem "$env:SystemRoot\regedit.exe" }
-        "5"  { Run-AsSystem "$env:SystemRoot\System32\taskmgr.exe" }
-        "6"  { Run-AsSystem "shell:AppsFolder\Microsoft.Windows.Settings_8wekyb3d8bbwe!App" "UWP" }
-        "7"  { Run-AsSystem "shell:AppsFolder\Microsoft.WindowsStore_8wekyb3d8bbwe!App" "UWP" }
-        "8"  { Run-AsSystem "shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App" "UWP" }
-        "9"  { Run-AsSystem "shell:AppsFolder\Microsoft.Windows.Photos_8wekyb3d8bbwe!App" "UWP" }
-        "10" {
-            $all = Get-Win32Programs
-            for ($i = 0; $i -lt $all.Count; \( i++) { Write-Host "[ \)($i+1)] $($all[$i])" }
-            $num = Read-Host "Enter number"
-            if (\( num -match '^\d+ \)') { Run-AsSystem $all[[int]$num-1] }
+    # Add System Tools
+    foreach ($tool in $systemTools) {
+        $allItems += [PSCustomObject]@{
+            Display = "[System] $(Split-Path $tool -Leaf)"
+            Path    = $tool
+            Type    = "Win32"
         }
-        default { Write-Host "Exiting..." }
+    }
+
+    # Add Windows Apps
+    foreach ($app in $uwpApps) {
+        $allItems += [PSCustomObject]@{
+            Display = "[Windows App] $($app.DisplayName)"
+            Path    = $app.LaunchString
+            Type    = "UWP"
+        }
+    }
+
+    # Add Installed Programs
+    foreach ($prog in $installedPrograms) {
+        $allItems += [PSCustomObject]@{
+            Display = "[Program] $(Split-Path $prog -Leaf)"
+            Path    = $prog
+            Type    = "Win32"
+        }
+    }
+
+    # Show clean single list
+    Write-Host "`n=== GOD MODE - Select What to Run as SYSTEM ===" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $allItems.Count; $i++) {
+        Write-Host "[$($i+1)] $($allItems[$i].Display)"
+    }
+
+    $choice = Read-Host "`nEnter number (or press Enter to exit)"
+    if (\( choice -match '^\d+ \)') {
+        $index = [int]$choice - 1
+        if ($index -ge 0 -and $index -lt $allItems.Count) {
+            $selected = $allItems[$index]
+            Run-AsSystem $selected.Path $selected.Type
+        }
     }
 }
 
-# === CLI ===
+# === CLI Commands ===
 if ($ToggleOn)  { Set-Toggle $true; exit }
 if ($ToggleOff) { Set-Toggle $false; exit }
 if ($Status)    { Get-Status; exit }
@@ -162,12 +178,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE v4 (Win32 + Windows Apps) ===" -ForegroundColor Red
+    Write-Host "`n=== GOD MODE CONTROLLER ===" -ForegroundColor Red
     Write-Host "Commands:"
     Write-Host "  -ToggleOn     Enable God Mode + Auto Watcher"
     Write-Host "  -ToggleOff    Disable God Mode"
     Write-Host "  -Status       Check status"
-    Write-Host "  -Launch       Open menu + auto elevation"
+    Write-Host "  -Launch       Open clean list (System + Windows Apps + Programs)"
     Write-Host ""
-    Write-Host "Auto-elevates both traditional programs and some Windows Apps when ON." -ForegroundColor Yellow
+    Write-Host "Shows everything in one clean list. No cluttered menu." -ForegroundColor Yellow
 }
