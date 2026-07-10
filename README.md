@@ -160,6 +160,27 @@ Both scripts are designed for **testing, research, and full system control** sce
 
 ## Usage
 
+### Quick Tutorial — Install vs Enable
+
+God Mode has two separate steps: **Install** (persistence) and **Enable** (activation).
+
+| Step | Menu Option | What it does |
+|------|-------------|--------------|
+| **Install** | `[6]` | Copies the script to `C:\ProgramData\GodMode\`, creates the `godmode` CLI command, and registers scheduled tasks that auto-enable on every boot and logon. Does **not** turn God Mode on right now. |
+| **Enable** | `[7]` | Immediately disables Windows Defender, Firewall, UAC, Safe Mode, logging, etc. and sets the active flag. This is the dangerous part. |
+| **Status** | `[9]` | Shows whether God Mode is currently ACTIVE or INACTIVE. |
+| **Disable** | `[8]` | Re-enables all security features and clears the active flag. The scheduled tasks from step 1 remain and will re-enable it on next reboot. |
+| **Uninstall** | `[6]` (when already installed) | Removes the installed files, CLI command, and all scheduled tasks. |
+
+**Correct workflow:**
+1. Run `God-Mode-Windows.ps1` and press `[6]` to install.
+2. Press `[7]` to enable God Mode right now.
+3. Press `[9]` to verify it shows `ACTIVE`.
+4. Press `[8]` to disable it temporarily (tasks will re-enable on next reboot).
+5. Press `[6]` again to fully uninstall everything.
+
+---
+
 ### DNS Lockout (God-Mode-Windows.ps1)
 
 ```powershell
