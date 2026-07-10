@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode v7 - Restricted to Built-in Administrator only
+    God Mode v8 - More Dangerous (Disables Defender + Firewall when ON)
 #>
 
 param(
@@ -12,37 +12,9 @@ param(
     [switch]$Launch
 )
 
-# ============================================================
-#  SECURITY CHECK - Only allow Built-in Administrator
-# ============================================================
-function Test-BuiltInAdmin {
-    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
-    
-    # Built-in Administrator has SID ending with -500
-    $isBuiltInAdmin = $currentUser.User.Value -like "*-500"
-    
-    if (-not $isBuiltInAdmin) {
-        return $false
-    }
-    return $true
-}
-
-if (-not (Test-BuiltInAdmin) -and -not $Status) {
-    Write-Host "`n[SECURITY] This tool can only be used by the Built-in Administrator account." -ForegroundColor Red
-    Write-Host "Current user is not the built-in Administrator." -ForegroundColor Yellow
-    Write-Host "Exiting for safety.`n" -ForegroundColor Red
-    exit 1
-}
-
-# ============================================================
-#  REST OF THE SCRIPT
-# ============================================================
-
 $ToggleFile  = "C:\Windows\GodMode_Enabled.flag"
 $LogFile     = "C:\Windows\GodMode_Log.txt"
-$WatcherTask = "GodMode_UserStartMonitor"
-$RegPath     = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+$WatcherTask = "GodMode_DangerousMonitor"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -51,38 +23,30 @@ function Write-Log {
     Write-Host "[$Time] [$Level] $Message"
 }
 
-function Apply-StrongElevation {
-    Write-Log "Applying strong elevation (UAC disabled)..." "WARN"
+function Disable-DefenderAndFirewall {
+    Write-Log "Disabling Windows Defender and Firewall (DANGEROUS MODE)..." "WARN"
 
-    if (-not (Test-Path "HKLM:\SOFTWARE\GodModeBackup")) {
-        New-Item -Path "HKLM:\SOFTWARE\GodModeBackup" -Force | Out-Null
-        try {
-            $lua = (Get-ItemProperty -Path $RegPath -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
-            $consent = (Get-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA -Value $lua
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin -Value $consent
-        } catch {}
+    try {
+        # Disable Windows Defender Real-time Protection
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        Write-Log "Windows Defender Real-time Protection disabled." "WARN"
+
+        # Disable Windows Firewall
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
+        Write-Log "Windows Firewall disabled." "WARN"
+    } catch {
+        Write-Log "Failed to disable some security features: $_" "ERROR"
     }
-
-    Set-ItemProperty -Path $RegPath -Name EnableLUA -Value 0 -Force
-    Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value 0 -Force
-    Set-ItemProperty -Path $RegPath -Name PromptOnSecureDesktop -Value 0 -Force
-
-    Write-Log "UAC fully disabled via registry." "OK"
 }
 
-function Revert-RegistryChanges {
-    Write-Log "Reverting registry settings..." "WARN"
+function Enable-DefenderAndFirewall {
+    Write-Log "Re-enabling Windows Defender and Firewall..." "WARN"
     try {
-        if (Test-Path "HKLM:\SOFTWARE\GodModeBackup") {
-            $lua = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA).EnableLUA
-            $consent = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin).ConsentPromptBehaviorAdmin
-            Set-ItemProperty -Path $RegPath -Name EnableLUA -Value $lua -Force
-            Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value $consent -Force
-            Remove-Item "HKLM:\SOFTWARE\GodModeBackup" -Force -ErrorAction SilentlyContinue
-        }
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
+        Write-Log "Defender and Firewall re-enabled." "OK"
     } catch {
-        Write-Log "Could not fully restore settings." "ERROR"
+        Write-Log "Could not fully re-enable security features." "ERROR"
     }
 }
 
@@ -90,12 +54,12 @@ function Set-Toggle {
     param([bool]$Enabled)
     if ($Enabled) {
         "ON" | Out-File $ToggleFile -Force
-        Apply-StrongElevation
-        Write-Log "God Mode ENABLED (Built-in Admin only)" "OK"
+        Disable-DefenderAndFirewall
+        Write-Log "God Mode ENABLED (More Dangerous)" "WARN"
         Start-ProcessMonitor
     } else {
         Remove-Item $ToggleFile -Force -ErrorAction SilentlyContinue
-        Revert-RegistryChanges
+        Enable-DefenderAndFirewall
         Write-Log "God Mode DISABLED" "WARN"
         Unregister-ScheduledTask -TaskName $WatcherTask -Confirm:$false -ErrorAction SilentlyContinue
     }
@@ -103,7 +67,7 @@ function Set-Toggle {
 
 function Get-Status {
     if (Test-Path $ToggleFile) {
-        Write-Host "God Mode: ON (Built-in Admin + UAC Disabled)" -ForegroundColor Red
+        Write-Host "God Mode: ON (Dangerous Mode - Defender + Firewall disabled)" -ForegroundColor Red
     } else {
         Write-Host "God Mode: OFF" -ForegroundColor Yellow
     }
@@ -140,7 +104,7 @@ function Start-GodMode {
         return
     }
 
-    Write-Log "God Mode active - Monitoring user-started programs..." "INFO"
+    Write-Log "God Mode active (Dangerous) - Elevating user-started programs..." "WARN"
 
     $seen = @{}
     while ($true) {
@@ -165,12 +129,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE v7 (Built-in Admin Only) ===" -ForegroundColor Red
-    Write-Host "This tool can ONLY be used by the Built-in Administrator account."
+    Write-Host "`n=== GOD MODE v8 (More Dangerous) ===" -ForegroundColor Red
+    Write-Host "WARNING: This version disables Windows Defender and Firewall when enabled."
     Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  -ToggleOn     Enable (applies strong elevation)"
-    Write-Host "  -ToggleOff    Disable + restore settings"
+    Write-Host "  -ToggleOn     Enable (disables Defender + Firewall)"
+    Write-Host "  -ToggleOff    Disable + re-enable security features"
     Write-Host "  -Status       Check status"
     Write-Host "  -Launch       Start monitoring"
 }
