@@ -2,8 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode - Optimized Aggressive (All Programs + System Tools)
-    Frequency: Every 60 seconds | Optimized to reduce unnecessary load
+    God Mode v5 - Elevate programs when user starts them (not auto-launch)
 #>
 
 param(
@@ -13,25 +12,23 @@ param(
     [switch]$Launch
 )
 
-$ToggleFile   = "C:\Windows\GodMode_Enabled.flag"
-$LogFile      = "C:\Windows\GodMode_Log.txt"
-$LastElevated = "C:\Windows\GodMode_LastElevated.txt"
-$WatcherTask  = "GodMode_OptimizedAggressive"
+$ToggleFile  = "C:\Windows\GodMode_Enabled.flag"
+$LogFile     = "C:\Windows\GodMode_Log.txt"
+$WatcherTask = "GodMode_ProcessMonitor"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $Time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$Time] [$Level] $Message"
-    Add-Content -Path $LogFile -Value $logEntry -Encoding UTF8
-    Write-Host $logEntry
+    "[$Time] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
+    Write-Host "[$Time] [$Level] $Message"
 }
 
 function Set-Toggle {
     param([bool]$Enabled)
     if ($Enabled) {
         "ON" | Out-File $ToggleFile -Force
-        Write-Log "God Mode ENABLED (Optimized Aggressive)" "WARN"
-        Start-OptimizedWatcher
+        Write-Log "God Mode ENABLED (Elevate on user start)" "OK"
+        Start-ProcessMonitor
     } else {
         Remove-Item $ToggleFile -Force -ErrorAction SilentlyContinue
         Write-Log "God Mode DISABLED" "WARN"
@@ -41,51 +38,36 @@ function Set-Toggle {
 
 function Get-Status {
     if (Test-Path $ToggleFile) {
-        Write-Host "God Mode: ON (Optimized Aggressive - Every 60s)" -ForegroundColor Red
+        Write-Host "God Mode: ON (Elevates programs when user starts them)" -ForegroundColor Green
     } else {
         Write-Host "God Mode: OFF" -ForegroundColor Yellow
     }
 }
 
-function Start-OptimizedWatcher {
+function Start-ProcessMonitor {
     Unregister-ScheduledTask -TaskName $WatcherTask -Confirm:$false -ErrorAction SilentlyContinue
 
+    # This task will run the monitoring script
     $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
-    $Trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 60)
+    $Trigger = New-ScheduledTaskTrigger -AtLogon
     $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
     Register-ScheduledTask -TaskName $WatcherTask -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
-    Write-Log "Optimized Aggressive Watcher started (every 60 seconds)" "OK"
+    Write-Log "Process monitor registered (runs at logon)" "OK"
 }
 
-function Get-AllExecutables {
-    $paths = @("\( env:ProgramFiles", " \){env:ProgramFiles(x86)}")
-    $list = @()
-    foreach ($p in $paths) {
-        if (Test-Path $p) {
-            Get-ChildItem $p -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Length -gt 80KB } |
-                Select-Object -ExpandProperty FullName |
-                ForEach-Object { $list += $_ }
-        }
-    }
-    return $list | Sort-Object | Get-Unique
-}
-
-function Run-AsSystem {
+function Elevate-Process {
     param([string]$Path)
-    try {
-        $Action = New-ScheduledTaskAction -Execute $Path
-        $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        \( tempTask = "GodMode_Temp_ \)([Guid]::NewGuid())"
-        Register-ScheduledTask -TaskName $tempTask -Action $Action -Principal $Principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $tempTask
-        Start-Sleep -Milliseconds 400
-        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false
-        Write-Log "Elevated: $Path" "OK"
-    } catch {
-        Write-Log "Failed to elevate: $Path - $($_.Exception.Message)" "ERROR"
-    }
+    if (-not (Test-Path $Path)) { return }
+    Write-Log "User started program → Elevating: $Path" "OK"
+
+    $Action = New-ScheduledTaskAction -Execute $Path
+    $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    \( temp = "GodMode_Elevate_ \)([Guid]::NewGuid())"
+    Register-ScheduledTask -TaskName $temp -Action $Action -Principal $Principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $temp
+    Start-Sleep -Milliseconds 500
+    Unregister-ScheduledTask -TaskName $temp -Confirm:$false
 }
 
 function Start-GodMode {
@@ -94,44 +76,24 @@ function Start-GodMode {
         return
     }
 
-    Write-Log "=== AGGRESSIVE CYCLE START ===" "INFO"
+    Write-Log "God Mode active - Monitoring for user-started programs..." "INFO"
 
-    # Get all programs
-    $allPrograms = Get-AllExecutables
-    Write-Log "Found $($allPrograms.Count) programs to process" "INFO"
+    # Monitor for new processes (simple loop version)
+    while ($true) {
+        Start-Sleep -Seconds 3
 
-    # Elevate all programs (optimized - only new ones since last cycle)
-    $alreadyElevated = @()
-    if (Test-Path $LastElevated) {
-        $alreadyElevated = Get-Content $LastElevated
-    }
+        # Get recently started processes
+        $recent = Get-WmiObject Win32_Process | Where-Object {
+            $_.CreationDate -and 
+            ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-10)
+        }
 
-    $toElevate = $allPrograms | Where-Object { $_ -notin $alreadyElevated }
-    Write-Log "Elevating $($toElevate.Count) new/remaining programs..." "WARN"
-
-    foreach ($prog in $toElevate) {
-        Run-AsSystem $prog
-    }
-
-    # Save what we just elevated
-    $allPrograms | Out-File $LastElevated -Force
-
-    # Elevate important system tools every cycle
-    $systemTools = @(
-        "$env:SystemRoot\explorer.exe",
-        "$env:SystemRoot\System32\cmd.exe",
-        "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe",
-        "$env:SystemRoot\regedit.exe",
-        "$env:SystemRoot\System32\taskmgr.exe"
-    )
-
-    foreach ($tool in $systemTools) {
-        if (Test-Path $tool) {
-            Run-AsSystem $tool
+        foreach ($proc in $recent) {
+            if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
+                Elevate-Process $proc.ExecutablePath
+            }
         }
     }
-
-    Write-Log "=== AGGRESSIVE CYCLE FINISHED ===" "INFO"
 }
 
 # === CLI Commands ===
@@ -142,12 +104,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE - OPTIMIZED AGGRESSIVE ===" -ForegroundColor Red
+    Write-Host "`n=== GOD MODE v5 ===" -ForegroundColor Cyan
     Write-Host "Commands:"
-    Write-Host "  -ToggleOn     Enable aggressive mode (every 60s)"
+    Write-Host "  -ToggleOn     Enable (elevates programs when user starts them)"
     Write-Host "  -ToggleOff    Disable"
     Write-Host "  -Status       Check status"
-    Write-Host "  -Launch       Manual aggressive elevation"
+    Write-Host "  -Launch       Start monitoring manually"
     Write-Host ""
-    Write-Host "Elevates all programs + system tools. Optimized to reduce repeated work." -ForegroundColor Yellow
+    Write-Host "When ON: Any program the user starts will be automatically elevated to SYSTEM." -ForegroundColor Yellow
 }
