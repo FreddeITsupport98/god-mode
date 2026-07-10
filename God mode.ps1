@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode v12.5 - Weaknesses Addressed
+    God Mode v12.6 - Weaknesses Further Improved
 #>
 
 param(
@@ -89,7 +89,7 @@ function Unregister-StealthTask {
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# Improved Elevation with Better Duplicate Prevention
+# Improved Elevation with Stronger Duplicate Prevention
 function Elevate-Process {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return }
@@ -111,7 +111,7 @@ function Elevate-Process {
     }
 }
 
-# Improved Monitoring Loop with Auto-Recovery
+# Monitoring Loop with Improved Stability
 function Start-Monitoring {
     if (-not (Test-Path $FlagFile)) {
         Write-Log "God Mode is not enabled." "ERROR"
@@ -135,9 +135,9 @@ function Start-Monitoring {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
                     $path = $proc.ExecutablePath
 
-                    # Improved duplicate prevention (45-second cooldown)
+                    # Stronger duplicate prevention (60-second cooldown)
                     if (-not $lastElevated.ContainsKey($path) -or 
-                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-45)) {
+                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
 
                         $lastElevated[$path] = Get-Date
                         Elevate-Process $path
@@ -178,7 +178,7 @@ function Show-Status {
 # Menu
 function Show-Menu {
     Clear-Host
-    Write-Host "=== GOD MODE v12.5 ===" -ForegroundColor Cyan
+    Write-Host "=== GOD MODE v12.6 ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "1. Enable God Mode"
     Write-Host "2. Disable God Mode"
