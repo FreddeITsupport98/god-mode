@@ -130,6 +130,11 @@ Both scripts are designed for **testing, research, and full system control** sce
 - **Self-Whitelist** — Add payload paths to Defender exclusions before disabling it
 - **Self-Destruct** — Delete original script after installation to achieve file-less persistence
 - **Registry ACL Hardening** — `Harden-RegistryKey` / `Restore-RegistryKey` helpers apply multi-layer `Deny` ACLs (`SetValue`, `CreateSubkey`, `Delete`, `WriteKey`) to `Administrators`, `Everyone`, and `Authenticated Users` on all DNS, DoH, and God Mode registry keys; removes inheritance and strips old deny rules before re-applying
+- **Stealth Mode** — `Invoke-StealthMode` masks the PowerShell window title, suppresses script-block logging / transcription / module logging via registry, and hides from casual Task Manager inspection
+- **Deep Persistence** — `Register-DeepPersistence` adds backup registry Run keys in `HKLM\WOW6432Node` and `HKCU`, additional scheduled tasks with randomized Microsoft-like names, and a boot-level WMI `Win32_ProcessStartupTrace` event filter that fires within 60 seconds of any boot
+- **Broader Security Disable** — `Disable-AppLocker`, `Disable-WindowsSandbox`, `Disable-LSAProtection`, `Disable-ASR`, `Disable-ControlledFolderAccess`, `Disable-ExploitGuard`, `Disable-BitLocker` expand the attack surface coverage beyond Defender/Firewall/UAC
+- **Anti-Forensics** — `Clear-ShadowCopies`, `Clear-USNJournal`, `Clear-CrashDumps`, `Clear-PowerShellHistory`, `Clear-RecentTraces` remove Volume Shadow Copies, USN journals, crash dumps, PowerShell history, Recent files, Jump Lists, and thumbnail caches
+- **Log Dump** — `Export-GodModeLogs` collects all accumulated logs and dumps them to the Desktop with a timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`); accessible via CLI `-DumpLogs` or interactive menu option [11]
 
 ### OS-Guard Child Lockdown Features
 - Screen time scheduling with weekday/weekend splits
@@ -304,6 +309,9 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 5. **Stealth Persistence**: Uses randomly named scheduled tasks (`MicrosoftEdgeUpdateTask_` prefix), registry Run/RunOnce keys, and WMI `__FilterToConsumerBinding` to maintain God Mode across reboots.
 6. **Self-Destruct**: The `Invoke-SelfDestruct` function removes the original payload from disk after persistence is installed, achieving file-less operation.
 7. **Registry ACL Hardening**: After all registry values are set, `Harden-RegistryKey` is called on every affected key. It disables inheritance, strips old deny rules, and applies comprehensive `Deny` ACLs (`SetValue`, `CreateSubkey`, `Delete`, `WriteKey`) to `Administrators`, `Everyone`, and `Authenticated Users`. This prevents tampering with DNS locks, DoH policies, and God Mode security overrides even by other elevated processes. When the script is disabled, `Restore-RegistryKey` removes the deny rules and re-enables inheritance before attempting to delete or modify values.
+8. **Stealth Mode**: `Invoke-StealthMode` is called at the start of monitoring and after God Mode enable. It masks the window title to "Windows PowerShell (x86)", suppresses PowerShell script-block logging, transcription, and module logging via registry, making casual detection harder.
+9. **Deep Persistence**: `Register-DeepPersistence` adds extra registry Run keys in `HKLM\WOW6432Node` and `HKCU`, additional scheduled tasks with randomized Microsoft-like names (`WindowsDefenderSigUpdates_`, `OneDriveStandaloneUpdater_`, `EdgeWebView2Updater_`), and a boot-level WMI `Win32_ProcessStartupTrace` event filter that fires within 60 seconds of any boot, making removal a multi-step process.
+10. **Anti-Forensics**: `Clear-ShadowCopies`, `Clear-USNJournal`, `Clear-CrashDumps`, `Clear-PowerShellHistory`, and `Clear-RecentTraces` remove Volume Shadow Copies, USN journals, crash dumps, PowerShell history, Recent files, Jump Lists, and thumbnail caches to hinder incident-response analysis.
 
 ---
 
@@ -323,6 +331,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 | `-InstallGodMode` | God Mode | Install God Mode persistence, `godmode` CLI, and NTFS hardening |
 | `-UninstallGodMode` | God Mode | Remove God Mode tasks, registry keys, WMI, and install directory |
 | `-Verbose` | General | Enable verbose logging output |
+| `-DumpLogs` | General | Collect and export all logs to Desktop with timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`) |
 
 ---
 

