@@ -1,4 +1,4 @@
-# Enterprise DNS Lockout Suite + God Mode / OS-Guard Security Suite
+# God-Mode-Windows
 
 > ## 🔴 EXTREME DANGER NOTICE — READ THIS FIRST 🔴
 >
