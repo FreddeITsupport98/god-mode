@@ -2,7 +2,8 @@
 
 <#
 .SYNOPSIS
-    God Mode v8 - More Dangerous (Disables Defender + Firewall when ON)
+    God Mode v9 - Very Dangerous Mode
+    WARNING: Disables multiple core Windows security features
 #>
 
 param(
@@ -14,7 +15,7 @@ param(
 
 $ToggleFile  = "C:\Windows\GodMode_Enabled.flag"
 $LogFile     = "C:\Windows\GodMode_Log.txt"
-$WatcherTask = "GodMode_DangerousMonitor"
+$WatcherTask = "GodMode_VeryDangerous"
 
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
@@ -23,30 +24,53 @@ function Write-Log {
     Write-Host "[$Time] [$Level] $Message"
 }
 
-function Disable-DefenderAndFirewall {
-    Write-Log "Disabling Windows Defender and Firewall (DANGEROUS MODE)..." "WARN"
+function Apply-DangerousSettings {
+    Write-Log "=== APPLYING VERY DANGEROUS SETTINGS ===" "WARN"
 
+    # 1. Disable Windows Defender Real-time Protection
     try {
-        # Disable Windows Defender Real-time Protection
         Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-        Write-Log "Windows Defender Real-time Protection disabled." "WARN"
+        Write-Log "Windows Defender Real-time Protection: DISABLED" "WARN"
+    } catch {}
 
-        # Disable Windows Firewall
+    # 2. Disable Windows Firewall
+    try {
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False -ErrorAction SilentlyContinue
-        Write-Log "Windows Firewall disabled." "WARN"
-    } catch {
-        Write-Log "Failed to disable some security features: $_" "ERROR"
-    }
+        Write-Log "Windows Firewall: DISABLED" "WARN"
+    } catch {}
+
+    # 3. Disable SmartScreen
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
+        Write-Log "SmartScreen: DISABLED" "WARN"
+    } catch {}
+
+    # 4. Try to stop Windows Defender service
+    try {
+        Stop-Service -Name WinDefend -Force -ErrorAction SilentlyContinue
+        Write-Log "Windows Defender Service: STOPPED" "WARN"
+    } catch {}
+
+    # 5. Disable UAC (already strong)
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+        Write-Log "UAC: DISABLED" "WARN"
+    } catch {}
 }
 
-function Enable-DefenderAndFirewall {
-    Write-Log "Re-enabling Windows Defender and Firewall..." "WARN"
+function Revert-DangerousSettings {
+    Write-Log "Reverting dangerous settings..." "WARN"
+
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
-        Write-Log "Defender and Firewall re-enabled." "OK"
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction SilentlyContinue
+        Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 1 -Force
+        Write-Log "Security features re-enabled." "OK"
     } catch {
-        Write-Log "Could not fully re-enable security features." "ERROR"
+        Write-Log "Could not fully restore all settings." "ERROR"
     }
 }
 
@@ -54,12 +78,12 @@ function Set-Toggle {
     param([bool]$Enabled)
     if ($Enabled) {
         "ON" | Out-File $ToggleFile -Force
-        Disable-DefenderAndFirewall
-        Write-Log "God Mode ENABLED (More Dangerous)" "WARN"
+        Apply-DangerousSettings
+        Write-Log "God Mode ENABLED - VERY DANGEROUS MODE" "WARN"
         Start-ProcessMonitor
     } else {
         Remove-Item $ToggleFile -Force -ErrorAction SilentlyContinue
-        Enable-DefenderAndFirewall
+        Revert-DangerousSettings
         Write-Log "God Mode DISABLED" "WARN"
         Unregister-ScheduledTask -TaskName $WatcherTask -Confirm:$false -ErrorAction SilentlyContinue
     }
@@ -67,7 +91,7 @@ function Set-Toggle {
 
 function Get-Status {
     if (Test-Path $ToggleFile) {
-        Write-Host "God Mode: ON (Dangerous Mode - Defender + Firewall disabled)" -ForegroundColor Red
+        Write-Host "God Mode: ON (VERY DANGEROUS - Defender + Firewall + SmartScreen disabled)" -ForegroundColor Red
     } else {
         Write-Host "God Mode: OFF" -ForegroundColor Yellow
     }
@@ -91,10 +115,10 @@ function Elevate-Program {
         \( temp = "GodMode_Elev_ \)([Guid]::NewGuid())"
         Register-ScheduledTask -TaskName $temp -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $temp
-        Start-Sleep -Milliseconds 500
+        Start-Sleep -Milliseconds 400
         Unregister-ScheduledTask -TaskName $temp -Confirm:$false
     } catch {
-        Write-Log "Failed to elevate $Path" "ERROR"
+        Write-Log "Failed to elevate: $Path" "ERROR"
     }
 }
 
@@ -104,7 +128,7 @@ function Start-GodMode {
         return
     }
 
-    Write-Log "God Mode active (Dangerous) - Elevating user-started programs..." "WARN"
+    Write-Log "God Mode VERY DANGEROUS active - Monitoring..." "WARN"
 
     $seen = @{}
     while ($true) {
@@ -129,12 +153,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE v8 (More Dangerous) ===" -ForegroundColor Red
-    Write-Host "WARNING: This version disables Windows Defender and Firewall when enabled."
+    Write-Host "`n=== GOD MODE v9 - VERY DANGEROUS ===" -ForegroundColor Red
+    Write-Host "This version disables Defender, Firewall, and SmartScreen."
     Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  -ToggleOn     Enable (disables Defender + Firewall)"
-    Write-Host "  -ToggleOff    Disable + re-enable security features"
+    Write-Host "  -ToggleOn     Enable (very dangerous mode)"
+    Write-Host "  -ToggleOff    Disable + restore security"
     Write-Host "  -Status       Check status"
     Write-Host "  -Launch       Start monitoring"
 }
