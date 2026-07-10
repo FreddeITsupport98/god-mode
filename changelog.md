@@ -27,8 +27,24 @@ All notable changes to this project will be documented in this file.
 - New CLI switch `-DebugMode` forwards debug verbosity to the main log and preserves detailed traces in the debug log.
 - Auto-elevation and PS7 launcher now forward `-DebugMode` and `-Verbose` flags to the elevated child process.
 
+### Fixed
+- `Invoke-SelfDestruct` now guards deletion so it only removes the script if it resides inside `$GodModeInstallDir`. Prevents accidental deletion of the original development source file when running from the GitHub repo.
+- `Add-DefenderExclusion` now guards `Add-MpPreference` with `Get-Command` to avoid runtime errors when the Defender module is not available (e.g., PowerShell 7 without Windows Defender cmdlets).
+- All `Set-MpPreference` calls in `Enable-DangerousMode`, `Disable-DangerousMode`, `Disable-ASR`, `Disable-ControlledFolderAccess`, and `Disable-ExploitGuard` are now wrapped with `Get-Command` guards, skipping gracefully when the cmdlet is unavailable.
+- `Set-NetFirewallProfile` `-Enabled` parameter now uses string literals `"False"` and `"True"` instead of boolean `$false`/`$true`, resolving type-conversion runtime errors.
+- `reagentc` calls replaced with `cmd /c "reagentc.exe /disable"` and `cmd /c "reagentc.exe /enable"` to fix "not recognized" errors in PowerShell 7.
+- `Get-BitLockerVolume` call in `Disable-BitLocker` now guarded with `Get-Command` to skip suspension when the BitLocker module is not present.
+- `Invoke-StealthMode` removed the read-only `$Proc.MainWindowTitle` assignment, which caused a runtime property-assignment error.
+
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.
+
+---
+
+## 2026-07-10 19:48:00 UTC — Self-destruct and runtime error fixes
+
+### Fixed
+- See "Fixed" section under Unreleased for detailed bug fixes applied during this build.
 
 ---
 

@@ -52,14 +52,14 @@ if (-not $ScriptRoot) { $ScriptRoot = (Get-Location).Path }
 $ProjectRoot = Split-Path -Parent $ScriptRoot
 if (-not $ProjectRoot) { $ProjectRoot = $ScriptRoot }
 
-$DnsScript = Join-Path $ProjectRoot "God_mode.ps1"
+$DnsScript = Join-Path $ProjectRoot "God-Mode-Windows.ps1"
 $SystemScript = Join-Path $ProjectRoot "Launch-SystemShell.ps1"
 
 # ============================================================================
 # 1. FILE EXISTENCE
 # ============================================================================
 Write-Section "FILE EXISTENCE"
-Add-Assertion -Name "God_mode.ps1 exists" -Pass (Test-Path $DnsScript)
+Add-Assertion -Name "God-Mode-Windows.ps1 exists" -Pass (Test-Path $DnsScript)
 Add-Assertion -Name "Launch-SystemShell.ps1 exists" -Pass (Test-Path $SystemScript)
 Add-Assertion -Name "God_mode.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "God_mode.bat"))
 Add-Assertion -Name "Launch-SystemShell.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "Launch-SystemShell.bat"))
@@ -86,18 +86,18 @@ Write-Section "SCRIPT STRUCTURE"
 
 if (Test-Path $DnsScript) {
     $Content = Get-Content -Path $DnsScript -Raw
-    Add-Assertion -Name "God_mode.ps1 has #Requires or auto-elevation" -Pass (
+    Add-Assertion -Name "God-Mode-Windows.ps1 has #Requires or auto-elevation" -Pass (
         $Content -match '#Requires -RunAsAdministrator' -or $Content -match 'runAs'
     )
-    Add-Assertion -Name "God_mode.ps1 defines Install function" -Pass ($Content -match 'function Install-Persistence')
-    Add-Assertion -Name "God_mode.ps1 defines Uninstall function" -Pass ($Content -match 'function Uninstall-Persistence')
-    Add-Assertion -Name "God_mode.ps1 defines Lock function" -Pass ($Content -match 'function Enable-DNSLock')
-    Add-Assertion -Name "God_mode.ps1 defines Unlock function" -Pass ($Content -match 'function Disable-DNSLock')
-    Add-Assertion -Name "God_mode.ps1 has integrity checking" -Pass ($Content -match 'Test-IntegrityStatus|Get-FileHash')
-    Add-Assertion -Name "God_mode.ps1 handles IPv6" -Pass ($Content -match 'Tcpip6')
-    Add-Assertion -Name "God_mode.ps1 handles Browser DoH" -Pass ($Content -match 'DnsOverHttps|Firefox|Edge|Chrome')
-    Add-Assertion -Name "God_mode.ps1 has WMI cleanup in Uninstall" -Pass ($Content -match 'Remove-WmiObject')
-    Add-Assertion -Name "God_mode.ps1 has SYSTEM helper (Invoke-AsSystem)" -Pass ($Content -match 'Invoke-AsSystem')
+    Add-Assertion -Name "God-Mode-Windows.ps1 defines Install function" -Pass ($Content -match 'function Install-Persistence')
+    Add-Assertion -Name "God-Mode-Windows.ps1 defines Uninstall function" -Pass ($Content -match 'function Uninstall-Persistence')
+    Add-Assertion -Name "God-Mode-Windows.ps1 defines Lock function" -Pass ($Content -match 'function Enable-DNSLock')
+    Add-Assertion -Name "God-Mode-Windows.ps1 defines Unlock function" -Pass ($Content -match 'function Disable-DNSLock')
+    Add-Assertion -Name "God-Mode-Windows.ps1 has integrity checking" -Pass ($Content -match 'Test-IntegrityStatus|Get-FileHash')
+    Add-Assertion -Name "God-Mode-Windows.ps1 handles IPv6" -Pass ($Content -match 'Tcpip6')
+    Add-Assertion -Name "God-Mode-Windows.ps1 handles Browser DoH" -Pass ($Content -match 'DnsOverHttps|Firefox|Edge|Chrome')
+    Add-Assertion -Name "God-Mode-Windows.ps1 has WMI cleanup in Uninstall" -Pass ($Content -match 'Remove-WmiObject')
+    Add-Assertion -Name "God-Mode-Windows.ps1 has SYSTEM helper (Invoke-AsSystem)" -Pass ($Content -match 'Invoke-AsSystem')
 }
 
 if (Test-Path $SystemScript) {
@@ -129,7 +129,7 @@ if ($IsAdmin -and (Test-Path $DnsScript)) {
     Add-Assertion -Name "Install-Persistence stores hash in registry" -Pass ($Content -match 'PushConfigBackoffInterval')
     Add-Assertion -Name "Uninstall-Persistence removes registry hash" -Pass ($Content -match 'Remove-ItemProperty.*PushConfigBackoffInterval')
 } else {
-    Add-Assertion -Name "Admin + script present for hash checks" -Pass $false -Details "Skipped (need admin + God_mode.ps1)"
+    Add-Assertion -Name "Admin + script present for hash checks" -Pass $false -Details "Skipped (need admin + God-Mode-Windows.ps1)"
 }
 
 # ============================================================================
@@ -150,7 +150,7 @@ if (Test-Path $DnsScript) {
     Add-Assertion -Name "Uninstall uses Invoke-AsSystem for cleanup" -Pass ($Content -match 'Invoke-AsSystem')
     Add-Assertion -Name "Uninstall handles missing install gracefully" -Pass ($Content -match 'IsInstalled.*Test-Path.*InstallDir')
 } else {
-    Add-Assertion -Name "Script present for uninstall checks" -Pass $false -Details "Skipped (God_mode.ps1 missing)"
+    Add-Assertion -Name "Script present for uninstall checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
 }
 
 # ============================================================================
@@ -169,7 +169,7 @@ if (Test-Path $DnsScript) {
     Add-Assertion -Name "Install hardens NTFS ACLs" -Pass ($Content -match 'Set-Acl.*InstallDir')
     Add-Assertion -Name "Install sets owner to SYSTEM" -Pass ($Content -match 'SetOwner.*SidSystem')
 } else {
-    Add-Assertion -Name "Script present for install checks" -Pass $false -Details "Skipped (God_mode.ps1 missing)"
+    Add-Assertion -Name "Script present for install checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
 }
 
 # ============================================================================
@@ -183,11 +183,11 @@ if (Test-Path $DnsScript) {
     Add-Assertion -Name "Menu has option 3 (Install Service)" -Pass ($Content -match '\[3\].*INSTALL SERVICE')
     Add-Assertion -Name "Menu has option 4 (Uninstall Service)" -Pass ($Content -match '\[4\].*UNINSTALL SERVICE')
     Add-Assertion -Name "Menu has option 5 (Refresh)" -Pass ($Content -match '\[5\].*REFRESH')
-    Add-Assertion -Name "Menu has option 6 (Exit)" -Pass ($Content -match '\[6\].*EXIT')
+    Add-Assertion -Name "Menu has option 12 (Exit)" -Pass ($Content -match '\[12\].*EXIT')
     Add-Assertion -Name "Menu blocks tampered integrity options 1-3" -Pass ($Content -match 'BLOCKED.*tampered')
     Add-Assertion -Name "Menu allows Uninstall even if tampered" -Pass ($Content -match 'Uninstall-Persistence' -and $Content -notmatch 'BLOCKED.*Uninstall-Persistence')
 } else {
-    Add-Assertion -Name "Script present for menu checks" -Pass $false -Details "Skipped (God_mode.ps1 missing)"
+    Add-Assertion -Name "Script present for menu checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
 }
 
 # ============================================================================
@@ -200,7 +200,7 @@ if (Test-Path $DnsScript) {
     Add-Assertion -Name "Log writes to temp file" -Pass ($Content -match 'Out-File.*LogFile')
     Add-Assertion -Name "Log timestamps entries" -Pass ($Content -match 'Get-Date.*yyyy-MM-dd HH:mm:ss')
 } else {
-    Add-Assertion -Name "Script present for logging checks" -Pass $false -Details "Skipped (God_mode.ps1 missing)"
+    Add-Assertion -Name "Script present for logging checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
 }
 
 # ============================================================================
