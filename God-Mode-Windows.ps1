@@ -538,8 +538,19 @@ function Restore-RegistryKey {
         Write-Log -Message "Restored registry key: $Path" -Type "SUCCESS" -Color Green
         return $true
     } catch {
-        Write-Log -Message "Failed to restore registry key $Path`: $_" -Type "WARN" -Color Yellow
-        return $false
+        Write-Log -Message "Direct restore failed for $Path`: $_" -Type "WARN" -Color Yellow
+        $FallbackScript = "C:\Windows\Temp\RestoreReg_$([Guid]::NewGuid().ToString()).ps1"
+        $PsCode = "try { `$k = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('$SubKeyPath', [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions); if (`$k) { `$a = `$k.GetAccessControl(); foreach (`$r in `$a.Access) { if (`$r.AccessControlType -eq 'Deny') { try { `$sid = `$r.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]); if (`$sid.Value -in @('S-1-5-32-544','S-1-1-0','S-1-5-11','S-1-5-18')) { [void]`$a.RemoveAccessRule(`$r) } } catch {} } }; `$a.SetAccessRuleProtection(`$false,`$false); `$k.SetAccessControl(`$a); `$k.Close(); exit 0 } else { exit 1 } } catch { exit 1 }"
+        Set-Content -Path $FallbackScript -Value $PsCode -Encoding UTF8 -Force
+        $Result = Invoke-AsSystem -Command "powershell.exe -ExecutionPolicy Bypass -File `"$FallbackScript`""
+        Remove-Item -Path $FallbackScript -Force -ErrorAction SilentlyContinue
+        if ($Result.Success) {
+            Write-Log -Message "Restored registry key via SYSTEM: $Path" -Type "SUCCESS" -Color Green
+            return $true
+        } else {
+            Write-Log -Message "Failed to restore registry key via SYSTEM: $Path. Output: $($Result.Output)" -Type "WARN" -Color Yellow
+            return $false
+        }
     }
 }
 
@@ -1034,26 +1045,35 @@ function Invoke-AsSystem {
     $TempTaskName = "DNSGuard-Helper_$TaskId"
     $CommonTemp = "C:\Windows\Temp"
     $ResultFile = "$CommonTemp\DNSGuard_Result_$TaskId.txt"
-    $TempScript = "$CommonTemp\DNSGuard_Script_$TaskId.ps1"
+    $BatchFile = "$CommonTemp\DNSGuard_Batch_$TaskId.cmd"
     Write-Log -Message "[DEBUG] Invoke-AsSystem called (TaskId=$TaskId)." -Type "INFO" -Color Yellow
     try {
-        $ScriptContent = @"
-try { `$ErrorActionPreference = 'Stop'; $Command; '___SUCCESS___' | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Append -Force } catch { `$_.Exception.Message | Out-File -FilePath '$ResultFile' -Encoding UTF8 -Force }
+        $BatchContent = @"
+@echo off
+cd /d $CommonTemp
+$Command
+if %errorlevel% equ 0 (
+    echo ___SUCCESS___ > "$ResultFile"
+) else (
+    echo ___FAILED___ > "$ResultFile"
+)
 "@
-        $ScriptContent | Out-File -FilePath $TempScript -Encoding UTF8 -Force
-        $Action = New-ScheduledTaskAction -Execute "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -Argument "-ExecutionPolicy Bypass -File `"$TempScript`""
+        $BatchContent | Out-File -FilePath $BatchFile -Encoding ASCII -Force
+        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile`""
         $Principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $TempTaskName -Action $Action -Principal $Principal -Force | Out-Null
         Start-ScheduledTask -TaskName $TempTaskName
         $Waited = 0
         $Completed = $false
+        $Success = $false
         while ($Waited -lt $MaxWaitSeconds) {
             Start-Sleep -Seconds 1
             $Waited++
             if (Test-Path $ResultFile) {
                 $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
-                if ($ResultText -and $ResultText.Contains("___SUCCESS___")) {
+                if ($ResultText -and ($ResultText.Contains("___SUCCESS___") -or $ResultText.Contains("___FAILED___"))) {
                     $Completed = $true
+                    $Success = $ResultText.Contains("___SUCCESS___")
                     break
                 }
             }
@@ -1062,13 +1082,13 @@ try { `$ErrorActionPreference = 'Stop'; $Command; '___SUCCESS___' | Out-File -Fi
         $Output = ""
         if (Test-Path $ResultFile) {
             $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
-            $Output = ($ResultText -replace "___SUCCESS___", "").Trim()
+            $Output = ($ResultText -replace "___SUCCESS___", "" -replace "___FAILED___", "").Trim()
             Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -Path $TempScript -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
         if ($Completed) {
-            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName completed successfully." -Type "INFO" -Color Yellow
-            return [PSCustomObject]@{ Success = $true; Output = $Output }
+            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName completed. Success=$Success" -Type "INFO" -Color Yellow
+            return [PSCustomObject]@{ Success = $Success; Output = $Output }
         } else {
             Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName did not complete within $MaxWaitSeconds seconds. Output: $Output" -Type "ERROR" -Color Red
             return [PSCustomObject]@{ Success = $false; Output = $Output }
@@ -1077,7 +1097,7 @@ try { `$ErrorActionPreference = 'Stop'; $Command; '___SUCCESS___' | Out-File -Fi
         Write-Log -Message "SYSTEM helper task failed: $_" -Type "ERROR" -Color Red
         Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $TempScript -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
         return [PSCustomObject]@{ Success = $false; Output = "" }
     }
 }
@@ -1286,7 +1306,7 @@ function Uninstall-GodModePersistence {
             Set-Acl -Path $GodModeCmdPath -AclObject $CmdAcl -ErrorAction Stop
             Remove-Item -Path $GodModeCmdPath -Force -ErrorAction Stop
         } catch {
-            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$GodModeCmdPath`"; icacls.exe `"$GodModeCmdPath`" /reset; cmd /c del /f /q `"$GodModeCmdPath`""
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$GodModeCmdPath`" & icacls.exe `"$GodModeCmdPath`" /reset & cmd /c del /f /q `"$GodModeCmdPath`""
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $GodModeCmdPath. Output: $($Result.Output)" -Type "ERROR" -Color Red
             }
@@ -1405,7 +1425,7 @@ function Uninstall-Persistence {
             Remove-Item -Path $CmdPath -Force -ErrorAction Stop
         } catch {
             Write-Log -Message "Direct deletion failed for $CmdPath. Spawning SYSTEM cleanup task..." -Type "INFO" -Color Yellow
-            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$CmdPath`"; icacls.exe `"$CmdPath`" /reset; cmd /c del /f /q `"$CmdPath`""
+            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$CmdPath`" & icacls.exe `"$CmdPath`" /reset & cmd /c del /f /q `"$CmdPath`""
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $CmdPath. Output: $($Result.Output)" -Type "ERROR" -Color Red
             }
@@ -1495,7 +1515,7 @@ function Test-BuiltInAdmin {
 
 function Test-SystemContext {
     Write-Host "`n[VERIFY] Running whoami as SYSTEM..." -ForegroundColor Cyan
-    $Result = Invoke-AsSystem -Command "whoami; whoami /groups"
+    $Result = Invoke-AsSystem -Command "whoami & whoami /groups"
     if ($Result.Success -and $Result.Output) {
         Write-Host "[SUCCESS] SYSTEM context verified:" -ForegroundColor Green
         Write-Host $Result.Output -ForegroundColor Green
