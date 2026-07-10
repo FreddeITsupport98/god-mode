@@ -15,7 +15,9 @@ A Zero-Trust Windows security tool for DNS hijack protection, browser DoH restri
 
 ## Quick Links
 
+- [God_mode.bat](God_mode.bat) — **Recommended launcher** (auto-bypasses Execution Policy, no system changes)
 - [God_mode.ps1](God_mode.ps1) — Main DNS protection & installer suite
+- [Launch-SystemShell.bat](Launch-SystemShell.bat) — **Recommended launcher** for SYSTEM shell
 - [Launch-SystemShell.ps1](Launch-SystemShell.ps1) — Explicit SYSTEM shell launcher for security testing
 - [tests/Test-Suite.ps1](tests/Test-Suite.ps1) — Regression test suite (no side-effects)
 - [changelog.md](changelog.md) — Full change history
@@ -61,11 +63,12 @@ Explicit, non-persistent SYSTEM shell launcher for security testing. No silent e
 
 ## Usage
 
-1. Open PowerShell as Administrator
-2. Run `.\God_mode.ps1` to open the interactive menu
-3. Select `[1] DEPLOY LOCK` to secure adapters
-4. Select `[3] INSTALL SERVICE` to enable auto-heal persistence
-5. Use `.\Launch-SystemShell.ps1 -Launch` when you need an explicit SYSTEM shell for testing
+1. Right-click `God_mode.bat` and choose **Run as administrator**
+2. Select `[1] DEPLOY LOCK` to secure adapters
+3. Select `[3] INSTALL SERVICE` to enable auto-heal persistence
+4. Right-click `Launch-SystemShell.bat` and choose **Run as administrator** when you need an explicit SYSTEM shell
+
+> **Note:** The `.bat` wrappers use `-ExecutionPolicy Bypass` for **this script only** and do **not** change your system policy. If you prefer PowerShell directly, use `powershell -ExecutionPolicy Bypass -File .\God_mode.ps1`.
 
 ## System Shell Launcher
 

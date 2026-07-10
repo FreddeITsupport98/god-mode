@@ -61,6 +61,8 @@ $SystemScript = Join-Path $ProjectRoot "Launch-SystemShell.ps1"
 Write-Section "FILE EXISTENCE"
 Add-Assertion -Name "God_mode.ps1 exists" -Pass (Test-Path $DnsScript)
 Add-Assertion -Name "Launch-SystemShell.ps1 exists" -Pass (Test-Path $SystemScript)
+Add-Assertion -Name "God_mode.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "God_mode.bat"))
+Add-Assertion -Name "Launch-SystemShell.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "Launch-SystemShell.bat"))
 
 # ============================================================================
 # 2. SYNTAX VALIDATION (PowerShell parser)
