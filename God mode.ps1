@@ -2,7 +2,7 @@
 
 <#
 .SYNOPSIS
-    God Mode v6 - With Strong Registry Elevation (Disable UAC when ON)
+    God Mode v7 - Restricted to Built-in Administrator only
 #>
 
 param(
@@ -11,6 +11,33 @@ param(
     [switch]$Status,
     [switch]$Launch
 )
+
+# ============================================================
+#  SECURITY CHECK - Only allow Built-in Administrator
+# ============================================================
+function Test-BuiltInAdmin {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    
+    # Built-in Administrator has SID ending with -500
+    $isBuiltInAdmin = $currentUser.User.Value -like "*-500"
+    
+    if (-not $isBuiltInAdmin) {
+        return $false
+    }
+    return $true
+}
+
+if (-not (Test-BuiltInAdmin) -and -not $Status) {
+    Write-Host "`n[SECURITY] This tool can only be used by the Built-in Administrator account." -ForegroundColor Red
+    Write-Host "Current user is not the built-in Administrator." -ForegroundColor Yellow
+    Write-Host "Exiting for safety.`n" -ForegroundColor Red
+    exit 1
+}
+
+# ============================================================
+#  REST OF THE SCRIPT
+# ============================================================
 
 $ToggleFile  = "C:\Windows\GodMode_Enabled.flag"
 $LogFile     = "C:\Windows\GodMode_Log.txt"
@@ -25,46 +52,37 @@ function Write-Log {
 }
 
 function Apply-StrongElevation {
-    Write-Log "Applying strong elevation registry changes..." "WARN"
+    Write-Log "Applying strong elevation (UAC disabled)..." "WARN"
 
-    # Backup current values (if not already backed up)
     if (-not (Test-Path "HKLM:\SOFTWARE\GodModeBackup")) {
         New-Item -Path "HKLM:\SOFTWARE\GodModeBackup" -Force | Out-Null
         try {
-            $currentEnableLUA = (Get-ItemProperty -Path $RegPath -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
-            $currentConsent   = (Get-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA -Value $currentEnableLUA
-            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin -Value $currentConsent
+            $lua = (Get-ItemProperty -Path $RegPath -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
+            $consent = (Get-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA -Value $lua
+            Set-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin -Value $consent
         } catch {}
     }
 
-    # Apply strong changes
-    Set-ItemProperty -Path $RegPath -Name EnableLUA -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $RegPath -Name PromptOnSecureDesktop -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $RegPath -Name EnableLUA -Value 0 -Force
+    Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value 0 -Force
+    Set-ItemProperty -Path $RegPath -Name PromptOnSecureDesktop -Value 0 -Force
 
-    Write-Log "UAC disabled and elevation maximized via registry." "OK"
+    Write-Log "UAC fully disabled via registry." "OK"
 }
 
 function Revert-RegistryChanges {
-    Write-Log "Reverting registry changes..." "WARN"
+    Write-Log "Reverting registry settings..." "WARN"
     try {
         if (Test-Path "HKLM:\SOFTWARE\GodModeBackup") {
-            $backupLUA = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA -ErrorAction SilentlyContinue).EnableLUA
-            $backupConsent = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin -ErrorAction SilentlyContinue).ConsentPromptBehaviorAdmin
-
-            if ($backupLUA -ne $null) { Set-ItemProperty -Path $RegPath -Name EnableLUA -Value $backupLUA -Force }
-            if ($backupConsent -ne $null) { Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value $backupConsent -Force }
-
+            $lua = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name EnableLUA).EnableLUA
+            $consent = (Get-ItemProperty -Path "HKLM:\SOFTWARE\GodModeBackup" -Name ConsentPromptBehaviorAdmin).ConsentPromptBehaviorAdmin
+            Set-ItemProperty -Path $RegPath -Name EnableLUA -Value $lua -Force
+            Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value $consent -Force
             Remove-Item "HKLM:\SOFTWARE\GodModeBackup" -Force -ErrorAction SilentlyContinue
-        } else {
-            # Fallback to safe defaults
-            Set-ItemProperty -Path $RegPath -Name EnableLUA -Value 1 -Force
-            Set-ItemProperty -Path $RegPath -Name ConsentPromptBehaviorAdmin -Value 5 -Force
         }
-        Write-Log "Registry settings restored." "OK"
     } catch {
-        Write-Log "Failed to fully restore registry: $_" "ERROR"
+        Write-Log "Could not fully restore settings." "ERROR"
     }
 }
 
@@ -73,7 +91,7 @@ function Set-Toggle {
     if ($Enabled) {
         "ON" | Out-File $ToggleFile -Force
         Apply-StrongElevation
-        Write-Log "God Mode ENABLED with strong elevation" "OK"
+        Write-Log "God Mode ENABLED (Built-in Admin only)" "OK"
         Start-ProcessMonitor
     } else {
         Remove-Item $ToggleFile -Force -ErrorAction SilentlyContinue
@@ -85,7 +103,7 @@ function Set-Toggle {
 
 function Get-Status {
     if (Test-Path $ToggleFile) {
-        Write-Host "God Mode: ON (UAC Disabled + Auto Elevation)" -ForegroundColor Red
+        Write-Host "God Mode: ON (Built-in Admin + UAC Disabled)" -ForegroundColor Red
     } else {
         Write-Host "God Mode: OFF" -ForegroundColor Yellow
     }
@@ -122,13 +140,13 @@ function Start-GodMode {
         return
     }
 
-    Write-Log "God Mode active - Elevating programs you start..." "INFO"
+    Write-Log "God Mode active - Monitoring user-started programs..." "INFO"
 
     $seen = @{}
     while ($true) {
         Start-Sleep -Seconds 2
         $recent = Get-WmiObject Win32_Process | Where-Object {
-            $_.CreationDate -and ([datetime]::ParseExact($_.CreationDate.Substring(0,14),"yyyyMMddHHmmss",$null)) -gt (Get-Date).AddSeconds(-8)
+            $_.CreationDate -and ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-8)
         }
         foreach ($p in $recent) {
             if ($p.ExecutablePath -like "*.exe" -and -not $seen.ContainsKey($p.ExecutablePath)) {
@@ -139,7 +157,7 @@ function Start-GodMode {
     }
 }
 
-# === CLI ===
+# === CLI Commands ===
 if ($ToggleOn)  { Set-Toggle $true; exit }
 if ($ToggleOff) { Set-Toggle $false; exit }
 if ($Status)    { Get-Status; exit }
@@ -147,10 +165,12 @@ if ($Status)    { Get-Status; exit }
 if ($Launch) {
     Start-GodMode
 } else {
-    Write-Host "`n=== GOD MODE v6 (With Registry Elevation) ===" -ForegroundColor Red
+    Write-Host "`n=== GOD MODE v7 (Built-in Admin Only) ===" -ForegroundColor Red
+    Write-Host "This tool can ONLY be used by the Built-in Administrator account."
+    Write-Host ""
     Write-Host "Commands:"
-    Write-Host "  -ToggleOn     Enable + Apply strong registry changes (UAC disabled)"
-    Write-Host "  -ToggleOff    Disable + Restore original settings"
-    Write-Host "  -Status       Check current state"
+    Write-Host "  -ToggleOn     Enable (applies strong elevation)"
+    Write-Host "  -ToggleOff    Disable + restore settings"
+    Write-Host "  -Status       Check status"
     Write-Host "  -Launch       Start monitoring"
 }
