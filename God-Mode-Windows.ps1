@@ -2368,6 +2368,24 @@ function Show-GodModeStatus {
     Write-Host " GOD MODE STATUS DETAIL                    " -ForegroundColor White
     Write-Host "=====================================================" -ForegroundColor DarkGray
 
+    # Current user identity
+    $CurrentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $IsAdmin = ([Security.Principal.WindowsPrincipal]$CurrentUser).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $IsBuiltIn = ($CurrentUser.User.Value -like "*-500")
+    Write-Host "  Current User            : $($CurrentUser.Name)" -ForegroundColor White
+    Write-Host "  User SID                : $($CurrentUser.User.Value)" -ForegroundColor White
+    if ($IsBuiltIn) {
+        Write-Host "  Built-in Administrator  : YES" -ForegroundColor Red
+    } else {
+        Write-Host "  Built-in Administrator  : NO" -ForegroundColor Yellow
+    }
+    if ($IsAdmin) {
+        Write-Host "  Admin Privileges        : YES" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Admin Privileges        : NO" -ForegroundColor Red
+    }
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+
     # Core God Mode state
     if (Test-Path $GodModeFlagFile) {
         Write-Host "  God Mode State          : ACTIVE" -ForegroundColor Red
@@ -3050,7 +3068,7 @@ do {
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
-        "9" { Show-GodModeStatus; Start-Sleep -Seconds 2 }
+        "9" { Show-GodModeStatus; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "13" { Test-SystemContext; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "10" {
             if (-not (Test-BuiltInAdmin)) {
