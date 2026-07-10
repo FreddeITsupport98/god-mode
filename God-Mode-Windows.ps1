@@ -110,7 +110,8 @@ if (-not $ScriptDir) { $ScriptDir = $PWD.Path }
 $LogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.log"
 $DebugLogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.debug.log"
 
-$GodModeFlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
+$GodModeFlagRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WpnPlatform\Settings"
+$GodModeFlagRegName = "GodModeActive"
 $GodModeLogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
 $GodModeTaskPrefix = "MicrosoftEdgeUpdateTask_"
 
@@ -2194,9 +2195,10 @@ function Elevate-Process {
 
 function Start-Monitoring {
     Write-DebugLog -FunctionName "Start-Monitoring" -Action "ENTRY"
-    if (-not (Test-Path $GodModeFlagFile)) {
+    $Flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
+    if (-not ($Flag -and $Flag.$GodModeFlagRegName -eq 1)) {
         Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
-        Write-DebugLog -FunctionName "Start-Monitoring" -Action "EXIT" -Message "Aborted: flag file missing"
+        Write-DebugLog -FunctionName "Start-Monitoring" -Action "EXIT" -Message "Aborted: flag registry missing"
         return
     }
 
@@ -2265,7 +2267,8 @@ function Start-Monitoring {
 
 function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
-    "1" | Out-File $GodModeFlagFile -Force
+    if (-not (Test-Path $GodModeFlagRegPath)) { New-Item -Path $GodModeFlagRegPath -Force | Out-Null }
+    Set-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -Value 1 -Force -ErrorAction SilentlyContinue
     Register-StealthTask
     Enable-DangerousMode
 
@@ -2292,17 +2295,22 @@ function Enable-GodMode {
         } catch { Write-Log -Message "Backup task $Prefix failed: $_" -Type "WARN" -Color Yellow }
     }
 
-    # --- Self-protection: harden flag file ---
+    # --- Self-protection: harden flag registry key ---
     try {
-        $FlagAcl = Get-Acl -Path $GodModeFlagFile -ErrorAction SilentlyContinue
-        if ($FlagAcl) {
-            $FlagAcl.SetAccessRuleProtection($true, $false)
-            $FlagAcl.Access | ForEach-Object { $FlagAcl.RemoveAccessRule($_) | Out-Null }
-            $FlagAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidSystem, "FullControl", "None", "None", "Allow")))
-            $FlagAcl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($SidAdmin, "Read", "None", "None", "Allow")))
-            Set-Acl -Path $GodModeFlagFile -AclObject $FlagAcl -ErrorAction SilentlyContinue
+        if (Test-Path $GodModeFlagRegPath) {
+            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\WpnPlatform\Settings", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+            if ($RegKey) {
+                $Acl = $RegKey.GetAccessControl()
+                $Acl.SetAccessRuleProtection($true, $false)
+                $Acl.Access | ForEach-Object { $Acl.RemoveAccessRule($_) | Out-Null }
+                $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidSystem, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+                $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAdmin, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Allow")))
+                $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidUsers, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Deny")))
+                $RegKey.SetAccessControl($Acl)
+                $RegKey.Close()
+            }
         }
-    } catch { Write-Log -Message "Flag file self-protection failed: $_" -Type "WARN" -Color Yellow }
+    } catch { Write-Log -Message "Flag registry self-protection failed: $_" -Type "WARN" -Color Yellow }
 
     # --- WMI persistence (file-less fallback) ---
     Register-GodModeWMI
@@ -2330,7 +2338,7 @@ function Enable-GodMode {
 
 function Disable-GodMode {
     Write-DebugLog -FunctionName "Disable-GodMode" -Action "ENTRY"
-    Remove-Item $GodModeFlagFile -Force -ErrorAction SilentlyContinue
+    Remove-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
     Unregister-StealthTask
 
     # --- Remove backup task prefixes ---
@@ -2387,7 +2395,8 @@ function Show-GodModeStatus {
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
     # Core God Mode state
-    if (Test-Path $GodModeFlagFile) {
+    $Flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
+    if ($Flag -and $Flag.$GodModeFlagRegName -eq 1) {
         Write-Host "  God Mode State          : ACTIVE" -ForegroundColor Red
     } else {
         Write-Host "  God Mode State          : INACTIVE" -ForegroundColor Green
@@ -2935,8 +2944,8 @@ do {
     Write-Host "=====================================================" -ForegroundColor Cyan
 
     # Quick system status header
-    $QuickGodMode = if (Test-Path $GodModeFlagFile) { "ACTIVE" } else { "INACTIVE" }
-    $QuickGodModeColor = if (Test-Path $GodModeFlagFile) { "Red" } else { "Green" }
+    $QuickGodMode = if ((Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName -eq 1) { "ACTIVE" } else { "INACTIVE" }
+    $QuickGodModeColor = if ((Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName -eq 1) { "Red" } else { "Green" }
     $QuickDNS = Get-QuickDNSLockStatus
     $QuickDNSText = if ($QuickDNS) { "LOCKED" } else { "UNLOCKED" }
     $QuickDNSColor = if ($QuickDNS) { "Red" } else { "Green" }
