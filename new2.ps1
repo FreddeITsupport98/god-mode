@@ -38,6 +38,24 @@ try {
 }
 
 # ============================================================================
+# 0.5 POWERSHELL 7 PREFERRED LAUNCHER
+# ============================================================================
+if ($PSVersionTable.PSVersion.Major -le 5) {
+    $Pwsh7 = Get-Command -Name pwsh -CommandType Application -ErrorAction SilentlyContinue
+    if ($Pwsh7) {
+        $ArgList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$PSCommandPath`"")
+        $Bound = $PSBoundParameters.GetEnumerator() | ForEach-Object {
+            if ($_.Value -is [switch] -and $_.Value.IsPresent) {
+                "-$($_.Key)"
+            }
+        }
+        if ($Bound) { $ArgList += $Bound }
+        Start-Process -FilePath $Pwsh7.Source -ArgumentList $ArgList -Wait -NoNewWindow
+        Exit
+    }
+}
+
+# ============================================================================
 # 1. AUTO-ELEVATION & PRE-FLIGHT CHECKS
 # ============================================================================
 
@@ -53,7 +71,7 @@ if (-not $Principal.IsInRole($Role)) {
     Start-Sleep -Seconds 1
     try {
         $ProcessInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $ProcessInfo.FileName = "powershell.exe"
+        $ProcessInfo.FileName = (Get-Process -Id $PID).Path
         
         # Forward any CLI flags (like -Uninstall) to the elevated process
         $ArgsString = ""
