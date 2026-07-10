@@ -19,6 +19,7 @@
 ## Table of Contents
 
 - [Quick Links](#quick-links)
+- [Jump List](#jump-list)
 - [Project Overview](#project-overview)
 - [Scripts Included](#scripts-included)
 - [Features](#features)
@@ -28,6 +29,11 @@
 - [OS-Guard Child Lockdown Features](#os-guard-child-lockdown-features)
 - [Testing & Regression](#testing--regression)
 - [Syntax Checking](#syntax-checking)
+- [File Inventory](#file-inventory)
+- [Architecture & How It Works](#architecture--how-it-works)
+- [Parameter Reference](#parameter-reference)
+- [Troubleshooting](#troubleshooting)
+- [Legacy & Planned Components](#legacy--planned-components)
 - [Changelog](#changelog)
 - [Disclaimer](#disclaimer)
 
@@ -37,11 +43,24 @@
 
 | Section | Description |
 |---------|-------------|
-| [new2.ps1](#new2ps1--enterprise-dns--god-mode) | DNS Lockout + God Mode (dangerous admin control) |
-| [security.ps1](#securityps1--os-guard-child-lockdown) | Parental control / child lockdown suite |
-| [syntax_check.ps1](#syntax-checking) | Project-wide syntax checker script |
+| [God-Mode-Windows.ps1](#god-mode-windowsps1--enterprise-dns--god-mode) | DNS Lockout + God Mode (dangerous admin control) |
+| [syntax_check.ps1](#syntax-checking) | Project-wide syntax checker & auto-chmod script |
 | [tests/](#testing--regression) | Regression test suite folder |
 | [CHANGELOG](#changelog) | Version history and unreleased changes |
+
+---
+
+## Jump List
+
+- [God-Mode-Windows.ps1 — Enterprise DNS + God Mode](#scripts-included)
+- [DNS Lockout Usage](#dns-lockout-god-mode-windowsps1)
+- [God Mode Usage](#god-mode-god-mode-windowsps1)
+- [Syntax Checking](#syntax-checking)
+- [Regression Tests](#testing--regression)
+- [Changelog](#changelog)
+- [Architecture & How It Works](#architecture--how-it-works)
+- [Parameter Reference](#parameter-reference)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -49,8 +68,8 @@
 
 This project is a dual-suite Windows PowerShell security toolkit consisting of two primary scripts:
 
-1. **`new2.ps1`** — Enterprise DNS Hijack Protection + **God Mode** (dangerous admin override suite)
-2. **`security.ps1`** — OS-Guard Child Lockdown Suite (parental control / kiosk mode)
+1. **`God-Mode-Windows.ps1`** — Enterprise DNS Hijack Protection + **God Mode** (dangerous admin override suite)
+2. **`security.ps1`** — OS-Guard Child Lockdown Suite (parental control / kiosk mode — legacy / planned module)
 
 Both scripts are designed for **testing, research, and full system control** scenarios where the built-in administrator needs to either lock down or unlock the operating system at the deepest levels.
 
@@ -58,7 +77,7 @@ Both scripts are designed for **testing, research, and full system control** sce
 
 ## Scripts Included
 
-### new2.ps1 — Enterprise DNS + God Mode
+### God-Mode-Windows.ps1 — Enterprise DNS + God Mode
 
 - **DNS Lockout**: Enforces static DNS on all network adapters (IPv4/IPv6) via registry ACLs
 - **DoH Blocking**: Disables DNS-over-HTTPS in Edge, Chrome, and Firefox via GPO registry
@@ -134,34 +153,34 @@ Both scripts are designed for **testing, research, and full system control** sce
 
 ## Usage
 
-### DNS Lockout (new2.ps1)
+### DNS Lockout (God-Mode-Windows.ps1)
 
 ```powershell
 # Interactive TUI menu
-.\new2.ps1
+.\God-Mode-Windows.ps1
 
 # CLI flags
-.\new2.ps1 -Lock          # Deploy DNS lock immediately
-.\new2.ps1 -Unlock        # Remove DNS lock
-.\new2.ps1 -Install       # Install background service + auto-heal
-.\new2.ps1 -Uninstall     # Remove service and unlock
-.\new2.ps1 -SilentLock    # Background guardian mode (no UI)
+.\God-Mode-Windows.ps1 -Lock          # Deploy DNS lock immediately
+.\God-Mode-Windows.ps1 -Unlock        # Remove DNS lock
+.\God-Mode-Windows.ps1 -Install       # Install background service + auto-heal
+.\God-Mode-Windows.ps1 -Uninstall     # Remove service and unlock
+.\God-Mode-Windows.ps1 -SilentLock    # Background guardian mode (no UI)
 ```
 
-### God Mode (new2.ps1)
+### God Mode (God-Mode-Windows.ps1)
 
 ```powershell
 # Check God Mode status
-.\new2.ps1 -GodModeStatus
+.\God-Mode-Windows.ps1 -GodModeStatus
 
 # Enable God Mode (Built-in Admin ONLY — DANGEROUS)
-.\new2.ps1 -Launch
+.\God-Mode-Windows.ps1 -Launch
 
 # Install God Mode service persistence
-.\new2.ps1 -InstallGodMode
+.\God-Mode-Windows.ps1 -InstallGodMode
 
 # Uninstall God Mode service
-.\new2.ps1 -UninstallGodMode
+.\God-Mode-Windows.ps1 -UninstallGodMode
 ```
 
 ### OS-Guard (security.ps1)
@@ -226,6 +245,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 
 ### Unreleased
 
+- **2026-07-10 19:01 UTC** — Updated README quick links, renamed all `new2.ps1` references to `God-Mode-Windows.ps1`, added Jump List, File Inventory, Architecture, Parameter Reference, Troubleshooting, and Legacy sections for improved documentation depth
 - **2026-07-10 18:29 UTC** — Added five new registry power functions to God Mode: `Disable-UACPrompts`, `Disable-SmartScreenRegistry`, `Disable-RemoteUAC`, `Disable-CredentialGuard`, `Disable-WindowsScriptHost`
 - **2026-07-10 18:29 UTC** — Integrated all new registry functions into `Enable-DangerousMode` and `Disable-DangerousMode` flows
 - **2026-07-10 18:29 UTC** — Updated `Show-GodModeStatus` TUI to display UAC Prompts, SmartScreen, Remote UAC, Credential Guard/VBS, and Windows Script Host states
@@ -249,6 +269,84 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 - WMI file-less persistence fallback
 - Self-destruct capability for file-less operation
 - Syntax checker and regression test suite
+
+---
+
+## File Inventory
+
+| File | Purpose |
+|------|---------|
+| `God-Mode-Windows.ps1` | Main dual-suite script (DNS Lockout + God Mode) |
+| `syntax_check.ps1` | Enhanced multi-layer syntax checker, regression validator, and auto-chmod utility |
+| `tests/Test-Suite.ps1` | Regression test suite for syntax, installer logic, and menu integrity |
+| `changelog.md` | External project changelog |
+| `God mode.ps1.old` | Legacy archived payload (retained for reference) |
+
+---
+
+## Architecture & How It Works
+
+### DNS Lockout Architecture
+1. **Registry ACL Denial**: The script enumerates all active network adapters and applies `Deny SetValue` ACLs to both IPv4 (`Tcpip`) and IPv6 (`Tcpip6`) registry parameter subkeys for `S-1-5-32-544` (Administrators) and `S-1-5-18` (SYSTEM). This prevents any interactive user or service from modifying DNS settings.
+2. **GPO UI Restrictions**: Sets `NC_LanProperties`, `NC_LanChangeProperties`, and `NC_AllowAdvancedTCPIPConfig` to `0` under `HKCU:\Software\Policies\Microsoft\Windows\Network Connections`, graying out the adapter properties UI.
+3. **Browser DoH Closure**: Disables DNS-over-HTTPS via registry policies for Edge (`HKLM\SOFTWARE\Policies\Microsoft\Edge`), Chrome (`HKLM\SOFTWARE\Policies\Google\Chrome`), and Firefox (`HKLM\SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS`).
+4. **Persistent Guardian**: Installs three scheduled tasks (startup, logon, network-change event ID 10000) plus two heartbeat guardians (5-minute and 10-minute intervals) and a WMI event subscription (`__EventFilter` + `CommandLineEventConsumer`) that re-applies locks if the Task Scheduler service is modified.
+5. **NTFS Self-Defense**: Sets `C:\ProgramData\DNSGuard` owner to SYSTEM, strips inherited permissions, grants Admins `ReadAndExecute` only, and denies `Delete`, `ChangePermissions`, and `TakeOwnership` to prevent tampering.
+6. **Integrity Verification**: Computes a SHA-256 hash of the installed payload and stores it both in a registry key (`PushConfigBackoffInterval` under `WpnPlatform\Settings`) and in a file (`integrity.sha256`) to detect tampering.
+
+### God Mode Architecture
+1. **Authorization Gate**: All God Mode commands check `Test-BuiltInAdmin` (RID-500) and exit with `ACCESS DENIED` if the caller is not the built-in Administrator.
+2. **Exclusion First**: Before disabling Defender, the script adds `$GodModeInstallDir` and the current script path to Windows Defender exclusions to avoid self-flagging.
+3. **Layered Disable**: Applies registry overrides, service-level disable, `MpPreference` disable, process termination, firewall disable, UAC disable, Safe Mode / Recovery BCD edits, ELAM disable, event log clearing, and SmartScreen / Credential Guard / Remote UAC / WSH registry locks.
+4. **Resurrection Killer**: A persistent monitor loop (`Start-Monitoring`) checks every 30 seconds for security service respawns and re-kills them; it also auto-elevates any new process to SYSTEM within a 60-second cooldown.
+5. **Stealth Persistence**: Uses randomly named scheduled tasks (`MicrosoftEdgeUpdateTask_` prefix), registry Run/RunOnce keys, and WMI `__FilterToConsumerBinding` to maintain God Mode across reboots.
+6. **Self-Destruct**: The `Invoke-SelfDestruct` function removes the original payload from disk after persistence is installed, achieving file-less operation.
+
+---
+
+## Parameter Reference
+
+| Parameter | Scope | Description |
+|-----------|-------|-------------|
+| `-Install` | DNS Lockout | Install background service, auto-heal, `dnslock` CLI, and NTFS hardening |
+| `-Uninstall` | DNS Lockout | Remove service, unlock registry, clean PATH, and delete install directory |
+| `-Lock` | DNS Lockout | Immediately apply DNS registry ACL locks and GPO restrictions |
+| `-Unlock` | DNS Lockout | Remove all DNS locks and GPO restrictions |
+| `-SilentLock` | DNS Lockout | Background guardian mode (no UI); used by scheduled tasks |
+| `-ToggleOn` | God Mode | Enable God Mode (Built-in Admin only) |
+| `-ToggleOff` | God Mode | Disable God Mode (Built-in Admin only) |
+| `-GodModeStatus` | God Mode | Display detailed TUI status of all security subsystems |
+| `-Launch` | God Mode | Launch the persistent monitor / resurrection killer (Built-in Admin only) |
+| `-InstallGodMode` | God Mode | Install God Mode persistence, `godmode` CLI, and NTFS hardening |
+| `-UninstallGodMode` | God Mode | Remove God Mode tasks, registry keys, WMI, and install directory |
+| `-Verbose` | General | Enable verbose logging output |
+
+---
+
+## Troubleshooting
+
+### DNS Lockout Issues
+- **Cannot uninstall because "must run as SYSTEM"**: The uninstaller requires SYSTEM because the install directory is owned by SYSTEM. Use `psexec -s powershell.exe -File "C:\ProgramData\DNSGuard\DNS_Lockdown.ps1" -Uninstall` or run the original `God-Mode-Windows.ps1 -Uninstall` from an elevated admin shell (it will spawn a SYSTEM helper task automatically via `Invoke-AsSystem`).
+- **GPO restrictions still active after uninstall**: The uninstaller removes `NC_LanProperties`, `NC_LanChangeProperties`, and `NC_AllowAdvancedTCPIPConfig` from `HKCU:\Software\Policies\Microsoft\Windows\Network Connections`. If these remain, run `gpupdate /force` or manually delete the keys.
+- **Integrity mismatch warning**: If the SHA-256 hash of the installed script does not match the stored baseline, the script blocks lock/unlock operations. Reinstall from a clean source.
+
+### God Mode Issues
+- **Access Denied**: God Mode commands are restricted to the Built-in Administrator (RID-500). Ensure you are logged in as the actual built-in admin, not a domain or local admin account.
+- **Defender keeps re-enabling**: Some Windows builds require a reboot for tamper-protection registry changes to take effect. If Defender respawns, run `God-Mode-Windows.ps1 -Launch` to start the resurrection killer, then reboot.
+- **Safe Mode blocked and cannot restore**: If you locked yourself out of Safe Mode, boot from Windows installation media and use `bcdedit /deletevalue {default} safeboot` from the repair command prompt.
+- **WMI persistence still active after uninstall**: WMI objects sometimes require a manual cleanup. Run `Get-WmiObject -Class __EventFilter -Namespace "root\subscription" | Where-Object Name -eq 'Win32ProviderHealthCheck' | Remove-WmiObject` as admin.
+
+### General Issues
+- **PowerShell 7 not detected**: The script checks `$PSVersionTable.PSVersion.Major` and relaunches in `pwsh` if available. If `pwsh` is not in PATH, it stays in Windows PowerShell 5.1.
+- **Execution Policy blocked**: The script auto-sets `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` at startup. If GPO overrides this, sign the script or use `powershell.exe -ExecutionPolicy Bypass -File .\God-Mode-Windows.ps1`.
+
+---
+
+## Legacy & Planned Components
+
+- **`new2.ps1`**: This was the original filename for the Enterprise DNS + God Mode script during early development. It has been renamed to `God-Mode-Windows.ps1` to reflect its purpose accurately. All legacy documentation references have been updated.
+- **`security.ps1` / OS-Guard Child Lockdown**: The OS-Guard suite (parental control, screen time, app blocking, kiosk mode) is described as a planned or legacy module. The file is not present in the current repository but may be merged in a future release.
+- **`God mode.ps1.old`**: Archived legacy payload retained for reference and historical comparison.
 
 ---
 
