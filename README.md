@@ -132,9 +132,10 @@ Both scripts are designed for **testing, research, and full system control** sce
 - **Registry ACL Hardening** — `Harden-RegistryKey` / `Restore-RegistryKey` helpers apply multi-layer `Deny` ACLs (`SetValue`, `CreateSubkey`, `Delete`, `WriteKey`) to `Administrators`, `Everyone`, and `Authenticated Users` on all DNS, DoH, and God Mode registry keys; removes inheritance and strips old deny rules before re-applying
 - **Stealth Mode** — `Invoke-StealthMode` masks the PowerShell window title, suppresses script-block logging / transcription / module logging via registry, and hides from casual Task Manager inspection
 - **Deep Persistence** — `Register-DeepPersistence` adds backup registry Run keys in `HKLM\WOW6432Node` and `HKCU`, additional scheduled tasks with randomized Microsoft-like names, and a boot-level WMI `Win32_ProcessStartupTrace` event filter that fires within 60 seconds of any boot
-- **Broader Security Disable** — `Disable-AppLocker`, `Disable-WindowsSandbox`, `Disable-LSAProtection`, `Disable-ASR`, `Disable-ControlledFolderAccess`, `Disable-ExploitGuard`, `Disable-BitLocker` expand the attack surface coverage beyond Defender/Firewall/UAC
-- **Anti-Forensics** — `Clear-ShadowCopies`, `Clear-USNJournal`, `Clear-CrashDumps`, `Clear-PowerShellHistory`, `Clear-RecentTraces` remove Volume Shadow Copies, USN journals, crash dumps, PowerShell history, Recent files, Jump Lists, and thumbnail caches
-- **Log Dump** — `Export-GodModeLogs` collects all accumulated logs and dumps them to the Desktop with a timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`); accessible via CLI `-DumpLogs` or interactive menu option [11]
+|- **Broader Security Disable** — `Disable-AppLocker`, `Disable-WindowsSandbox`, `Disable-LSAProtection`, `Disable-ASR`, `Disable-ControlledFolderAccess`, `Disable-ExploitGuard`, `Disable-BitLocker` expand the attack surface coverage beyond Defender/Firewall/UAC
+|- **Anti-Forensics** — `Clear-ShadowCopies`, `Clear-USNJournal`, `Clear-CrashDumps`, `Clear-PowerShellHistory`, `Clear-RecentTraces` remove Volume Shadow Copies, USN journals, crash dumps, PowerShell history, Recent files, Jump Lists, and thumbnail caches
+|- **Log Dump** — `Export-GodModeLogs` collects all accumulated logs and dumps them to the Desktop with a timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`); accessible via CLI `-DumpLogs` or interactive menu option [11]
+|- **Rotating Raw Debug Dump** — `Export-RawDebugDump` captures full system state (environment variables, loaded modules, running processes, `$Error` stack, and all log files) into timestamped dumps under `%TEMP%\GodMode_RawDumps`. Automatically rotates to keep only the 5 most recent dumps. Triggered automatically on installation start/end and on any uncaught terminating error via a global `trap` handler.
 
 ### OS-Guard Child Lockdown Features
 - Screen time scheduling with weekday/weekend splits
@@ -251,6 +252,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 
 ### Unreleased
 
+- **2026-07-10 20:08 UTC** — Added rotating raw debug/error dumper (`Export-RawDebugDump`) with automatic log rotation (keeps 5 most recent dumps) and global `trap` auto-capture; also hardened `Uninstall-GodModePersistence` and `Uninstall-Persistence` to explicitly delete payloads via `cmd /c del /f /q` before directory removal for reliable cleanup against hardened ACLs
 - **2026-07-10 19:09 UTC** — Added `Harden-RegistryKey` and `Restore-RegistryKey` helpers; integrated multi-layer registry ACL hardening into DNS Lockout, DoH, and God Mode enable/disable flows
 - **2026-07-10 19:01 UTC** — Updated README quick links, renamed all `new2.ps1` references to `God-Mode-Windows.ps1`, added Jump List, File Inventory, Architecture, Parameter Reference, Troubleshooting, and Legacy sections for improved documentation depth
 - **2026-07-10 18:29 UTC** — Added five new registry power functions to God Mode: `Disable-UACPrompts`, `Disable-SmartScreenRegistry`, `Disable-RemoteUAC`, `Disable-CredentialGuard`, `Disable-WindowsScriptHost`

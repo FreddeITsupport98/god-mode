@@ -5,6 +5,9 @@ All notable changes to this project will be documented in this file.
 ## Unreleased
 
 ### Added
+- `Export-RawDebugDump` — Rotating raw debug/error dumper that captures full system state (environment variables, loaded modules, running processes, `$Error` stack, and all log files) into timestamped dumps under `%TEMP%\GodMode_RawDumps`. Automatically rotates to keep only the 5 most recent dumps.
+- Global `trap` handler that auto-calls `Export-RawDebugDump` on any uncaught terminating error, ensuring a full snapshot is preserved before the script breaks.
+- `Export-RawDebugDump` auto-triggered during `Install-GodModePersistence` (start/end) and `Install-Persistence` (start/end) so every installation produces a complete raw audit trail.
 - `God_mode.bat` — Batch launcher that automatically bypasses Execution Policy for this run only. Recommended way to start the suite when scripts are blocked.
 - `Launch-SystemShell.bat` — Batch launcher for the SYSTEM shell tool with automatic Execution Policy bypass.
 - `Launch-SystemShell.ps1` — Explicit, non-persistent SYSTEM shell launcher for security testing. Uses a temporary scheduled task. No auto-elevation, no silent UAC bypass, no persistence.
@@ -40,8 +43,12 @@ All notable changes to this project will be documented in this file.
 - Hardened-file cleanup commands switched from `Remove-Item` to `cmd /c del /f /q` (files) and `cmd /c rd /s /q` (directories) for better reliability when SYSTEM executes them.
 - Added `Test-SystemContext` function and menu option `[13] VERIFY SYSTEM CONTEXT` — runs `whoami` and `whoami /groups` as SYSTEM via `Invoke-AsSystem` and displays the live output, proving SYSTEM execution works.
 - Added `Get-CurrentUserSidInfo` helper that returns current SID, `IsAdmin`, and `IsBuiltInAdmin` flags.
-- All `Test-BuiltInAdmin` access-denied messages (CLI handlers and interactive menu) now print the actual SID, admin status, and built-in admin status so users can see exactly why they are blocked.
-- Menu prompt updated from `(1-12)` to `(1-13)` to reflect the new option.
+|- All `Test-BuiltInAdmin` access-denied messages (CLI handlers and interactive menu) now print the actual SID, admin status, and built-in admin status so users can see exactly why they are blocked.
+|- Menu prompt updated from `(1-12)` to `(1-13)` to reflect the new option.
+
+### Fixed (2026-07-10 20:08 UTC)
+|- `Uninstall-GodModePersistence` now explicitly deletes `GodMode.ps1` via `cmd /c del /f /q` before attempting directory removal, and the SYSTEM fallback command was tightened to explicitly delete the file then remove the directory with `cmd /c rd /s /q`. This prevents the hardened install directory from leaving the payload behind.
+|- `Uninstall-Persistence` hardened cleanup for the DNS-Guard install directory now follows the same explicit file-then-directory deletion pattern via `cmd /c del /f /q` and `cmd /c rd /s /q`, improving reliability against hardened ACLs.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.

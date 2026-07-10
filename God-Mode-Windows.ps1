@@ -120,6 +120,10 @@ $GodModeCmdPath        = "C:\Windows\godmode.cmd"
 $GodModeTaskName       = "Windows-Update-Health-Monitor"
 $GodModeGuardianName   = "Windows-Update-Health-Check"
 
+# Raw debug dump rotation settings
+$RawDumpDir = Join-Path $env:TEMP "GodMode_RawDumps"
+$MaxRawDumps = 5
+
 function Write-Log {
     param ([string]$Message, [string]$Type = "INFO", [ConsoleColor]$Color = "White")
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -171,6 +175,79 @@ function Invoke-WithDebug {
         Write-Log -Message "[$FunctionName] Error: $($ErrorRecord.Exception.Message)" -Type "ERROR" -Color Red
         throw $ErrorRecord
     }
+}
+
+function Export-RawDebugDump {
+    param(
+        [string]$Trigger = "Manual",
+        [string]$DumpDir = $RawDumpDir,
+        [int]$KeepCount = $MaxRawDumps
+    )
+    try {
+        if (-not (Test-Path $DumpDir)) { New-Item -ItemType Directory -Path $DumpDir -Force | Out-Null }
+        # Rotate: keep only $KeepCount most recent dumps
+        Get-ChildItem -Path $DumpDir -Filter "GodMode_RawDump_*.log" -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -Skip $KeepCount |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+        $Timestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+        $DumpFile = Join-Path $DumpDir "GodMode_RawDump_${Timestamp}_${Trigger}.log"
+        $Dump = @()
+        $Dump += "===== GOD MODE RAW DEBUG DUMP ====="
+        $Dump += "Trigger: $Trigger"
+        $Dump += "Generated: $(Get-Date)"
+        $Dump += "Script: $PSCommandPath"
+        $Dump += "PID: $PID"
+        $Dump += "PSVersion: $($PSVersionTable.PSVersion)"
+        $Dump += "PSPath: $($PSHome)"
+        $Dump += "OS: $((Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption)"
+        $Dump += "User: $([Environment]::UserName)"
+        $Dump += "Computer: $([Environment]::MachineName)"
+        $Dump += "IsAdmin: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+        $Dump += "IsBuiltInAdmin: $(([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -like '*-500'))"
+        $Dump += ""
+        $Dump += "===== ENVIRONMENT VARIABLES ====="
+        $Dump += (Get-ChildItem Env: -ErrorAction SilentlyContinue | Select-Object Name, Value | Out-String)
+        $Dump += ""
+        $Dump += "===== LOADED MODULES ====="
+        $Dump += (Get-Module | Select-Object Name, Version, Path | Out-String)
+        $Dump += ""
+        $Dump += "===== RUNNING PROCESSES (Top 20) ====="
+        $Dump += (Get-Process -ErrorAction SilentlyContinue | Sort-Object CPU -Descending | Select-Object -First 20 | Out-String)
+        $Dump += ""
+        $Dump += "===== `$ERROR VARIABLE (Last 20) ====="
+        if ($Error.Count -gt 0) {
+            $Dump += ($Error | Select-Object -First 20 | ForEach-Object {
+                "Exception: $($_.Exception.Message)`nStackTrace: $($_.ScriptStackTrace)`nCategory: $($_.CategoryInfo)`n---"
+            } | Out-String)
+        } else {
+            $Dump += '[No errors in $Error]'
+        }
+        $Dump += ""
+        $Dump += "===== MAIN LOG ====="
+        if (Test-Path $LogFile) { $Dump += (Get-Content -Raw $LogFile -ErrorAction SilentlyContinue) } else { $Dump += '[No main log]' }
+        $Dump += ""
+        $Dump += "===== DEBUG LOG ====="
+        if (Test-Path $DebugLogFile) { $Dump += (Get-Content -Raw $DebugLogFile -ErrorAction SilentlyContinue) } else { $Dump += '[No debug log]' }
+        $Dump += ""
+        $Dump += "===== GOD MODE LOG ====="
+        if (Test-Path $GodModeLogFile) { $Dump += (Get-Content -Raw $GodModeLogFile -ErrorAction SilentlyContinue) } else { $Dump += '[No GodMode log]' }
+        $Dump += ""
+        $Dump += "===== RAW DUMP COMPLETE ====="
+        $Dump -join "`r`n" | Out-File -FilePath $DumpFile -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Raw debug dump created: $DumpFile" -Type "DEBUG" -Color Gray
+        return $DumpFile
+    } catch {
+        Write-Log -Message "Failed to create raw debug dump: $_" -Type "ERROR" -Color Red
+        return $null
+    }
+}
+
+# Global uncaught error trap: dump raw debug state and log, then break
+trap {
+    Export-RawDebugDump -Trigger "UNCAUGHT_TRAP"
+    Write-Log -Message "UNCAUGHT TRAP: $($_.Exception.Message) | Stack: $($_.ScriptStackTrace)" -Type "ERROR" -Color Red
+    break
 }
 
 if (-not $SilentLock) { Write-Log -Message "Enterprise Diagnostics Suite Initialized." -Type "SYSTEM" -Color Cyan }
@@ -732,6 +809,7 @@ function Disable-DNSLock {
 
 function Install-Persistence {
     Write-DebugLog -FunctionName "Install-Persistence" -Action "ENTRY"
+    Export-RawDebugDump -Trigger "DNS_INSTALL_START"
     Write-Log -Message "Installing DNS-Guard to System ($InstallDir)..." -Type "ACTION" -Color Yellow
 
     # 0. Installation Gate: Prevent overwriting existing installs
@@ -936,6 +1014,7 @@ function Install-Persistence {
     if (-not $WmiFilter) { Write-Log -Message "WMI event filter missing." -Type "WARN" -Color Yellow }
     $WmiConsumer = Get-WmiObject -Class CommandLineEventConsumer -Namespace "root\subscription" -Filter "Name='WindowsUpdateHealthCheck'" -ErrorAction SilentlyContinue
     if (-not $WmiConsumer) { Write-Log -Message "WMI event consumer missing." -Type "WARN" -Color Yellow }
+    Export-RawDebugDump -Trigger "DNS_INSTALL_END"
     if ($FailedCount -eq 0) {
         Write-Host "[SUCCESS] INSTALLATION COMPLETE!" -ForegroundColor Green
         Write-DebugLog -FunctionName "Install-Persistence" -Action "EXIT" -Message "Success"
@@ -1004,6 +1083,7 @@ try { `$ErrorActionPreference = 'Stop'; $Command; '___SUCCESS___' | Out-File -Fi
 
 function Install-GodModePersistence {
     Write-DebugLog -FunctionName "Install-GodModePersistence" -Action "ENTRY"
+    Export-RawDebugDump -Trigger "GODMODE_INSTALL_START"
     Write-Log -Message "Installing God Mode to System ($GodModeInstallDir)..." -Type "ACTION" -Color Yellow
 
     # Gate: prevent overwrite
@@ -1152,6 +1232,7 @@ function Install-GodModePersistence {
     if (-not (Get-ScheduledTask -TaskName $GodModeGuardianName -ErrorAction SilentlyContinue)) { $FailedCount++; Write-Log -Message "Guardian missing." -Type "ERROR" -Color Red }
     $CurrentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
     if ($CurrentPath -notlike "*$GodModeInstallDir*") { $FailedCount++; Write-Log -Message "PATH missing." -Type "ERROR" -Color Red }
+    Export-RawDebugDump -Trigger "GODMODE_INSTALL_END"
     if ($FailedCount -eq 0) {
         Write-Host "[SUCCESS] GOD MODE INSTALLATION COMPLETE!" -ForegroundColor Green
     } else {
@@ -1228,16 +1309,25 @@ function Uninstall-GodModePersistence {
 
     # Remove install dir
     if (Test-Path $GodModeInstallDir) {
+        # Explicitly delete the installed script file first (bypass ACLs via cmd)
+        if (Test-Path $GodModeInstallScript) {
+            cmd /c "del /f /q `"$GodModeInstallScript`"" | Out-Null
+        }
         try {
             Remove-Item -Path $GodModeInstallDir -Recurse -Force -ErrorAction Stop
         } catch {
-            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$GodModeInstallDir`" /R /D Y; icacls.exe `"$GodModeInstallDir`" /reset /T; cmd /c rd /s /q `"$GodModeInstallDir`""
+            Write-Log -Message "Direct deletion failed for $GodModeInstallDir. Trying SYSTEM cleanup..." -Type "INFO" -Color Yellow
+            $SystemCmd = "cmd /c del /f /q `"$GodModeInstallScript`" 2>nul & cmd /c rd /s /q `"$GodModeInstallDir`" 2>nul"
+            $Result = Invoke-AsSystem -Command $SystemCmd
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $GodModeInstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
             }
         }
         if (Test-Path $GodModeInstallDir) {
             Write-Log -Message "SYSTEM cleanup failed: $GodModeInstallDir still exists." -Type "ERROR" -Color Red
+            if (Test-Path $GodModeInstallScript) {
+                Write-Log -Message "GodMode.ps1 still exists inside install dir." -Type "ERROR" -Color Red
+            }
         } else {
             Write-Log -Message "God Mode directory removed." -Type "INFO" -Color Gray
         }
@@ -1343,12 +1433,17 @@ function Uninstall-Persistence {
     # Delete System Directory LAST - use SYSTEM helper if direct deletion fails (hardened ACLs)
     if (Test-Path $InstallDir) {
         Write-Log -Message "Removing hardened installation directory..." -Type "INFO" -Color Gray
+        # Explicitly delete the installed script file first (bypass ACLs via cmd)
+        if (Test-Path $InstallScript) {
+            cmd /c "del /f /q `"$InstallScript`"" | Out-Null
+        }
         try {
             Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction Stop
             Write-Log -Message "Installation directory removed." -Type "INFO" -Color Gray
         } catch {
             Write-Log -Message "Direct deletion failed (hardened ACLs). Spawning SYSTEM cleanup task..." -Type "INFO" -Color Yellow
-            $Result = Invoke-AsSystem -Command "takeown.exe /F `"$InstallDir`" /R /D Y; icacls.exe `"$InstallDir`" /reset /T; cmd /c rd /s /q `"$InstallDir`""
+            $SystemCmd = "cmd /c del /f /q `"$InstallScript`" 2>nul & cmd /c rd /s /q `"$InstallDir`" 2>nul"
+            $Result = Invoke-AsSystem -Command $SystemCmd
             if (-not $Result.Success) {
                 Write-Log -Message "SYSTEM cleanup failed for $InstallDir. Output: $($Result.Output)" -Type "ERROR" -Color Red
             }
