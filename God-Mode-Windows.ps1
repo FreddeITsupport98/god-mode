@@ -1638,11 +1638,15 @@ function Invoke-SelfDestruct {
         if (Test-Path $Path) {
             $InstallDirFull = (Get-Item $GodModeInstallDir -ErrorAction SilentlyContinue).FullName
             $TargetFull = (Get-Item $Path -ErrorAction SilentlyContinue).FullName
-            if ($InstallDirFull -and $TargetFull -and $TargetFull.StartsWith($InstallDirFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $InstalledFull = (Get-Item $GodModeInstallScript -ErrorAction SilentlyContinue).FullName
+            # Never delete the installed script itself (scheduled tasks need it)
+            if ($InstalledFull -and $TargetFull -and ($TargetFull -eq $InstalledFull)) {
+                Write-Log -Message "Self-destruct skipped: $Path is the installed script. Preserved." -Type "INFO" -Color Gray
+            } elseif ($InstallDirFull -and $TargetFull -and $TargetFull.StartsWith($InstallDirFull, [System.StringComparison]::OrdinalIgnoreCase)) {
                 Remove-Item -Path $Path -Force -ErrorAction SilentlyContinue
-                Write-Log -Message "Original payload self-destructed: $Path" -Type "INFO" -Color Gray
+                Write-Log -Message "Temp payload self-destructed: $Path" -Type "INFO" -Color Gray
             } else {
-                Write-Log -Message "Self-destruct skipped: $Path is not inside the install directory ($GodModeInstallDir). Source preserved." -Type "INFO" -Color Gray
+                Write-Log -Message "Self-destruct skipped: $Path is outside the install directory ($GodModeInstallDir). Source preserved." -Type "INFO" -Color Gray
             }
         }
     } catch { Write-Log -Message "Self-destruct failed: $_" -Type "WARN" -Color Yellow }
