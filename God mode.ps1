@@ -2,14 +2,15 @@
 
 <#
 .SYNOPSIS
-    God Mode v12.4 - With Auto-Recovery
+    God Mode v12.5 - Weaknesses Addressed
 #>
 
 param(
     [switch]$ToggleOn,
     [switch]$ToggleOff,
     [switch]$Status,
-    [switch]$Launch
+    [switch]$Launch,
+    [switch]$Verbose
 )
 
 $FlagFile   = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syscache"
@@ -31,6 +32,10 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "[$timestamp] [$Level] $Message" | Out-File $LogFile -Append -Encoding UTF8
+
+    if ($Verbose -or $Level -in @("ERROR", "WARN")) {
+        Write-Host "[$timestamp] [$Level] $Message"
+    }
 }
 
 # Dangerous Mode
@@ -84,7 +89,7 @@ function Unregister-StealthTask {
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-# Elevation
+# Improved Elevation with Better Duplicate Prevention
 function Elevate-Process {
     param([string]$Path)
     if (-not (Test-Path $Path)) { return }
@@ -106,7 +111,7 @@ function Elevate-Process {
     }
 }
 
-# Monitoring Loop with Auto-Recovery
+# Improved Monitoring Loop with Auto-Recovery
 function Start-Monitoring {
     if (-not (Test-Path $FlagFile)) {
         Write-Log "God Mode is not enabled." "ERROR"
@@ -115,7 +120,7 @@ function Start-Monitoring {
 
     Write-Log "Monitoring started with auto-recovery." "INFO"
 
-    $lastElevated = @{}
+    $lastElevated = @{}   # Process path → last elevated time
 
     while ($true) {
         try {
@@ -130,8 +135,9 @@ function Start-Monitoring {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
                     $path = $proc.ExecutablePath
 
+                    # Improved duplicate prevention (45-second cooldown)
                     if (-not $lastElevated.ContainsKey($path) -or 
-                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-30)) {
+                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-45)) {
 
                         $lastElevated[$path] = Get-Date
                         Elevate-Process $path
@@ -140,13 +146,13 @@ function Start-Monitoring {
             }
         }
         catch {
-            Write-Log "Monitoring crashed. Restarting in 5 seconds... Error: $_" "ERROR"
+            Write-Log "Monitoring error (recovering in 5s): $_" "ERROR"
             Start-Sleep -Seconds 5
         }
     }
 }
 
-# Toggle Functions
+# Toggle & Status
 function Enable-GodMode {
     "1" | Out-File $FlagFile -Force
     Register-StealthTask
@@ -172,7 +178,7 @@ function Show-Status {
 # Menu
 function Show-Menu {
     Clear-Host
-    Write-Host "=== GOD MODE v12.4 ===" -ForegroundColor Cyan
+    Write-Host "=== GOD MODE v12.5 ===" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "1. Enable God Mode"
     Write-Host "2. Disable God Mode"
