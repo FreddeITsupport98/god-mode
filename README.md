@@ -129,6 +129,7 @@ Both scripts are designed for **testing, research, and full system control** sce
 - **Resurrection Killer** — Re-kill security services every 30 seconds if they respawn
 - **Self-Whitelist** — Add payload paths to Defender exclusions before disabling it
 - **Self-Destruct** — Delete original script after installation to achieve file-less persistence
+- **Registry ACL Hardening** — `Harden-RegistryKey` / `Restore-RegistryKey` helpers apply multi-layer `Deny` ACLs (`SetValue`, `CreateSubkey`, `Delete`, `WriteKey`) to `Administrators`, `Everyone`, and `Authenticated Users` on all DNS, DoH, and God Mode registry keys; removes inheritance and strips old deny rules before re-applying
 
 ### OS-Guard Child Lockdown Features
 - Screen time scheduling with weekday/weekend splits
@@ -245,6 +246,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 
 ### Unreleased
 
+- **2026-07-10 19:09 UTC** — Added `Harden-RegistryKey` and `Restore-RegistryKey` helpers; integrated multi-layer registry ACL hardening into DNS Lockout, DoH, and God Mode enable/disable flows
 - **2026-07-10 19:01 UTC** — Updated README quick links, renamed all `new2.ps1` references to `God-Mode-Windows.ps1`, added Jump List, File Inventory, Architecture, Parameter Reference, Troubleshooting, and Legacy sections for improved documentation depth
 - **2026-07-10 18:29 UTC** — Added five new registry power functions to God Mode: `Disable-UACPrompts`, `Disable-SmartScreenRegistry`, `Disable-RemoteUAC`, `Disable-CredentialGuard`, `Disable-WindowsScriptHost`
 - **2026-07-10 18:29 UTC** — Integrated all new registry functions into `Enable-DangerousMode` and `Disable-DangerousMode` flows
@@ -301,6 +303,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 4. **Resurrection Killer**: A persistent monitor loop (`Start-Monitoring`) checks every 30 seconds for security service respawns and re-kills them; it also auto-elevates any new process to SYSTEM within a 60-second cooldown.
 5. **Stealth Persistence**: Uses randomly named scheduled tasks (`MicrosoftEdgeUpdateTask_` prefix), registry Run/RunOnce keys, and WMI `__FilterToConsumerBinding` to maintain God Mode across reboots.
 6. **Self-Destruct**: The `Invoke-SelfDestruct` function removes the original payload from disk after persistence is installed, achieving file-less operation.
+7. **Registry ACL Hardening**: After all registry values are set, `Harden-RegistryKey` is called on every affected key. It disables inheritance, strips old deny rules, and applies comprehensive `Deny` ACLs (`SetValue`, `CreateSubkey`, `Delete`, `WriteKey`) to `Administrators`, `Everyone`, and `Authenticated Users`. This prevents tampering with DNS locks, DoH policies, and God Mode security overrides even by other elevated processes. When the script is disabled, `Restore-RegistryKey` removes the deny rules and re-enables inheritance before attempting to delete or modify values.
 
 ---
 

@@ -317,6 +317,107 @@ function Test-IntegrityStatus {
     return ($ExpectedHash.Trim() -eq $ActualHash.Trim())
 }
 
+function Harden-RegistryKey {
+    param(
+        [string]$Path,
+        [switch]$IsCurrentUser
+    )
+    try {
+        $Hive = if ($IsCurrentUser) { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+        $SubKeyPath = $Path -replace '^HKLM:\\' -replace '^HKCU:\\'
+        
+        $RegKey = $Hive.OpenSubKey($SubKeyPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        if (-not $RegKey) { 
+            Write-Log -Message "Registry key not found for hardening: $Path" -Type "WARN" -Color Yellow
+            return $false 
+        }
+        
+        $Acl = $RegKey.GetAccessControl()
+        
+        # Remove inheritance (convert inherited to explicit)
+        $Acl.SetAccessRuleProtection($true, $true)
+        
+        # Remove existing deny rules for the SIDs we will harden
+        $RulesToRemove = @()
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -eq "Deny") {
+                try {
+                    $RuleSid = $Rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+                    if ($RuleSid.Value -in @("S-1-5-32-544", "S-1-1-0", "S-1-5-11", "S-1-5-18")) {
+                        $RulesToRemove += $Rule
+                    }
+                } catch {}
+            }
+        }
+        foreach ($Rule in $RulesToRemove) {
+            $Acl.RemoveAccessRule($Rule) | Out-Null
+        }
+        
+        # Deny Admins dangerous rights
+        $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAdmin, "SetValue,CreateSubkey,Delete,WriteKey", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        
+        # Deny Everyone
+        $SidEveryone = New-Object System.Security.Principal.SecurityIdentifier("S-1-1-0")
+        $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidEveryone, "SetValue,CreateSubkey,Delete,WriteKey", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        
+        # Deny Authenticated Users
+        $SidAuthUsers = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-11")
+        $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAuthUsers, "SetValue,CreateSubkey,Delete,WriteKey", "ContainerInherit,ObjectInherit", "None", "Deny")))
+        
+        $RegKey.SetAccessControl($Acl)
+        $RegKey.Close()
+        Write-Log -Message "Hardened registry key: $Path" -Type "SUCCESS" -Color Green
+        return $true
+    } catch {
+        Write-Log -Message "Failed to harden registry key $Path`: $_" -Type "WARN" -Color Yellow
+        return $false
+    }
+}
+
+function Restore-RegistryKey {
+    param(
+        [string]$Path,
+        [switch]$IsCurrentUser
+    )
+    try {
+        $Hive = if ($IsCurrentUser) { [Microsoft.Win32.Registry]::CurrentUser } else { [Microsoft.Win32.Registry]::LocalMachine }
+        $SubKeyPath = $Path -replace '^HKLM:\\' -replace '^HKCU:\\'
+        
+        $RegKey = $Hive.OpenSubKey($SubKeyPath, [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        if (-not $RegKey) { return $false }
+        
+        $Acl = $RegKey.GetAccessControl()
+        
+        # Remove deny rules for Admin, Everyone, Authenticated Users, and SYSTEM
+        $RulesToRemove = @()
+        foreach ($Rule in $Acl.Access) {
+            if ($Rule.AccessControlType -eq "Deny") {
+                try {
+                    $RuleSid = $Rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier])
+                    if ($RuleSid.Value -in @("S-1-5-32-544", "S-1-1-0", "S-1-5-11", "S-1-5-18")) {
+                        $RulesToRemove += $Rule
+                    }
+                } catch {}
+            }
+        }
+        
+        foreach ($Rule in $RulesToRemove) {
+            $Acl.RemoveAccessRule($Rule) | Out-Null
+        }
+        
+        # Re-enable inheritance
+        $Acl.SetAccessRuleProtection($false, $false)
+        
+        $RegKey.SetAccessControl($Acl)
+        $RegKey.Close()
+        Write-Log -Message "Restored registry key: $Path" -Type "SUCCESS" -Color Green
+        return $true
+    } catch {
+        Write-Log -Message "Failed to restore registry key $Path`: $_" -Type "WARN" -Color Yellow
+        return $false
+    }
+}
+
 # ============================================================================
 # 4. LOCKDOWN MODULE (ENABLE)
 # ============================================================================
@@ -390,6 +491,22 @@ function Enable-DNSLock {
         Write-Log -Message "Protection deployed silently (no DHCP renewal in background task)." -Type "SUCCESS" -Color Green
     }
 
+    # Harden registry ACLs to prevent tampering
+    Write-Log -Message "Hardening registry ACLs to prevent tampering..." -Type "INFO" -Color Yellow
+    $Adapters = Get-NetAdapter -IncludeHidden:$false -ErrorAction SilentlyContinue
+    if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
+    foreach ($Adapter in $Adapters) {
+        $Guid = $Adapter.InterfaceGuid
+        Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid"
+        Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
+    }
+    Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    Harden-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
+    Harden-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
+    Harden-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
+    Harden-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
+    Harden-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
+
     # Final status verification
     $FailedCount = 0
     $Adapters = Get-NetAdapter -IncludeHidden:$false -ErrorAction SilentlyContinue
@@ -440,6 +557,22 @@ function Enable-DNSLock {
 
 function Disable-DNSLock {
     Write-Log -Message "Initiating Total Unlock (Ångra)..." -Type "ACTION" -Color Magenta
+
+    # Restore hardened registry ACLs before attempting to modify values
+    Write-Log -Message "Restoring hardened registry ACLs..." -Type "INFO" -Color Yellow
+    $Adapters = Get-NetAdapter -IncludeHidden:$false -ErrorAction SilentlyContinue
+    if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
+    foreach ($Adapter in $Adapters) {
+        $Guid = $Adapter.InterfaceGuid
+        Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$Guid"
+        Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters\Interfaces\$Guid"
+    }
+    Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    Restore-RegistryKey -Path "SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters"
+    Restore-RegistryKey -Path "Software\Policies\Microsoft\Windows\Network Connections" -IsCurrentUser
+    Restore-RegistryKey -Path "SOFTWARE\Policies\Microsoft\Edge"
+    Restore-RegistryKey -Path "SOFTWARE\Policies\Google\Chrome"
+    Restore-RegistryKey -Path "SOFTWARE\Policies\Mozilla\Firefox\DNSOverHTTPS"
 
     foreach ($Adapter in $Adapters) {
         $Guid = $Adapter.InterfaceGuid
@@ -1415,10 +1548,48 @@ function Enable-DangerousMode {
 
     # 13. NEW: Disable Windows Script Host
     Disable-WindowsScriptHost
+
+    # Harden God Mode registry keys to prevent tampering
+    Write-Log -Message "Hardening God Mode registry keys against tampering..." -Type "INFO" -Color Yellow
+    $GodModeRegistryKeys = @(
+        "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+        "SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
+        "SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications",
+        "SYSTEM\CurrentControlSet\Control\DeviceGuard",
+        "SYSTEM\CurrentControlSet\Control\EarlyLaunch",
+        "SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
+        "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+        "SOFTWARE\Policies\Microsoft\Windows\System",
+        "SOFTWARE\Microsoft\Windows Script Host\Settings",
+        "SOFTWARE\Microsoft\Windows Defender\Features",
+        "SYSTEM\CurrentControlSet\Control\Lsa"
+    )
+    foreach ($Key in $GodModeRegistryKeys) {
+        Harden-RegistryKey -Path $Key
+    }
 }
 
 function Disable-DangerousMode {
     Write-Log -Message "Disabling dangerous mode..." -Type "WARN" -Color Yellow
+
+    # Restore God Mode registry ACLs before attempting to remove values
+    Write-Log -Message "Restoring God Mode registry ACLs..." -Type "INFO" -Color Yellow
+    $GodModeRegistryKeys = @(
+        "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
+        "SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
+        "SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications",
+        "SYSTEM\CurrentControlSet\Control\DeviceGuard",
+        "SYSTEM\CurrentControlSet\Control\EarlyLaunch",
+        "SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
+        "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
+        "SOFTWARE\Policies\Microsoft\Windows\System",
+        "SOFTWARE\Microsoft\Windows Script Host\Settings",
+        "SOFTWARE\Microsoft\Windows Defender\Features",
+        "SYSTEM\CurrentControlSet\Control\Lsa"
+    )
+    foreach ($Key in $GodModeRegistryKeys) {
+        Restore-RegistryKey -Path $Key
+    }
 
     # 1. Restore Tamper Protection registry
     try {
