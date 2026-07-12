@@ -1949,7 +1949,7 @@ function Enable-DangerousMode {
     }
 
     # 2. Disable core Windows Defender user-mode services only (boot-critical drivers excluded)
-    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc", "WaaSMedicSvc", "usosvc", "WerSvc", "DPS", "BITS", "NisSrv", "SgrmBroker")
     foreach ($svc in $DefenderServices) {
         try {
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
@@ -2016,7 +2016,7 @@ function Enable-DangerousMode {
 
     # 7. Kill Defender processes
     try {
-        Get-Process -Name MsMpEng, MsMpEngCP, smartscreen, SecurityHealthService, MpCmdRun, MsSense, MpDefenderCoreService -ErrorAction SilentlyContinue |
+        Get-Process -Name MsMpEng, MsMpEngCP, smartscreen, SecurityHealthService, MpCmdRun, MsSense, MpDefenderCoreService, NisSrv, SgrmBroker, WerFault, WerFaultSecure, WaaSMedic, SecurityHealthSystray -ErrorAction SilentlyContinue |
             Stop-Process -Force -ErrorAction SilentlyContinue
         Write-Log -Message "Defender processes terminated." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Error killing defender processes: $_" -Type "WARN" -Color Yellow }
@@ -2095,7 +2095,7 @@ function Disable-DangerousMode {
     } catch { Write-Log -Message "Error restoring tamper protection registry: $_" -Type "WARN" -Color Yellow }
 
     # 2. Restore Defender services
-    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc", "WaaSMedicSvc", "usosvc", "WerSvc", "DPS", "BITS", "NisSrv", "SgrmBroker")
     foreach ($svc in $DefenderServices) {
         try {
             Set-Service -Name $svc -StartupType Automatic -ErrorAction SilentlyContinue
@@ -2280,6 +2280,37 @@ function Start-Monitoring {
 
     $lastElevated = @{}   # Process path -> last elevated time
     $lastKillCheck = [datetime]::MinValue
+    $lastExistingElevate = [datetime]::MinValue
+
+    # --- One-time elevation of all existing user-session processes at startup ---
+    Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe")
+    $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+    foreach ($proc in $ExistingProcesses) {
+        $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
+        if ($CriticalProcs -contains $procName) { continue }
+        $path = $proc.ExecutablePath
+        $arguments = ""
+        if ($proc.CommandLine) {
+            $cmdLine = $proc.CommandLine
+            if ($cmdLine.StartsWith('"')) {
+                $endQuote = $cmdLine.IndexOf('"', 1)
+                if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                    $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                }
+            } else {
+                $firstSpace = $cmdLine.IndexOf(' ')
+                if ($firstSpace -gt 0) {
+                    $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                }
+            }
+        }
+        if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+            $lastElevated[$path] = Get-Date
+            Elevate-Process -Path $path -Arguments $arguments
+            Start-Sleep -Milliseconds 100
+        }
+    }
 
     while ($true) {
         try {
@@ -2288,14 +2319,14 @@ function Start-Monitoring {
             # --- Resurrection Killer: Re-kill security services if they respawn (every 30 seconds) ---
             if ((Get-Date) - $lastKillCheck -gt [TimeSpan]::FromSeconds(30)) {
                 $lastKillCheck = Get-Date
-                $ServicesToKill = @("MsMpEng", "MsMpEngCP", "MpDefenderCoreService", "MsSense", "smartscreen", "SecurityHealthService", "MpCmdRun")
+                $ServicesToKill = @("MsMpEng", "MsMpEngCP", "MpDefenderCoreService", "MsSense", "smartscreen", "SecurityHealthService", "MpCmdRun", "NisSrv", "SgrmBroker", "WerFault", "WerFaultSecure", "WaaSMedic", "SecurityHealthSystray")
                 foreach ($procName in $ServicesToKill) {
                     try {
                         Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                     } catch { }
                 }
                 # Re-apply service-level disable if any service got re-enabled
-                $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+                $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc", "WaaSMedicSvc", "usosvc", "WerSvc", "DPS", "BITS", "NisSrv", "SgrmBroker")
                 foreach ($svc in $DefenderServices) {
                     try {
                         $svcObj = Get-Service -Name $svc -ErrorAction SilentlyContinue
@@ -2305,6 +2336,37 @@ function Start-Monitoring {
                             Write-Log -Message "Resurrection killer: re-disabled $svc" -Type "INFO" -Color Gray
                         }
                     } catch { }
+                }
+            }
+
+            # --- Periodic Existing Process Elevation: Re-elevate every 60 seconds ---
+            if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(60)) {
+                $lastExistingElevate = Get-Date
+                $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+                foreach ($proc in $ExistingProcesses) {
+                    $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
+                    if ($CriticalProcs -contains $procName) { continue }
+                    $path = $proc.ExecutablePath
+                    $arguments = ""
+                    if ($proc.CommandLine) {
+                        $cmdLine = $proc.CommandLine
+                        if ($cmdLine.StartsWith('"')) {
+                            $endQuote = $cmdLine.IndexOf('"', 1)
+                            if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                                $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                            }
+                        } else {
+                            $firstSpace = $cmdLine.IndexOf(' ')
+                            if ($firstSpace -gt 0) {
+                                $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                            }
+                        }
+                    }
+                    if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+                        $lastElevated[$path] = Get-Date
+                        Elevate-Process -Path $path -Arguments $arguments
+                        Start-Sleep -Milliseconds 100
+                    }
                 }
             }
 
