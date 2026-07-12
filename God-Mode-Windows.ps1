@@ -1590,16 +1590,13 @@ function Disable-ELAM {
 # --- Helper: Disable Security Auditing / Clear Logs ---
 function Disable-SecurityAuditing {
     try {
-        Stop-Service -Name "EventLog" -Force -ErrorAction SilentlyContinue
-        Set-Service -Name "EventLog" -StartupType Disabled -ErrorAction SilentlyContinue
-        Stop-Service -Name "CryptSvc" -Force -ErrorAction SilentlyContinue
-        Set-Service -Name "CryptSvc" -StartupType Disabled -ErrorAction SilentlyContinue
+        # Boot-critical services (EventLog, CryptSvc) are NOT stopped to avoid boot hangs
         $Channels = wevtutil el 2>$null
         if ($Channels) { $Channels | ForEach-Object { wevtutil cl "$_" 2>$null | Out-Null } }
         Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger" -ErrorAction SilentlyContinue | ForEach-Object {
             Set-ItemProperty -Path $_.PSPath -Name "Start" -Value 0 -Force -ErrorAction SilentlyContinue
         }
-        Write-Log -Message "Security auditing disabled and event logs cleared." -Type "INFO" -Color Gray
+        Write-Log -Message "Security auditing disabled and event logs cleared (boot-critical services preserved)." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "Failed to disable security auditing: $_" -Type "WARN" -Color Yellow }
 }
 
@@ -1933,8 +1930,8 @@ function Enable-DangerousMode {
         Write-Log -Message "Could not fully disable tamper protection via registry: $_" -Type "WARN" -Color Yellow
     }
 
-    # 2. Disable core Windows Defender services at the service level
-    $DefenderServices = @("WinDefend", "WdNisSvc", "WdNisDrv", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    # 2. Disable core Windows Defender user-mode services only (boot-critical drivers excluded)
+    $DefenderServices = @("WinDefend", "WdNisSvc", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
     foreach ($svc in $DefenderServices) {
         try {
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
