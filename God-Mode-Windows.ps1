@@ -1565,9 +1565,9 @@ function Add-DefenderExclusion {
 # --- Helper: Disable Safe Mode / Recovery ---
 function Disable-RecoveryAndSafeMode {
     try {
+        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
         bcdedit /set {current} bootstatuspolicy ignoreallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled No /f 2>$null | Out-Null
-        bcdedit /set {current} nx AlwaysOff /f 2>$null | Out-Null
         cmd /c "reagentc.exe /disable" 2>$null | Out-Null
         Write-Log -Message "Recovery and boot policies disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD edit failed: $_" -Type "WARN" -Color Yellow }
@@ -1598,7 +1598,8 @@ function Disable-SecurityAuditing {
         Set-Service -Name "EventLog" -StartupType Disabled -ErrorAction SilentlyContinue
         Stop-Service -Name "CryptSvc" -Force -ErrorAction SilentlyContinue
         Set-Service -Name "CryptSvc" -StartupType Disabled -ErrorAction SilentlyContinue
-        wevtutil el | ForEach-Object { wevtutil cl "$_" 2>$null | Out-Null }
+        $Channels = wevtutil el 2>$null
+        if ($Channels) { $Channels | ForEach-Object { wevtutil cl "$_" 2>$null | Out-Null } }
         Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger" -ErrorAction SilentlyContinue | ForEach-Object {
             Set-ItemProperty -Path $_.PSPath -Name "Start" -Value 0 -Force -ErrorAction SilentlyContinue
         }
@@ -1937,7 +1938,7 @@ function Enable-DangerousMode {
     }
 
     # 2. Disable core Windows Defender services at the service level
-    $DefenderServices = @("WinDefend", "WdNisSvc", "WdBootDriver", "WdFilter", "WdNisDrv", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
+    $DefenderServices = @("WinDefend", "WdNisSvc", "WdNisDrv", "wscsvc", "SecurityHealthService", "Sense", "MDCoreSvc")
     foreach ($svc in $DefenderServices) {
         try {
             Set-Service -Name $svc -StartupType Disabled -ErrorAction SilentlyContinue
@@ -2139,9 +2140,9 @@ function Disable-DangerousMode {
 
     # 8. Restore Safe Mode and Recovery
     try {
+        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
         bcdedit /set {current} bootstatuspolicy displayallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled Yes /f 2>$null | Out-Null
-        bcdedit /set {current} nx OptIn /f 2>$null | Out-Null
         cmd /c "reagentc.exe /enable" 2>$null | Out-Null
         Write-Log -Message "Windows RE and boot policies restored." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD restore failed: $_" -Type "WARN" -Color Yellow }
@@ -2284,9 +2285,12 @@ function Start-Monitoring {
             }
 
             # --- New Process Elevation ---
-            $newProcesses = Get-WmiObject Win32_Process | Where-Object {
-                $_.CreationDate -and 
-                ([datetime]::ParseExact($_.CreationDate.Substring(0,14), "yyyyMMddHHmmss", $null)) -gt (Get-Date).AddSeconds(-10)
+            $Now = Get-Date
+            $newProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                try {
+                    $_.CreationDate -and 
+                    ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-10)
+                } catch { $false }
             }
 
             foreach ($proc in $newProcesses) {
