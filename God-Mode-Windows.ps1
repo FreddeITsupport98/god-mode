@@ -1564,13 +1564,9 @@ function Add-DefenderExclusion {
 
 # --- Helper: Disable Safe Mode / Recovery ---
 function Disable-RecoveryAndSafeMode {
-    try {
-        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
-        bcdedit /set {current} bootstatuspolicy ignoreallfailures /f 2>$null | Out-Null
-        bcdedit /set {current} recoveryenabled No /f 2>$null | Out-Null
-        cmd /c "reagentc.exe /disable" 2>$null | Out-Null
-        Write-Log -Message "Recovery and boot policies disabled." -Type "INFO" -Color Gray
-    } catch { Write-Log -Message "BCD edit failed: $_" -Type "WARN" -Color Yellow }
+    # Intentionally left empty to avoid boot-level conflicts in VirtualBox
+    # Previous BCD edits caused BIOS logo hangs on reboot
+    Write-Log -Message "BCD/WinRE modifications skipped (boot-safe mode)." -Type "INFO" -Color Gray
 }
 
 # --- Helper: Suppress Security Center Alerts ---
@@ -2139,13 +2135,8 @@ function Disable-DangerousMode {
     try { Start-Service -Name WinDefend -ErrorAction SilentlyContinue } catch { Write-Log -Message "Could not restart WinDefend: $_" -Type "WARN" -Color Yellow }
 
     # 8. Restore Safe Mode and Recovery
-    try {
-        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
-        bcdedit /set {current} bootstatuspolicy displayallfailures /f 2>$null | Out-Null
-        bcdedit /set {current} recoveryenabled Yes /f 2>$null | Out-Null
-        cmd /c "reagentc.exe /enable" 2>$null | Out-Null
-        Write-Log -Message "Windows RE and boot policies restored." -Type "INFO" -Color Gray
-    } catch { Write-Log -Message "BCD restore failed: $_" -Type "WARN" -Color Yellow }
+    # BCD/WinRE modifications removed to prevent boot-level conflicts in VirtualBox
+    Write-Log -Message "BCD/WinRE restore skipped (boot-safe mode)." -Type "INFO" -Color Gray
 
     # 9. Restore Security Center alerts
     try {
