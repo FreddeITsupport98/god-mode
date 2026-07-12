@@ -1972,9 +1972,6 @@ function Enable-DangerousMode {
     # 4b. Suppress Security Center alerts
     Disable-SecurityAlerts
 
-    # 4c. Disable Early Launch Anti-Malware
-    Disable-ELAM
-
     # 5. Disable UAC / Admin Consent
     try {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" -Name EnableLUA -Value 0 -Force
@@ -2039,14 +2036,11 @@ function Enable-DangerousMode {
         "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
         "SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
         "SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications",
-        "SYSTEM\CurrentControlSet\Control\DeviceGuard",
-        "SYSTEM\CurrentControlSet\Control\EarlyLaunch",
         "SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
         "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
         "SOFTWARE\Policies\Microsoft\Windows\System",
         "SOFTWARE\Microsoft\Windows Script Host\Settings",
-        "SOFTWARE\Microsoft\Windows Defender\Features",
-        "SYSTEM\CurrentControlSet\Control\Lsa"
+        "SOFTWARE\Microsoft\Windows Defender\Features"
     )
     foreach ($Key in $GodModeRegistryKeys) {
         $null = Harden-RegistryKey -Path $Key
@@ -2064,14 +2058,11 @@ function Disable-DangerousMode {
         "SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System",
         "SOFTWARE\Policies\Microsoft\Windows Defender\Real-Time Protection",
         "SOFTWARE\Policies\Microsoft\Windows Defender Security Center\Notifications",
-        "SYSTEM\CurrentControlSet\Control\DeviceGuard",
-        "SYSTEM\CurrentControlSet\Control\EarlyLaunch",
         "SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU",
         "SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer",
         "SOFTWARE\Policies\Microsoft\Windows\System",
         "SOFTWARE\Microsoft\Windows Script Host\Settings",
-        "SOFTWARE\Microsoft\Windows Defender\Features",
-        "SYSTEM\CurrentControlSet\Control\Lsa"
+        "SOFTWARE\Microsoft\Windows Defender\Features"
     )
     foreach ($Key in $GodModeRegistryKeys) {
         $null = Restore-RegistryKey -Path $Key
