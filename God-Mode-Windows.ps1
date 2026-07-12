@@ -1565,12 +1565,11 @@ function Add-DefenderExclusion {
 # --- Helper: Disable Safe Mode / Recovery ---
 function Disable-RecoveryAndSafeMode {
     try {
-        bcdedit /set {current} safeboot minimal /f 2>$null | Out-Null
         bcdedit /set {current} bootstatuspolicy ignoreallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled No /f 2>$null | Out-Null
         bcdedit /set {current} nx AlwaysOff /f 2>$null | Out-Null
         cmd /c "reagentc.exe /disable" 2>$null | Out-Null
-        Write-Log -Message "Safe Mode and Recovery disabled." -Type "INFO" -Color Gray
+        Write-Log -Message "Recovery and boot policies disabled." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD edit failed: $_" -Type "WARN" -Color Yellow }
 }
 
@@ -2140,12 +2139,11 @@ function Disable-DangerousMode {
 
     # 8. Restore Safe Mode and Recovery
     try {
-        bcdedit /deletevalue {current} safeboot /f 2>$null | Out-Null
         bcdedit /set {current} bootstatuspolicy displayallfailures /f 2>$null | Out-Null
         bcdedit /set {current} recoveryenabled Yes /f 2>$null | Out-Null
         bcdedit /set {current} nx OptIn /f 2>$null | Out-Null
         cmd /c "reagentc.exe /enable" 2>$null | Out-Null
-        Write-Log -Message "Safe Mode and Windows RE restored." -Type "INFO" -Color Gray
+        Write-Log -Message "Windows RE and boot policies restored." -Type "INFO" -Color Gray
     } catch { Write-Log -Message "BCD restore failed: $_" -Type "WARN" -Color Yellow }
 
     # 9. Restore Security Center alerts
