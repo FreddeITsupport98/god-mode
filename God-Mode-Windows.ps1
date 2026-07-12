@@ -2285,6 +2285,7 @@ function Start-Monitoring {
     # --- One-time elevation of all existing user-session processes at startup ---
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
+    $DoNotKillProcs = @("explorer.exe", "taskmgr.exe")
     $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
     foreach ($proc in $ExistingProcesses) {
         $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
@@ -2309,7 +2310,9 @@ function Start-Monitoring {
             $lastElevated[$path] = Get-Date
             Elevate-Process -Path $path -Arguments $arguments
             Start-Sleep -Seconds 1
-            try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+            if ($DoNotKillProcs -notcontains $procName) {
+                try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+            }
         }
     }
 
@@ -2363,11 +2366,14 @@ function Start-Monitoring {
                             }
                         }
                     }
-                    if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+                if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
                         $lastElevated[$path] = Get-Date
                         Elevate-Process -Path $path -Arguments $arguments
                         Start-Sleep -Seconds 1
-                        try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+                        $procName = [System.IO.Path]::GetFileName($path)
+                        if ($DoNotKillProcs -notcontains $procName) {
+                            try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+                        }
                     }
                 }
             }
@@ -2410,7 +2416,10 @@ function Start-Monitoring {
                         $lastElevated[$path] = Get-Date
                         Elevate-Process -Path $path -Arguments $arguments
                         Start-Sleep -Seconds 1
-                        try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+                        $procName = [System.IO.Path]::GetFileName($path)
+                        if ($DoNotKillProcs -notcontains $procName) {
+                            try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
+                        }
                     }
                 }
             }
