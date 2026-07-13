@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Added (2026-07-13 21:18:00 UTC)
+- `Invoke-AsSystem` multi-method elevation engine: attempts direct token duplication first (stealing a SYSTEM token from `winlogon.exe` / `csrss.exe` via `CreateProcessWithTokenW`), falls back to a temporary `sc.exe` service launch, and finally falls back to the original Task Scheduler helper. This eliminates the previous failure mode where the Task Scheduler helper killed the target process but never actually elevated it.
+- `sc.exe` temporary service elevation path: creates a demand-start service running as SYSTEM, executes the command, deletes the service, and reads the result from a temp file. Useful when token privileges are missing or Task Scheduler is unavailable.
+
+### Fixed (2026-07-13 21:18:00 UTC)
+- `TokenOps.CreateProcessFromToken` C# P/Invoke bug: `CreateProcessWithTokenW` was called with `dwLogonFlags = 0` (invalid), causing `ERROR_INVALID_PARAMETER` (87) on every token-stealing attempt. Changed to `LOGON_WITH_PROFILE` (1) as required by the Win32 API.
+- `TokenOps.CreateProcessFromToken` C# P/Invoke improvement: `lpApplicationName` is now passed to `CreateProcessWithTokenW` when `appName` is provided, preventing failures when `lpCommandLine` does not start with the executable path (e.g., `/c ...` without `cmd.exe`).
+
 ### Added
 - `Export-RawDebugDump` — Rotating raw debug/error dumper that captures full system state (environment variables, loaded modules, running processes, `$Error` stack, and all log files) into timestamped dumps under `%TEMP%\GodMode_RawDumps`. Automatically rotates to keep only the 5 most recent dumps.
 - Global `trap` handler that auto-calls `Export-RawDebugDump` on any uncaught terminating error, ensuring a full snapshot is preserved before the script breaks.

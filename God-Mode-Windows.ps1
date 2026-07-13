@@ -1262,24 +1262,129 @@ function Invoke-AsSystem {
         [string]$Command,
         [int]$MaxWaitSeconds = 30
     )
+
     $TaskId = Get-Random -Minimum 10000 -Maximum 99999
-    $TempTaskName = "DNSGuard-Helper_$TaskId"
-    $CommonTemp = "C:\Windows\Temp"
-    $ResultFile = "$CommonTemp\DNSGuard_Result_$TaskId.txt"
-    $BatchFile = "$CommonTemp\DNSGuard_Batch_$TaskId.cmd"
-    Write-Log -Message "[DEBUG] Invoke-AsSystem called (TaskId=$TaskId)." -Type "INFO" -Color Yellow
+    $CommonTemp = $env:TEMP
+    $ResultFile = Join-Path $CommonTemp "InvokeAsSystem_Result_$TaskId.txt"
+    $BatchFile = Join-Path $CommonTemp "InvokeAsSystem_Batch_$TaskId.cmd"
 
-    # Ensure Task Scheduler service is running
+    Write-Log -Message "[Invoke-AsSystem] Starting multi-method SYSTEM elevation (TaskId=$TaskId)." -Type "INFO" -Color Yellow
+
+    # Build a batch wrapper that redirects all output to the result file and appends a done marker
+    $BatchContent = "@echo off`r`n$Command > `"$ResultFile`" 2>&1`r`necho ___DONE___ >> `"$ResultFile`""
+    Set-Content -Path $BatchFile -Value $BatchContent -Encoding ASCII -Force
+
+    # --- Method 1: Token Duplication (direct SYSTEM spawn) ---
     try {
-        $schedService = Get-Service -Name "Schedule" -ErrorAction SilentlyContinue
-        if ($schedService -and $schedService.Status -ne 'Running') {
-            Start-Service -Name "Schedule" -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
+        Enable-ElevationPrivileges
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -ne 0) {
+            Write-DebugLog -FunctionName "Invoke-AsSystem" -Action "INFO" -Message "Method 1: Token duplication using PID=$systemPid"
+            $err = [TokenOps]::CreateProcessFromToken($systemPid, "cmd.exe", "cmd.exe /c `"$BatchFile`"", $true)
+            if ($err -eq 0) {
+                Write-Log -Message "[Invoke-AsSystem] Token duplication succeeded (PID=$systemPid)." -Type "INFO" -Color Green
+                $waited = 0
+                while ($waited -lt $MaxWaitSeconds) {
+                    Start-Sleep -Seconds 1
+                    $waited++
+                    if (Test-Path $ResultFile) {
+                        $content = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
+                        if ($content -and $content.Contains("___DONE___")) {
+                            $output = ($content -replace "___DONE___", "").Trim()
+                            Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
+                            Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
+                            return [PSCustomObject]@{ Success = $true; Output = $output }
+                        }
+                    }
+                }
+                Write-Log -Message "[Invoke-AsSystem] Token duplication process did not write result within timeout." -Type "WARN" -Color Yellow
+            } else {
+                $errMsg = Get-Win32ErrorRootCause -ErrorCode $err -Context "CreateProcessWithTokenW"
+                Write-Log -Message "[Invoke-AsSystem] Token duplication failed: $errMsg" -Type "WARN" -Color Yellow
+            }
+        } else {
+            Write-Log -Message "[Invoke-AsSystem] No suitable SYSTEM process found for token duplication." -Type "WARN" -Color Yellow
         }
-    } catch {}
+    } catch {
+        Write-Log -Message "[Invoke-AsSystem] Token duplication exception: $_" -Type "WARN" -Color Yellow
+    }
+
+    # Cleanup Method 1 artifacts
+    Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
+
+    # --- Method 2: Temporary Service (sc.exe) ---
+    $ServiceName = "InvokeAsSystemSvc_$TaskId"
+    $ResultFile2 = Join-Path $CommonTemp "InvokeAsSystem_SvcResult_$TaskId.txt"
+    $BatchFile2 = Join-Path $CommonTemp "InvokeAsSystem_SvcBatch_$TaskId.cmd"
+
+    $BatchContent2 = "@echo off`r`n$Command > `"$ResultFile2`" 2>&1`r`necho ___DONE___ >> `"$ResultFile2`""
+    Set-Content -Path $BatchFile2 -Value $BatchContent2 -Encoding ASCII -Force
 
     try {
-        $BatchContent = @"
+        Write-DebugLog -FunctionName "Invoke-AsSystem" -Action "INFO" -Message "Method 2: Temporary service $ServiceName"
+        $scCreate = sc.exe create $ServiceName binPath= "cmd.exe /c `"$BatchFile2`"" start= demand
+        if ($LASTEXITCODE -eq 0) {
+            sc.exe start $ServiceName | Out-Null
+            Start-Sleep -Seconds 2
+
+            $waited = 0
+            $success = $false
+            while ($waited -lt $MaxWaitSeconds) {
+                Start-Sleep -Seconds 1
+                $waited++
+                if (Test-Path $ResultFile2) {
+                    $content = Get-Content -Path $ResultFile2 -Raw -ErrorAction SilentlyContinue
+                    if ($content -and $content.Contains("___DONE___")) {
+                        $output = ($content -replace "___DONE___", "").Trim()
+                        $success = $true
+                        break
+                    }
+                }
+            }
+
+            sc.exe stop $ServiceName | Out-Null
+            sc.exe delete $ServiceName | Out-Null
+
+            Remove-Item -Path $ResultFile2 -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $BatchFile2 -Force -ErrorAction SilentlyContinue
+
+            if ($success) {
+                Write-Log -Message "[Invoke-AsSystem] Temporary service method succeeded." -Type "INFO" -Color Green
+                return [PSCustomObject]@{ Success = $true; Output = $output }
+            } else {
+                Write-Log -Message "[Invoke-AsSystem] Temporary service method did not produce result within timeout." -Type "WARN" -Color Yellow
+            }
+        } else {
+            Write-Log -Message "[Invoke-AsSystem] Service creation failed (sc.exe exit code: $LASTEXITCODE). Output: $scCreate" -Type "WARN" -Color Yellow
+        }
+    } catch {
+        Write-Log -Message "[Invoke-AsSystem] Service method exception: $_" -Type "WARN" -Color Yellow
+    }
+
+    # Cleanup Method 2 artifacts
+    sc.exe stop $ServiceName | Out-Null
+    sc.exe delete $ServiceName | Out-Null
+    Remove-Item -Path $ResultFile2 -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $BatchFile2 -Force -ErrorAction SilentlyContinue
+
+    # --- Method 3: Task Scheduler Fallback ---
+    Write-Log -Message "[Invoke-AsSystem] Falling back to Task Scheduler method..." -Type "INFO" -Color Yellow
+
+    $TempTaskName = "DNSGuard-Helper_$TaskId"
+    $ResultFile3 = Join-Path $CommonTemp "DNSGuard_Result_$TaskId.txt"
+    $BatchFile3 = Join-Path $CommonTemp "DNSGuard_Batch_$TaskId.cmd"
+
+    try {
+        # Ensure Task Scheduler service is running
+        try {
+            $schedService = Get-Service -Name "Schedule" -ErrorAction SilentlyContinue
+            if ($schedService -and $schedService.Status -ne 'Running') {
+                Start-Service -Name "Schedule" -ErrorAction SilentlyContinue
+                Start-Sleep -Seconds 1
+            }
+        } catch {}
+
+        $BatchContent3 = @"
 @echo off
 cd /d $CommonTemp
 $Command
@@ -1289,8 +1394,8 @@ if %errorlevel% equ 0 (
     echo ___FAILED___
 )
 "@
-        $BatchContent | Out-File -FilePath $BatchFile -Encoding ASCII -Force
-        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile`" > `"$ResultFile`" 2>&1"
+        Set-Content -Path $BatchFile3 -Value $BatchContent3 -Encoding ASCII -Force
+        $Action = New-ScheduledTaskAction -Execute "cmd.exe" -Argument "/c `"$BatchFile3`" > `"$ResultFile3`" 2>&1"
         $Principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $TempTaskName -Action $Action -Principal $Principal -Force | Out-Null
         Start-Sleep -Milliseconds 500
@@ -1301,8 +1406,8 @@ if %errorlevel% equ 0 (
         while ($Waited -lt $MaxWaitSeconds) {
             Start-Sleep -Seconds 1
             $Waited++
-            if (Test-Path $ResultFile) {
-                $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
+            if (Test-Path $ResultFile3) {
+                $ResultText = Get-Content -Path $ResultFile3 -Raw -ErrorAction SilentlyContinue
                 if ($ResultText -and ($ResultText.Contains("___SUCCESS___") -or $ResultText.Contains("___FAILED___"))) {
                     $Completed = $true
                     $Success = $ResultText.Contains("___SUCCESS___")
@@ -1312,24 +1417,24 @@ if %errorlevel% equ 0 (
         }
         Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
         $Output = ""
-        if (Test-Path $ResultFile) {
-            $ResultText = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
+        if (Test-Path $ResultFile3) {
+            $ResultText = Get-Content -Path $ResultFile3 -Raw -ErrorAction SilentlyContinue
             $Output = ($ResultText -replace "___SUCCESS___", "" -replace "___FAILED___", "").Trim()
-            Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
+            Remove-Item -Path $ResultFile3 -Force -ErrorAction SilentlyContinue
         }
-        if (Test-Path $BatchFile) { Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue }
+        Remove-Item -Path $BatchFile3 -Force -ErrorAction SilentlyContinue
         if ($Completed) {
-            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName completed. Success=$Success" -Type "INFO" -Color Yellow
+            Write-Log -Message "[Invoke-AsSystem] Task Scheduler fallback completed. Success=$Success" -Type "INFO" -Color Yellow
             return [PSCustomObject]@{ Success = $Success; Output = $Output }
         } else {
-            Write-Log -Message "[DEBUG] SYSTEM task $TempTaskName did not complete within $MaxWaitSeconds seconds. Output: $Output" -Type "ERROR" -Color Red
+            Write-Log -Message "[Invoke-AsSystem] Task Scheduler fallback timed out." -Type "ERROR" -Color Red
             return [PSCustomObject]@{ Success = $false; Output = $Output }
         }
     } catch {
-        Write-Log -Message "SYSTEM helper task failed: $_" -Type "ERROR" -Color Red
+        Write-Log -Message "[Invoke-AsSystem] Task Scheduler fallback failed: $_" -Type "ERROR" -Color Red
         Unregister-ScheduledTask -TaskName $TempTaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
-        Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $ResultFile3 -Force -ErrorAction SilentlyContinue
+        Remove-Item -Path $BatchFile3 -Force -ErrorAction SilentlyContinue
         return [PSCustomObject]@{ Success = $false; Output = "" }
     }
 }
@@ -1959,10 +2064,11 @@ public class TokenOps {
                     if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
                     else creationFlags |= CREATE_NEW_CONSOLE;
 
+                    string app = appName;
                     string cmd = cmdLine;
                     if (string.IsNullOrEmpty(cmd)) { cmd = appName; }
 
-                    if (!CreateProcessWithTokenW(hDupToken, 0, null, cmd, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
+                    if (!CreateProcessWithTokenW(hDupToken, LOGON_WITH_PROFILE, app, cmd, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
                         return Marshal.GetLastWin32Error();
                     }
                     CloseHandle(pi.hProcess);
@@ -2923,7 +3029,7 @@ function Stop-NonSystemInstances {
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
-        Write-Log -Message "Not running as SYSTEM — skipping existing-process elevation. Token elevation requires SYSTEM privileges. After reboot, the monitoring loop (running as SYSTEM) will elevate all processes." -Type "INFO" -Color Gray
+        Write-Log -Message "Not running as SYSTEM -- skipping existing-process elevation. Token elevation requires SYSTEM privileges. After reboot, the monitoring loop (running as SYSTEM) will elevate all processes." -Type "INFO" -Color Gray
         return
     }
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
