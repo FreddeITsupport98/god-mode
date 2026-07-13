@@ -25,6 +25,17 @@ All notable changes to this project will be documented in this file.
   - Menu label dynamically shows `[16] UNINSTALL PERSISTENT SYSTEM IMPERSONATION (Active)` when installed, or `[16] INSTALL PERSISTENT SYSTEM IMPERSONATION (System-Wide + All PowerShell sessions)` when not. Guarded by `Test-BuiltInAdmin`.
   - Prompt updated from `(1-15)` to `(1-16)`.
 
+### Added (2026-07-13 22:43:00 UTC)
+- **Menu option [17] SYSTEM DESKTOP SESSION (Toggle).** Makes the entire Windows desktop (Explorer, Start Menu, Taskbar, Desktop) run as SYSTEM at every logon by using `CreateProcessAsUser` with a stolen `winlogon.exe` SYSTEM token modified for Session 1.
+  - New C# P/Invoke additions to `TokenOps`: `SetTokenInformation`, `CreateProcessAsUser`, `TokenSessionId` constant, and `CreateProcessAsSystem` helper method. `CreateProcessAsSystem` opens a SYSTEM process, duplicates its token to primary, explicitly sets `TokenSessionId` to 1, and calls `CreateProcessAsUser` to spawn `explorer.exe` on the interactive desktop (`WinSta0\Default`).
+  - `Start-SystemDesktopExplorer`: Finds `winlogon.exe` in Session 1, enables `SeIncreaseQuotaPrivilege`, kills the existing user `explorer.exe`, and calls `CreateProcessAsSystem` to start a SYSTEM-owned `explorer.exe` in the user's desktop session.
+  - `Install-SystemDesktopSession`: Registers a scheduled task `Windows-Session-Manager` triggered at both `AtStartup` and `AtLogOn`, running as `S-1-5-18` ServiceAccount. If the current process is not SYSTEM, it uses `Invoke-AsSystem` to immediately elevate and start the desktop session. After installation, `explorer` restarts as SYSTEM at every boot and logon.
+  - `Uninstall-SystemDesktopSession`: Unregisters the `Windows-Session-Manager` scheduled task.
+  - `Test-SystemDesktopSession`: Returns `$true` if the scheduled task exists.
+  - Menu label dynamically shows `[17] UNINSTALL SYSTEM DESKTOP SESSION (Active)` when installed, or `[17] INSTALL SYSTEM DESKTOP SESSION (Run Explorer as SYSTEM)` when not. Guarded by `Test-BuiltInAdmin`.
+  - New CLI flag `-SystemDesktop` triggers `Start-SystemDesktopExplorer` directly for non-interactive use.
+  - Prompt updated from `(1-16)` to `(1-17)`.
+
 ### Added (2026-07-13 21:18:00 UTC)
 - `Invoke-AsSystem` multi-method elevation engine: attempts direct token duplication first (stealing a SYSTEM token from `winlogon.exe` / `csrss.exe` via `CreateProcessWithTokenW`), falls back to a temporary `sc.exe` service launch, and finally falls back to the original Task Scheduler helper. This eliminates the previous failure mode where the Task Scheduler helper killed the target process but never actually elevated it.
 - `sc.exe` temporary service elevation path: creates a demand-start service running as SYSTEM, executes the command, deletes the service, and reads the result from a temp file. Useful when token privileges are missing or Task Scheduler is unavailable.

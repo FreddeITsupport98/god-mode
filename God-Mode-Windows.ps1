@@ -29,6 +29,7 @@ param (
     [switch]$DumpLogs,
     [switch]$ExportElevationDiagnostics,
     [switch]$ElevateAllProcesses,
+    [switch]$SystemDesktop,
     [switch]$DebugMode
 )
 
@@ -2044,6 +2045,69 @@ public class TokenOps {
 
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool SetThreadToken(IntPtr ThreadHandle, IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool SetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, ref int TokenInformation, int TokenInformationLength);
+
+    public const int TokenSessionId = 12;
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessAsUser(
+        IntPtr hToken,
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    public static int CreateProcessAsSystem(int pid, string appName, string cmdLine, bool hideWindow) {
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProcess == IntPtr.Zero) return Marshal.GetLastWin32Error();
+        try {
+            IntPtr hToken = IntPtr.Zero;
+            if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, out hToken)) {
+                return Marshal.GetLastWin32Error();
+            }
+            try {
+                IntPtr hPrimaryToken = IntPtr.Zero;
+                if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken)) {
+                    return Marshal.GetLastWin32Error();
+                }
+                try {
+                    int sessionId = 1;
+                    SetTokenInformation(hPrimaryToken, TokenSessionId, ref sessionId, 4);
+                    STARTUPINFO si = new STARTUPINFO();
+                    si.cb = Marshal.SizeOf(si);
+                    si.lpDesktop = "WinSta0\\Default";
+                    if (hideWindow) {
+                        si.dwFlags = 0x00000001;
+                        si.wShowWindow = 0;
+                    }
+                    PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+                    uint creationFlags = CREATE_UNICODE_ENVIRONMENT;
+                    if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
+                    else creationFlags |= CREATE_NEW_CONSOLE;
+                    if (!CreateProcessAsUser(hPrimaryToken, appName, cmdLine, IntPtr.Zero, IntPtr.Zero, false, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
+                        return Marshal.GetLastWin32Error();
+                    }
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    return 0;
+                } finally {
+                    CloseHandle(hPrimaryToken);
+                }
+            } finally {
+                CloseHandle(hToken);
+            }
+        } finally {
+            CloseHandle(hProcess);
+        }
+    }
 }
 "@
 
@@ -2434,6 +2498,86 @@ function Test-PersistentSystemImpersonation {
         if (-not (Test-Path $ProfilePath)) { return $false }
         $content = Get-Content -Path $ProfilePath -Raw -ErrorAction SilentlyContinue
         return ($content -and $content.Contains("GODMODE_PERSISTENT_IMPERSONATION"))
+    } catch {
+        return $false
+    }
+}
+
+function Start-SystemDesktopExplorer {
+    param([int]$TargetSessionId = 1)
+    try {
+        Enable-ElevationPrivileges
+        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        $winlogon = Get-CimInstance Win32_Process -Filter "Name='winlogon.exe' AND SessionId=$TargetSessionId" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $winlogon) {
+            Write-Host "[ERROR] winlogon.exe not found in Session $TargetSessionId" -ForegroundColor Red
+            return $false
+        }
+        Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+        $result = [TokenOps]::CreateProcessAsSystem($winlogon.ProcessId, "C:\Windows\explorer.exe", "C:\Windows\explorer.exe", $false)
+        if ($result -eq 0) {
+            Write-Host "[SUCCESS] SYSTEM desktop explorer started in Session $TargetSessionId" -ForegroundColor Green
+            return $true
+        } else {
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsUser"
+            Write-Host "[ERROR] CreateProcessAsSystem failed: $errMsg" -ForegroundColor Red
+            return $false
+        }
+    } catch {
+        Write-Host "[ERROR] Exception: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Install-SystemDesktopSession {
+    Write-DebugLog -FunctionName "Install-SystemDesktopSession" -Action "ENTRY"
+    try {
+        $taskName = "Windows-Session-Manager"
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -SystemDesktop"
+        $trigger1 = New-ScheduledTaskTrigger -AtStartup
+        $trigger2 = New-ScheduledTaskTrigger -AtLogOn
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger @($trigger1, $trigger2) -Principal $principal -Force | Out-Null
+        $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+        if ($isSystem) {
+            Start-SystemDesktopExplorer
+        } else {
+            $tempScript = Join-Path $env:TEMP "GodMode_SystemDesktop_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+            Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+            $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -SystemDesktop" -MaxWaitSeconds 180
+            Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+            if ($result.Success) {
+                Write-Host "[SUCCESS] SYSTEM desktop explorer started via service elevation." -ForegroundColor Green
+            } else {
+                Write-Host "[WARN] Immediate elevation failed: $($result.Output). Desktop will elevate after next reboot/logon." -ForegroundColor Yellow
+            }
+        }
+        Write-Host "[SUCCESS] SYSTEM desktop session installed. Task: $taskName" -ForegroundColor Green
+        Write-Host "[INFO] Explorer will restart as SYSTEM at every logon and startup." -ForegroundColor Cyan
+        Write-DebugLog -FunctionName "Install-SystemDesktopSession" -Action "EXIT" -Message "Success"
+    } catch {
+        Write-Host "[ERROR] Failed to install SYSTEM desktop session: $($_.Exception.Message)" -ForegroundColor Red
+        Write-DebugLog -FunctionName "Install-SystemDesktopSession" -Action "ERROR" -Message "Failed" -ErrorRecord $_
+    }
+}
+
+function Uninstall-SystemDesktopSession {
+    try {
+        $taskName = "Windows-Session-Manager"
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "[SUCCESS] SYSTEM desktop session uninstalled." -ForegroundColor Green
+    } catch {
+        Write-Host "[ERROR] Failed to uninstall SYSTEM desktop session: $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+function Test-SystemDesktopSession {
+    try {
+        $taskName = "Windows-Session-Manager"
+        $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        return ($null -ne $task)
     } catch {
         return $false
     }
@@ -4313,6 +4457,10 @@ if ($ElevateAllProcesses) {
     Invoke-ExistingProcessElevation
     Exit
 }
+if ($SystemDesktop) {
+    Start-SystemDesktopExplorer
+    Exit
+}
 
 # If no flags are passed, load the Interactive Menu
 do {
@@ -4392,8 +4540,14 @@ do {
         Write-Host "[16] INSTALL PERSISTENT SYSTEM IMPERSONATION (System-Wide + All PowerShell sessions)" -ForegroundColor Magenta
     }
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    if (Test-SystemDesktopSession) {
+        Write-Host "[17] UNINSTALL SYSTEM DESKTOP SESSION (Active)" -ForegroundColor Red
+    } else {
+        Write-Host "[17] INSTALL SYSTEM DESKTOP SESSION (Run Explorer as SYSTEM)" -ForegroundColor Magenta
+    }
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-16)"
+    $Choice = Read-Host "Select an administrative action (1-17)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -4506,6 +4660,20 @@ do {
                     Uninstall-PersistentSystemImpersonation
                 } else {
                     Install-PersistentSystemImpersonation
+                }
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "17" {
+            if (-not (Test-BuiltInAdmin)) {
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator can install SYSTEM desktop session.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
+            } else {
+                if (Test-SystemDesktopSession) {
+                    Uninstall-SystemDesktopSession
+                } else {
+                    Install-SystemDesktopSession
                 }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
