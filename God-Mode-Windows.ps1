@@ -27,6 +27,7 @@ param (
     [switch]$InstallGodMode,
     [switch]$UninstallGodMode,
     [switch]$DumpLogs,
+    [switch]$ExportElevationDiagnostics,
     [switch]$DebugMode
 )
 
@@ -84,6 +85,7 @@ if (-not $Principal.IsInRole($Role)) {
         if ($SilentLock) { $ArgsString += " -SilentLock" }
         if ($DebugMode) { $ArgsString += " -DebugMode" }
         if ($Verbose) { $ArgsString += " -Verbose" }
+        if ($ExportElevationDiagnostics) { $ArgsString += " -ExportElevationDiagnostics" }
 
         $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
@@ -417,7 +419,10 @@ function Get-ProcessElevationContext {
 }
 
 function Export-ElevationDiagnostics {
-    param([string]$Trigger = "Auto")
+    param(
+        [string]$Trigger = "Auto",
+        [string]$DestinationFolder = [Environment]::GetFolderPath("Desktop")
+    )
     $dump = @()
     $dump += "===== ELEVATION DIAGNOSTICS DUMP ====="
     $dump += "Trigger: $Trigger"
@@ -449,7 +454,7 @@ function Export-ElevationDiagnostics {
     }
     $dump += ""
     $dump += "----- END ELEVATION DIAGNOSTICS -----"
-    $dumpPath = Join-Path $env:TEMP "GodMode_ElevationDiagnostics_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
+    $dumpPath = Join-Path $DestinationFolder "GodMode_ElevationDiagnostics_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
     $dump -join "`r`n" | Out-File -FilePath $dumpPath -Encoding UTF8 -Force
     Write-Log -Message "Elevation diagnostics exported to: $dumpPath" -Type "DEBUG" -Color Gray
     Write-DebugLog -FunctionName "Export-ElevationDiagnostics" -Action "INFO" -Message "Dump written to $dumpPath"
@@ -3848,6 +3853,15 @@ if ($DumpLogs) {
     Export-GodModeLogs
     Exit
 }
+if ($ExportElevationDiagnostics) {
+    $diagPath = Export-ElevationDiagnostics -Trigger "ManualCLI"
+    if ($diagPath) {
+        Write-Host "[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
+    } else {
+        Write-Host "[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
+    }
+    Exit
+}
 
 # If no flags are passed, load the Interactive Menu
 do {
@@ -3911,9 +3925,10 @@ do {
     Write-Host "[12] EXIT TERMINAL" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[13] VERIFY SYSTEM CONTEXT" -ForegroundColor Cyan
+    Write-Host "[14] EXPORT ELEVATION DIAGNOSTICS" -ForegroundColor Cyan
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-13)"
+    $Choice = Read-Host "Select an administrative action (1-14)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -3993,6 +4008,15 @@ do {
         }
         "9" { Show-GodModeStatus; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "13" { Test-SystemContext; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
+        "14" {
+            $diagPath = Export-ElevationDiagnostics -Trigger "ManualMenu"
+            if ($diagPath) {
+                Write-Host "`n[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
+            } else {
+                Write-Host "`n[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
         "10" {
             if (-not (Test-BuiltInAdmin)) {
                 $sidInfo = Get-CurrentUserSidInfo

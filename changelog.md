@@ -44,7 +44,8 @@ All notable changes to this project will be documented in this file.
 - Added `Test-SystemContext` function and menu option `[13] VERIFY SYSTEM CONTEXT` — runs `whoami` and `whoami /groups` as SYSTEM via `Invoke-AsSystem` and displays the live output, proving SYSTEM execution works.
 - Added `Get-CurrentUserSidInfo` helper that returns current SID, `IsAdmin`, and `IsBuiltInAdmin` flags.
 |- All `Test-BuiltInAdmin` access-denied messages (CLI handlers and interactive menu) now print the actual SID, admin status, and built-in admin status so users can see exactly why they are blocked.
-|- Menu prompt updated from `(1-12)` to `(1-13)` to reflect the new option.
+||- Menu prompt updated from `(1-12)` to `(1-14)` to reflect the new options [13] VERIFY SYSTEM CONTEXT and [14] EXPORT ELEVATION DIAGNOSTICS.
+||- New CLI flag `-ExportElevationDiagnostics` exports the full elevation diagnostics dump without opening the interactive menu.
 
 ### Fixed (2026-07-10 20:08 UTC)
 ||- `Uninstall-GodModePersistence` now explicitly deletes `GodMode.ps1` via `cmd /c del /f /q` before attempting directory removal, and the SYSTEM fallback command was tightened to explicitly delete the file then remove the directory with `cmd /c rd /s /q`. This prevents the hardened install directory from leaving the payload behind.
