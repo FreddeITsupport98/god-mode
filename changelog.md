@@ -47,8 +47,15 @@ All notable changes to this project will be documented in this file.
 |- Menu prompt updated from `(1-12)` to `(1-13)` to reflect the new option.
 
 ### Fixed (2026-07-10 20:08 UTC)
-|- `Uninstall-GodModePersistence` now explicitly deletes `GodMode.ps1` via `cmd /c del /f /q` before attempting directory removal, and the SYSTEM fallback command was tightened to explicitly delete the file then remove the directory with `cmd /c rd /s /q`. This prevents the hardened install directory from leaving the payload behind.
-|- `Uninstall-Persistence` hardened cleanup for the DNS-Guard install directory now follows the same explicit file-then-directory deletion pattern via `cmd /c del /f /q` and `cmd /c rd /s /q`, improving reliability against hardened ACLs.
+||- `Uninstall-GodModePersistence` now explicitly deletes `GodMode.ps1` via `cmd /c del /f /q` before attempting directory removal, and the SYSTEM fallback command was tightened to explicitly delete the file then remove the directory with `cmd /c rd /s /q`. This prevents the hardened install directory from leaving the payload behind.
+||- `Uninstall-Persistence` hardened cleanup for the DNS-Guard install directory now follows the same explicit file-then-directory deletion pattern via `cmd /c del /f /q` and `cmd /c rd /s /q`, improving reliability against hardened ACLs.
+
+### Fixed (2026-07-13 18:40:00 UTC)
+||- **Post-reboot elevation failure (monitoring-loop flapping):** After pressing menu 7 and rebooting, `Start-Monitoring` was constantly killed and restarted by competing persistence layers (startup task, guardian task, WMI `Win32_ProcessStartupTrace` subscription, and backup tasks). Each `-ToggleOn` run called `Register-StealthTask`, which unconditionally called `Unregister-StealthTask`, terminating the already-running monitoring loop before it could elevate any new process.
+||  - `Register-StealthTask` now checks if a stealth task is already `Running` and skips re-registration.
+||  - `Enable-GodMode` now checks if the God Mode flag is already set and the monitor is already running, and exits idempotently if so.
+||  - Deep-persistence WMI subscription changed from `Win32_ProcessStartupTrace` (fires on every process start, causing hundreds of `-ToggleOn` launches) to `__InstanceModificationEvent` with `WITHIN 300` polling on `Win32_Service` (sufficient periodic re-trigger without flapping).
+||- **Periodic elevation missing critical-process guard:** `$CriticalProcs` was defined only inside `Invoke-ExistingProcessElevation`, so the periodic re-elevation block inside `Start-Monitoring` silently referenced an undefined variable and would not skip critical processes. `$CriticalProcs` is now defined at the top of `Start-Monitoring` before the `while` loop.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.

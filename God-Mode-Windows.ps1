@@ -1867,13 +1867,18 @@ function Register-DeepPersistence {
             Write-Log -Message "Deep persistence task $taskName registered." -Type "INFO" -Color Gray
         }
         
-        # WMI boot-level persistence (fires on Win32_Process startup within 60 seconds of boot)
+        # WMI boot-level persistence (low-frequency service-modification trigger).
+        # NOTE: Win32_ProcessStartupTrace was used previously but fires on EVERY
+        # process start, spawning hundreds of -ToggleOn PowerShell processes and
+        # constantly killing the Start-Monitoring loop via Register-StealthTask.
+        # Switched to a 300-second service-modification poll which is sufficient
+        # as a periodic re-trigger without causing monitoring-loop flapping.
         $WmiName = "Win32BootHealthCheck"
         $FilterPath = Set-WmiInstance -Class __EventFilter -Namespace "root\subscription" -Arguments @{
             Name = $WmiName
             EventNamespace = "root\cimv2"
             QueryLanguage = "WQL"
-            Query = "SELECT * FROM Win32_ProcessStartupTrace"
+            Query = "SELECT * FROM __InstanceModificationEvent WITHIN 300 WHERE TargetInstance ISA 'Win32_Service'"
         } -ErrorAction SilentlyContinue
         $ConsumerPath = Set-WmiInstance -Class CommandLineEventConsumer -Namespace "root\subscription" -Arguments @{
             Name = $WmiName
@@ -2197,6 +2202,17 @@ function Disable-DangerousMode {
 }
 
 function Register-StealthTask {
+    # Don't kill an already-running monitoring loop.
+    # Multiple -ToggleOn persistence layers fire at startup and would otherwise
+    # unregister each other's stealth task, causing Start-Monitoring to flap and
+    # never stabilize (post-reboot elevation bug).
+    $RunningStealth = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.State -eq 'Running' }
+    if ($RunningStealth) {
+        Write-Log -Message "Stealth monitoring task already running ($($RunningStealth.TaskName)). Skipping re-registration to prevent flapping." -Type "INFO" -Color Gray
+        return
+    }
+
     $taskName = $GodModeTaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
     Unregister-StealthTask
 
@@ -2326,6 +2342,10 @@ function Start-Monitoring {
     Invoke-StealthMode
 
     Write-Log -Message "Monitoring started with auto-recovery and resurrection killer." -Type "INFO"
+
+    # Critical processes that must never be re-elevated by the periodic loop.
+    # Defined here so it is in scope for the periodic elevation block below.
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
 
     $lastElevated = @{}   # Process path -> last elevated time (for startup/periodic scans)
     $lastElevatedPid = @{} # Process ID -> elevated time (for new process detection)
@@ -2457,6 +2477,26 @@ function Enable-GodMode {
         Write-Log -Message "God Mode install script not found. Copying payload to $GodModeInstallScript..." -Type "INFO" -Color Yellow
         if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
         Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force
+    }
+
+    # --- Idempotency: if God Mode is already enabled and the monitoring loop is
+    #     running, skip re-registration. This prevents the many -ToggleOn
+    #     persistence layers (startup tasks, guardian, WMI) from killing the
+    #     Start-Monitoring loop via Register-StealthTask -> Unregister-StealthTask.
+    #     Without this, the loop flaps constantly after reboot and never elevates. ---
+    $FlagAlreadySet = $false
+    try {
+        $ExistingFlag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
+        if ($ExistingFlag -and $ExistingFlag.$GodModeFlagRegName -eq 1) { $FlagAlreadySet = $true }
+    } catch {}
+    if ($FlagAlreadySet) {
+        $RunningMonitor = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.State -eq 'Running' }
+        if ($RunningMonitor) {
+            Write-Log -Message "God Mode already enabled and monitor running ($($RunningMonitor.TaskName)). Skipping re-registration to prevent flapping." -Type "INFO" -Color Gray
+            Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Idempotent skip (monitor already running)"
+            return
+        }
     }
 
     # Ensure main task and guardian exist (for users who press 7 without 6)
