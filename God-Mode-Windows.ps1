@@ -3500,6 +3500,156 @@ function Stop-NonSystemInstances {
     } catch { }
 }
 
+function Invoke-ParallelElevation {
+    param(
+        [array]$Targets,
+        [int]$systemPid,
+        [int]$MaxThreads = 8,
+        [switch]$HideWindow
+    )
+    $total = $Targets.Count
+    if ($total -eq 0) { return @() }
+
+    $canParallel = $false
+    try {
+        $null = Get-Command Start-ThreadJob -ErrorAction Stop
+        $canParallel = $true
+    } catch {
+        try {
+            Import-Module ThreadJob -ErrorAction Stop
+            $canParallel = $true
+        } catch {}
+    }
+
+    if (-not $canParallel) {
+        $results = @()
+        foreach ($proc in $Targets) {
+            $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
+            $hasSystem = $false
+            try {
+                $wmiProcs = Get-CimInstance Win32_Process -Filter "Name='$procName.exe'" -ErrorAction SilentlyContinue
+                foreach ($wp in $wmiProcs) {
+                    try {
+                        $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
+                        if ($owner.User -eq "SYSTEM") { $hasSystem = $true; break }
+                    } catch {}
+                }
+            } catch {}
+            if ($hasSystem) {
+                $results += [PSCustomObject]@{ Name = $procName; Result = "SKIP"; Error = "" }
+                continue
+            }
+            try {
+                $wmiProcs = Get-CimInstance Win32_Process -Filter "Name='$procName.exe'" -ErrorAction SilentlyContinue
+                foreach ($wp in $wmiProcs) {
+                    try {
+                        $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
+                        if ($owner.User -ne "SYSTEM") {
+                            Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+                        }
+                    } catch {}
+                }
+            } catch {}
+            $arguments = ""
+            if ($proc.CommandLine) {
+                $cmdLine = $proc.CommandLine
+                if ($cmdLine.StartsWith('"')) {
+                    $endQuote = $cmdLine.IndexOf('"', 1)
+                    if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                        $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                    }
+                } else {
+                    $firstSpace = $cmdLine.IndexOf(' ')
+                    if ($firstSpace -gt 0) {
+                        $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                    }
+                }
+            }
+            $cmdLine = if ($arguments) { "`"$($proc.ExecutablePath)`" $arguments" } else { "`"$($proc.ExecutablePath)`"" }
+            $result = [TokenOps]::CreateProcessAsSystem($systemPid, $proc.ExecutablePath, $cmdLine, [bool]$HideWindow)
+            if ($result -eq 0) {
+                $results += [PSCustomObject]@{ Name = $procName; Result = "SUCCESS"; Error = "" }
+            } else {
+                $results += [PSCustomObject]@{ Name = $procName; Result = "FAIL"; Error = $result.ToString() }
+            }
+        }
+        return $results
+    }
+
+    $batchSize = [math]::Ceiling($total / $MaxThreads)
+    $jobs = @()
+    for ($i = 0; $i -lt $MaxThreads; $i++) {
+        $start = $i * $batchSize
+        $end = [math]::Min(($i + 1) * $batchSize, $total)
+        if ($start -ge $total) { break }
+        $chunk = $Targets[$start..($end-1)]
+        $job = Start-ThreadJob -ScriptBlock {
+            param($chunk, $systemPid, $hideWindow)
+            $results = @()
+            foreach ($proc in $chunk) {
+                $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
+                $hasSystem = $false
+                try {
+                    $wmiProcs = Get-CimInstance Win32_Process -Filter "Name='$procName.exe'" -ErrorAction SilentlyContinue
+                    foreach ($wp in $wmiProcs) {
+                        try {
+                            $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
+                            if ($owner.User -eq "SYSTEM") { $hasSystem = $true; break }
+                        } catch {}
+                    }
+                } catch {}
+                if ($hasSystem) {
+                    $results += [PSCustomObject]@{ Name = $procName; Result = "SKIP"; Error = "" }
+                    continue
+                }
+                try {
+                    $wmiProcs = Get-CimInstance Win32_Process -Filter "Name='$procName.exe'" -ErrorAction SilentlyContinue
+                    foreach ($wp in $wmiProcs) {
+                        try {
+                            $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
+                            if ($owner.User -ne "SYSTEM") {
+                                Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
+                            }
+                        } catch {}
+                    }
+                } catch {}
+                $arguments = ""
+                if ($proc.CommandLine) {
+                    $cmdLine = $proc.CommandLine
+                    if ($cmdLine.StartsWith('"')) {
+                        $endQuote = $cmdLine.IndexOf('"', 1)
+                        if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                            $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                        }
+                    } else {
+                        $firstSpace = $cmdLine.IndexOf(' ')
+                        if ($firstSpace -gt 0) {
+                            $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                        }
+                    }
+                }
+                $cmdLine = if ($arguments) { "`"$($proc.ExecutablePath)`" $arguments" } else { "`"$($proc.ExecutablePath)`"" }
+                $result = [TokenOps]::CreateProcessAsSystem($systemPid, $proc.ExecutablePath, $cmdLine, $hideWindow)
+                if ($result -eq 0) {
+                    $results += [PSCustomObject]@{ Name = $procName; Result = "SUCCESS"; Error = "" }
+                } else {
+                    $results += [PSCustomObject]@{ Name = $procName; Result = "FAIL"; Error = $result.ToString() }
+                }
+            }
+            return $results
+        } -ArgumentList $chunk, $systemPid, [bool]$HideWindow
+        $jobs += $job
+    }
+
+    $allResults = @()
+    foreach ($job in $jobs) {
+        $jobResult = $job | Wait-Job | Receive-Job
+        $allResults += $jobResult
+        Remove-Job $job -Force
+    }
+    return $allResults
+}
+
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
@@ -3580,54 +3730,33 @@ function Invoke-ExistingProcessElevation {
     $skipped = 0
     $successCount = 0
     $failCount = 0
-    Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate." -Type "INFO" -Color Yellow
-    $processedNames = @()
-    foreach ($proc in $targetProcs) {
-        $count++
-        if ($count % 5 -eq 0 -or $count -eq $total) {
-            Write-Log -Message "Elevating process $count of $total ($skipped skipped, $successCount succeeded)..." -Type "INFO" -Color Gray
-        }
+    Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate. Deduplicating and launching parallel elevation..." -Type "INFO" -Color Yellow
+
+    # Deduplicate by process name (detect first)
+    $seen = @{}
+    $uniqueTargets = foreach ($proc in $targetProcs) {
         $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
-        # Deduplicate: only handle each unique process name once
-        if ($processedNames -contains $procName) { continue }
-        $processedNames += $procName
-
-        # Always purge non-SYSTEM instances before starting a SYSTEM one
-        Stop-NonSystemInstances -ProcessName "$procName.exe"
-        Start-Sleep -Milliseconds 300
-
-        # If a SYSTEM instance is already present after cleanup, skip
-        if (Test-SystemProcessExists -ProcessName "$procName.exe") {
-            $skipped++
-            continue
+        if (-not $seen.ContainsKey($procName)) {
+            $seen[$procName] = $true
+            $proc
         }
+    }
 
-        $path = $proc.ExecutablePath
-        $arguments = ""
-        if ($proc.CommandLine) {
-            $cmdLine = $proc.CommandLine
-            if ($cmdLine.StartsWith('"')) {
-                $endQuote = $cmdLine.IndexOf('"', 1)
-                if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
-                    $arguments = $cmdLine.Substring($endQuote + 1).Trim()
-                }
-            } else {
-                $firstSpace = $cmdLine.IndexOf(' ')
-                if ($firstSpace -gt 0) {
-                    $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
-                }
-            }
-        }
-        $cmdLine = if ($arguments) { "`"$path`" $arguments" } else { "`"$path`"" }
-        $result = [TokenOps]::CreateProcessAsSystem($systemPid, $path, $cmdLine, $false)
-        if ($result -eq 0) {
-            $successCount++
-            Write-Log -Message "SYSTEM elevated: $procName" -Type "INFO" -Color Green
-        } else {
-            $failCount++
-            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsUser"
-            Write-Log -Message "SYSTEM elevation failed for $procName : $errMsg" -Type "WARN" -Color Yellow
-        }
+    $uniqueTotal = $uniqueTargets.Count
+    Write-Log -Message "Parallel elevation: $uniqueTotal unique process names after deduplication. Spawning $([math]::Min(8, $uniqueTotal)) threads..." -Type "INFO" -Color Yellow
+
+    $results = Invoke-ParallelElevation -Targets $uniqueTargets -systemPid $systemPid -MaxThreads 8
+
+    $successCount = ($results | Where-Object { $_.Result -eq "SUCCESS" }).Count
+    $failCount = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
+    $skipped = ($results | Where-Object { $_.Result -eq "SKIP" }).Count
+
+    foreach ($r in ($results | Where-Object { $_.Result -eq "FAIL" })) {
+        $errMsg = Get-Win32ErrorRootCause -ErrorCode ([int]$r.Error) -Context "CreateProcessAsUser"
+        Write-Log -Message "SYSTEM elevation failed for $($r.Name) : $errMsg" -Type "WARN" -Color Yellow
+    }
+    foreach ($r in ($results | Where-Object { $_.Result -eq "SUCCESS" })) {
+        Write-Log -Message "SYSTEM elevated: $($r.Name)" -Type "INFO" -Color Green
     }
     Write-Log -Message "Aggressive process elevation complete ($successCount succeeded, $failCount failed, $skipped skipped)." -Type "INFO" -Color Gray
 }
@@ -3746,34 +3875,53 @@ function Start-Monitoring {
             if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(15)) {
                 $lastExistingElevate = Get-Date
                 $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+
+                # Build due list (detect first, then set in parallel)
+                $dueProcesses = @()
                 foreach ($proc in $ExistingProcesses) {
                     $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
                     if ($CriticalProcs -contains $procName) { continue }
                     $path = $proc.ExecutablePath
-                    $arguments = ""
-                    if ($proc.CommandLine) {
-                        $cmdLine = $proc.CommandLine
-                        if ($cmdLine.StartsWith('"')) {
-                            $endQuote = $cmdLine.IndexOf('"', 1)
-                            if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
-                                $arguments = $cmdLine.Substring($endQuote + 1).Trim()
-                            }
-                        } else {
-                            $firstSpace = $cmdLine.IndexOf(' ')
-                            if ($firstSpace -gt 0) {
-                                $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
-                            }
-                        }
-                    }
                     if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-15)) {
                         $lastElevated[$path] = Get-Date
-                        # If there is already a SYSTEM instance, kill any non-SYSTEM instances
-                        if (Test-SystemProcessExists -ProcessName $procName) {
-                            Stop-NonSystemInstances -ProcessName $procName
-                        } else {
-                        Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
+                        $dueProcesses += $proc
                     }
-                    Start-Sleep -Milliseconds 100
+                }
+
+                if ($dueProcesses.Count -gt 0) {
+                    Enable-ElevationPrivileges
+                    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+                    $systemPid = Find-SystemProcessCandidate
+                    if ($systemPid -ne 0) {
+                        $results = Invoke-ParallelElevation -Targets $dueProcesses -systemPid $systemPid -MaxThreads 4 -HideWindow
+                        $successCount = ($results | Where-Object { $_.Result -eq "SUCCESS" }).Count
+                        $failCount = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
+                        $skipCount = ($results | Where-Object { $_.Result -eq "SKIP" }).Count
+                        if ($successCount -gt 0 -or $failCount -gt 0) {
+                            Write-Log -Message "Periodic parallel elevation: $successCount succeeded, $failCount failed, $skipCount skipped." -Type "INFO" -Color Gray
+                        }
+                    } else {
+                        Write-Log -Message "Periodic scan: No SYSTEM token available, falling back to sequential." -Type "WARN" -Color Yellow
+                        foreach ($proc in $dueProcesses) {
+                            $path = $proc.ExecutablePath
+                            $arguments = ""
+                            if ($proc.CommandLine) {
+                                $cmdLine = $proc.CommandLine
+                                if ($cmdLine.StartsWith('"')) {
+                                    $endQuote = $cmdLine.IndexOf('"', 1)
+                                    if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                                        $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                                    }
+                                } else {
+                                    $firstSpace = $cmdLine.IndexOf(' ')
+                                    if ($firstSpace -gt 0) {
+                                        $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                                    }
+                                }
+                            }
+                            Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
+                        }
+                    }
                 }
             }
         }

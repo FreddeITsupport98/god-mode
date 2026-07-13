@@ -168,8 +168,17 @@ All notable changes to this project will be documented in this file.
 |- **`NtSetInformationProcess` token replacement (experimental).** Added `NtSetInformationProcess` P/Invoke from `ntdll.dll` to `TokenOps`, along with a `PROCESS_ACCESS_TOKEN` structure and a `ReplaceProcessToken` helper method. This allows in-place replacement of the current process token with a stolen SYSTEM token via `ProcessAccessToken` (0x09). A new PowerShell function `Invoke-ProcessTokenReplacement` wraps this method and is available for manual use. This is an undocumented API and may cause instability; it is provided as an additional elevation method to increase success chances.
 
 ||### Improved
-|- Project structure reorganized with `tests/` folder for regression scripts.
+||- Project structure reorganized with `tests/` folder for regression scripts.
 
+|||### Added (2026-07-13 23:51:00 UTC)
+||- **Parallel hyperthreaded elevation (`Invoke-ParallelElevation`).** Added a new `Invoke-ParallelElevation` helper that distributes process elevation across up to 8 concurrent `Start-ThreadJob` threads (PowerShell 7). This replaces the old sequential `foreach` loop in `Invoke-ExistingProcessElevation` (menu option 7) and dramatically reduces the time needed to elevate all running user processes to SYSTEM.
+||  - Each worker thread performs the full "detect first, then set" cycle per process: checks if a SYSTEM instance already exists via WMI `GetOwner`, skips if already SYSTEM, kills all non-SYSTEM instances of the same process name, extracts the original command-line arguments, and calls `TokenOps::CreateProcessAsSystem` to launch the process directly into Session 1 (`WinSta0\Default`).
+||  - Automatic fallback to sequential execution when `Start-ThreadJob` is unavailable (PowerShell 5.1), so the script remains compatible with older environments.
+||  - **Monitoring loop periodic scan also parallelized.** The 15-second periodic re-elevation block inside `Start-Monitoring` now builds a "due list" of processes that need elevation, then delegates the elevation work to `Invoke-ParallelElevation` with 4 threads instead of looping sequentially. This prevents the monitor loop from spending seconds per process and missing newly launched applications.
+||- **Deduplication before parallel elevation.** `Invoke-ExistingProcessElevation` now deduplicates the target process list by executable name before spawning threads, so only one elevation attempt per unique process is launched. This avoids race conditions where multiple threads might try to elevate the same app simultaneously.
+||- **Removed per-process `Start-Sleep -Milliseconds 300` bottleneck.** The old sequential loop paused 300ms between each process; the parallel path removes all sleeps, with threads running concurrently.
+
+||---
 |---
 
 ## 2026-07-10 19:48:00 UTC — Self-destruct and runtime error fixes
