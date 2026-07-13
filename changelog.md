@@ -88,7 +88,11 @@ All notable changes to this project will be documented in this file.
 ||||||||  - `Enable-ElevationPrivileges` now logs per-privilege success/failure, reports the Win32 error and root cause for each failed privilege, and auto-calls `Export-ElevationDiagnostics` if any required privilege is missing.
 ||||||||  - `Find-SystemProcessCandidate` now logs every rejection reason (e.g., "REJECTED: lsass.exe PID=892 Session=0 Owner=SYSTEM | TestOpenProcess failed | ERROR_ACCESS_DENIED..."), reports the total scan count, and auto-dumps diagnostics when no candidate is found.
 ||||||||  - `Start-ProcessWithStolenToken` now logs the exact target and source PID before attempting creation, and if `CreateProcessWithTokenW` fails it logs the root-cause error, the source process context (Session/Name/CanDup), and a recommendation about Session 1 vs Session 0.
-||||||||  - `Invoke-HybridElevation` and `Monitor-ElevateProcess` now log structured Phase 1 / Phase 2 transitions and explicit root-cause messages when paths are missing or token-stealing fails.
+|||||||||  - `Invoke-HybridElevation` and `Monitor-ElevateProcess` now log structured Phase 1 / Phase 2 transitions and explicit root-cause messages when paths are missing or token-stealing fails.
+||||||||||- **Invoke-ExistingProcessElevation no longer kills apps on token-steal failure (2026-07-13 20:10:00 UTC):**
+||||||||||  - `Invoke-ExistingProcessElevation` (called by menu option 7) was using `Elevate-Process` which includes the scheduled-task fallback. When token stealing failed (missing `SeAssignPrimaryTokenPrivilege` in interactive admin session), the fallback killed Chrome/Explorer and restarted them in Session 0, making them invisible.
+||||||||||  - Fixed by switching `Invoke-ExistingProcessElevation` to use `Monitor-ElevateProcess` (token-only, no kill, no scheduled-task fallback). This preserves existing desktop apps during the initial enable. After reboot, the monitor loop runs as SYSTEM with full privileges and correctly elevates new processes.
+||||||||||  - Added clarifying comment explaining the design: existing apps stay alive at their current privilege level during menu 7 enable; true SYSTEM elevation happens after reboot via the monitor loop.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.

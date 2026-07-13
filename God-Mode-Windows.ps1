@@ -2927,7 +2927,10 @@ function Invoke-ExistingProcessElevation {
                 }
             }
         }
-        Elevate-Process -Path $path -Arguments $arguments
+        # Use token-only elevation (no kill, no scheduled-task fallback) so we don't
+        # destroy existing desktop apps when the current session lacks privileges.
+        # The monitor loop running as SYSTEM after reboot will handle full elevation.
+        Monitor-ElevateProcess -Path $path -Arguments $arguments
     }
     Write-Log -Message "Existing process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
 }
