@@ -3023,7 +3023,7 @@ function Invoke-ExistingProcessElevation {
         Write-Log -Message "Not running as SYSTEM -- escalating to SYSTEM via temporary service for aggressive process takeover." -Type "INFO" -Color Yellow
         $tempScript = Join-Path $env:TEMP "GodMode_ElevateAll_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
         Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
-        $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ElevateAllProcesses" -MaxWaitSeconds 60
+        $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ElevateAllProcesses" -MaxWaitSeconds 180
         Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
         if ($result.Success) {
             Write-Log -Message "Aggressive elevation completed via SYSTEM service. All processes should now be SYSTEM." -Type "INFO" -Color Green
@@ -3063,17 +3063,27 @@ function Invoke-ExistingProcessElevation {
     Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate." -Type "INFO" -Color Yellow
     $batchLines = @("@echo off")
     $needBatch = $false
+    $processedNames = @()
     foreach ($proc in $targetProcs) {
         $count++
         if ($count % 5 -eq 0 -or $count -eq $total) {
             Write-Log -Message "Preparing process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
         }
         $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
+        # Deduplicate: only handle each unique process name once
+        if ($processedNames -contains $procName) { continue }
+        $processedNames += $procName
+
+        # Always purge non-SYSTEM instances before starting a SYSTEM one
+        Stop-NonSystemInstances -ProcessName "$procName.exe"
+        Start-Sleep -Milliseconds 300
+
+        # If a SYSTEM instance is already present after cleanup, skip
         if (Test-SystemProcessExists -ProcessName "$procName.exe") {
-            Stop-NonSystemInstances -ProcessName "$procName.exe"
             $skipped++
             continue
         }
+
         $needBatch = $true
         $path = $proc.ExecutablePath
         $arguments = ""
@@ -3095,23 +3105,15 @@ function Invoke-ExistingProcessElevation {
     }
     if ($needBatch) {
         $TaskId = Get-Random -Minimum 10000 -Maximum 99999
-        $ServiceName = "GodModeElevate_$TaskId"
         $BatchFile = Join-Path $env:TEMP "GodMode_ElevateAll_$TaskId.cmd"
         $batchLines += "echo ___DONE___"
         Set-Content -Path $BatchFile -Value ($batchLines -join "`r`n") -Encoding ASCII -Force
         try {
-            $null = sc.exe create $ServiceName binPath= "cmd.exe /c `"$BatchFile`"" start= demand
-            if ($LASTEXITCODE -eq 0) {
-                $null = sc.exe start $ServiceName
-                Start-Sleep -Seconds 5
-                $null = sc.exe stop $ServiceName
-                $null = sc.exe delete $ServiceName
-                Write-Log -Message "Bulk service elevation completed for $count processes." -Type "INFO" -Color Green
-            } else {
-                Write-Log -Message "Bulk service elevation failed: sc.exe create exit $LASTEXITCODE" -Type "ERROR" -Color Red
-            }
+            # Already running as SYSTEM -- execute directly without a nested sc.exe service
+            $null = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$BatchFile`"" -WindowStyle Hidden -Wait
+            Write-Log -Message "Bulk SYSTEM elevation completed for $count processes." -Type "INFO" -Color Green
         } catch {
-            Write-Log -Message "Bulk service elevation exception: $_" -Type "ERROR" -Color Red
+            Write-Log -Message "Bulk SYSTEM elevation exception: $_" -Type "ERROR" -Color Red
         }
         Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
     }
