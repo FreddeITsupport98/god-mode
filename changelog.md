@@ -55,7 +55,12 @@ All notable changes to this project will be documented in this file.
 ||  - `Register-StealthTask` now checks if a stealth task is already `Running` and skips re-registration.
 ||  - `Enable-GodMode` now checks if the God Mode flag is already set and the monitor is already running, and exits idempotently if so.
 ||  - Deep-persistence WMI subscription changed from `Win32_ProcessStartupTrace` (fires on every process start, causing hundreds of `-ToggleOn` launches) to `__InstanceModificationEvent` with `WITHIN 300` polling on `Win32_Service` (sufficient periodic re-trigger without flapping).
-||- **Periodic elevation missing critical-process guard:** `$CriticalProcs` was defined only inside `Invoke-ExistingProcessElevation`, so the periodic re-elevation block inside `Start-Monitoring` silently referenced an undefined variable and would not skip critical processes. `$CriticalProcs` is now defined at the top of `Start-Monitoring` before the `while` loop.
+|||- **Periodic elevation missing critical-process guard:** `$CriticalProcs` was defined only inside `Invoke-ExistingProcessElevation`, so the periodic re-elevation block inside `Start-Monitoring` silently referenced an undefined variable and would not skip critical processes. `$CriticalProcs` is now defined at the top of `Start-Monitoring` before the `while` loop.
+|||  - `explorer.exe` also added to `$CriticalProcs` so it is never killed and restarted.
+|||- **All processes failed elevation (single-instance detection):** `Elevate-Process` tried to spawn a new process via a temporary scheduled task, but single-instance apps (Chrome, Explorer, etc.) detected the existing running instance and immediately exited. This produced `Failed to elevate` for every single process and nothing appeared as SYSTEM in Task Manager.
+|||  - `Elevate-Process` now kills the existing process first (`Stop-Process -Force`), waits 800ms, then launches the new instance as SYSTEM. Also skips if an instance is already running as SYSTEM (via `Test-SystemProcessExists`), so the loop doesn't repeatedly re-kill processes that have already been elevated.
+|||  - `Test-SystemProcessExists` had a WMI `GetOwner` bug where `Invoke-CimMethod` returns a PSCustomObject with `User` property, not a direct `User` property — fixed.
+|||  - Wait time increased from 1 second to 3 seconds (30 x 100ms polls) for the scheduled task to enter the `Running` state.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.

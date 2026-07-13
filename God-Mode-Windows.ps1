@@ -2244,9 +2244,21 @@ function Elevate-Process {
     )
     if (-not (Test-Path $Path)) { return }
 
+    $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+
+    # Skip if an instance is already running as SYSTEM
+    if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+        return
+    }
+
     Write-Log -Message "Elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
 
     try {
+        # Kill existing instances first so single-instance apps (Chrome, Explorer, etc.)
+        # don't immediately exit when the new SYSTEM instance starts.
+        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+
         $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
         $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
             -LogonType ServiceAccount -RunLevel Highest
@@ -2255,9 +2267,9 @@ function Elevate-Process {
         Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $tempTask
 
-        # Wait up to 1 second for the task to actually start running
+        # Wait up to 3 seconds for the task to actually start running
         $started = $false
-        for ($i = 0; $i -lt 10; $i++) {
+        for ($i = 0; $i -lt 30; $i++) {
             Start-Sleep -Milliseconds 100
             $taskInfo = Get-ScheduledTask -TaskName $tempTask -ErrorAction SilentlyContinue
             if ($taskInfo -and $taskInfo.State -eq "Running") {
@@ -2266,10 +2278,14 @@ function Elevate-Process {
             }
         }
 
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 500
         Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false -ErrorAction SilentlyContinue
+
+        if (-not $started) {
+            Write-Log -Message "Elevated task did not start: $Path" -Type "WARN" -Color Yellow
+        }
     } catch {
-        Write-Log -Message "Failed to elevate: $Path" -Type "ERROR" -Color Red
+        Write-Log -Message "Failed to elevate: $Path | Exception: $($_.Exception.Message)" -Type "ERROR" -Color Red
     }
 }
 
@@ -2291,7 +2307,7 @@ function Test-SystemProcessExists {
 
 function Invoke-ExistingProcessElevation {
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
     try {
         $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
     } catch {
@@ -2345,7 +2361,7 @@ function Start-Monitoring {
 
     # Critical processes that must never be re-elevated by the periodic loop.
     # Defined here so it is in scope for the periodic elevation block below.
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
 
     $lastElevated = @{}   # Process path -> last elevated time (for startup/periodic scans)
     $lastElevatedPid = @{} # Process ID -> elevated time (for new process detection)
