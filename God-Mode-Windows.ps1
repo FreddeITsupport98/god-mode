@@ -2110,6 +2110,43 @@ public class TokenOps {
             CloseHandle(hProcess);
         }
     }
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtSetInformationProcess(IntPtr ProcessHandle, int ProcessInformationClass, ref PROCESS_ACCESS_TOKEN ProcessInformation, int ProcessInformationLength);
+
+    public const int ProcessAccessToken = 9;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_ACCESS_TOKEN {
+        public IntPtr Token;
+        public IntPtr Thread;
+    }
+
+    public static bool ReplaceProcessToken(int sourcePid) {
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, sourcePid);
+        if (hProcess == IntPtr.Zero) return false;
+        try {
+            IntPtr hToken = IntPtr.Zero;
+            if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, out hToken)) return false;
+            try {
+                IntPtr hPrimaryToken = IntPtr.Zero;
+                if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken)) return false;
+                try {
+                    PROCESS_ACCESS_TOKEN pat = new PROCESS_ACCESS_TOKEN();
+                    pat.Token = hPrimaryToken;
+                    pat.Thread = IntPtr.Zero;
+                    int status = NtSetInformationProcess(GetCurrentProcess(), ProcessAccessToken, ref pat, Marshal.SizeOf(pat));
+                    return status == 0;
+                } finally {
+                    CloseHandle(hPrimaryToken);
+                }
+            } finally {
+                CloseHandle(hToken);
+            }
+        } finally {
+            CloseHandle(hProcess);
+        }
+    }
 }
 "@
 
@@ -2324,6 +2361,31 @@ function Disable-SystemImpersonation {
     } else {
         Write-Host "[INFO] SYSTEM impersonation is not currently active." -ForegroundColor Yellow
     }
+}
+
+function Invoke-ProcessTokenReplacement {
+    param([int]$SourcePid = 0)
+    Enable-ElevationPrivileges
+    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    if ($SourcePid -eq 0) {
+        $SourcePid = Find-SystemProcessCandidate
+    }
+    if ($SourcePid -eq 0) {
+        Write-Host "[ERROR] No SYSTEM process found for token replacement." -ForegroundColor Red
+        return $false
+    }
+    Write-Host "[INFO] Attempting in-place process token replacement via NtSetInformationProcess (experimental)..." -ForegroundColor Cyan
+    $result = [TokenOps]::ReplaceProcessToken($SourcePid)
+    if ($result) {
+        $currentName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Write-Host "[SUCCESS] Process token replaced with SYSTEM token." -ForegroundColor Green
+        Write-Host "[INFO] Current identity: $currentName" -ForegroundColor Cyan
+        Write-Host "[WARN] NtSetInformationProcess is undocumented and may cause instability." -ForegroundColor Yellow
+    } else {
+        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        Write-Host "[ERROR] Token replacement failed. Win32 error: $err" -ForegroundColor Red
+    }
+    return $result
 }
 
 function Install-PersistentSystemImpersonation {
@@ -2605,8 +2667,18 @@ function Start-ProcessWithService {
         sc.exe create $ServiceName binPath= "cmd.exe /c `"$BatchFile`"" start= demand | Out-Null
         if ($LASTEXITCODE -eq 0) {
             sc.exe start $ServiceName | Out-Null
-            Start-Sleep -Seconds 2
-            sc.exe stop $ServiceName | Out-Null
+            # Poll until service stops naturally or timeout (30s)
+            $elapsed = 0
+            $maxWait = 30
+            while ($elapsed -lt $maxWait) {
+                Start-Sleep -Milliseconds 500
+                $elapsed++
+                $svcInfo = sc.exe query $ServiceName 2>$null
+                if ($svcInfo -match "STOPPED") { break }
+            }
+            if ($elapsed -ge $maxWait) {
+                sc.exe stop $ServiceName | Out-Null
+            }
             sc.exe delete $ServiceName | Out-Null
             Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
             return $true
@@ -2637,6 +2709,22 @@ function Invoke-HybridElevation {
     }
 
     Write-Log -Message "Hybrid elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
+
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if ($isSystem) {
+        Enable-ElevationPrivileges
+        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -ne 0) {
+            $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
+            Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 0: Direct CreateProcessAsSystem for $procName"
+            $result = [TokenOps]::CreateProcessAsSystem($systemPid, $Path, $cmdLine, $false)
+            if ($result -eq 0) {
+                Write-Log -Message "Direct SYSTEM elevation succeeded for $procName" -Type "INFO" -Color Green
+                return $true
+            }
+        }
+    }
 
     # --- Phase 1: Service elevation ---
     Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1: Service-elevation attempt for $procName"
@@ -3415,20 +3503,37 @@ function Stop-NonSystemInstances {
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
-        Write-Log -Message "Not running as SYSTEM -- spawning SYSTEM elevation task for aggressive process takeover." -Type "INFO" -Color Yellow
+        Write-Log -Message "Not running as SYSTEM -- scheduling SYSTEM elevation task for aggressive process takeover." -Type "INFO" -Color Yellow
         $tempScript = Join-Path $env:TEMP "GodMode_ElevateAll_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
         Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
-        $svcResult = Start-ProcessWithService -Path "powershell.exe" -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ElevateAllProcesses" -HideWindow
-        Start-Sleep -Seconds 3
-        Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
-        if ($svcResult) {
-            Write-Log -Message "SYSTEM elevation task spawned successfully. Elevation is running in the background." -Type "INFO" -Color Green
-        } else {
-            Write-Log -Message "SYSTEM elevation task spawn failed. Try using option [15] to impersonate SYSTEM first, then run option [7] again." -Type "ERROR" -Color Red
+        $taskName = "GodMode_ElevateAll_$(Get-Random -Minimum 10000 -Maximum 99999)"
+        try {
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ElevateAllProcesses"
+            $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+            Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            # Cleanup in background after 90 seconds
+            Start-Job -ScriptBlock {
+                param($tn, $ts)
+                Start-Sleep -Seconds 90
+                Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
+                Remove-Item -Path $ts -Force -ErrorAction SilentlyContinue
+            } -ArgumentList $taskName, $tempScript | Out-Null
+            Write-Log -Message "SYSTEM elevation task scheduled and running in background. Processes will be elevated to SYSTEM in Session 1." -Type "INFO" -Color Green
+        } catch {
+            Write-Log -Message "Scheduled task fallback failed: $_" -Type "ERROR" -Color Red
+            Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
         }
         return
     }
-    Write-Log -Message "SYSTEM context confirmed. Aggressively elevating ALL user processes to SYSTEM..." -Type "INFO" -Color Green
+    Write-Log -Message "SYSTEM context confirmed. Aggressively elevating ALL user processes to SYSTEM in Session 1..." -Type "INFO" -Color Green
+    Enable-ElevationPrivileges
+    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    $systemPid = Find-SystemProcessCandidate
+    if ($systemPid -eq 0) {
+        Write-Log -Message "No accessible SYSTEM process found for direct token elevation." -Type "ERROR" -Color Red
+        return
+    }
     # Critical processes that must never be killed/restarted (core OS + script host)
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe")
     $systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0")
@@ -3456,14 +3561,14 @@ function Invoke-ExistingProcessElevation {
     $total = $targetProcs.Count
     $count = 0
     $skipped = 0
+    $successCount = 0
+    $failCount = 0
     Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate." -Type "INFO" -Color Yellow
-    $batchLines = @("@echo off")
-    $needBatch = $false
     $processedNames = @()
     foreach ($proc in $targetProcs) {
         $count++
         if ($count % 5 -eq 0 -or $count -eq $total) {
-            Write-Log -Message "Preparing process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
+            Write-Log -Message "Elevating process $count of $total ($skipped skipped, $successCount succeeded)..." -Type "INFO" -Color Gray
         }
         $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
         # Deduplicate: only handle each unique process name once
@@ -3480,7 +3585,6 @@ function Invoke-ExistingProcessElevation {
             continue
         }
 
-        $needBatch = $true
         $path = $proc.ExecutablePath
         $arguments = ""
         if ($proc.CommandLine) {
@@ -3497,23 +3601,18 @@ function Invoke-ExistingProcessElevation {
                 }
             }
         }
-        $batchLines += "start `"`" `"$path`" $arguments"
-    }
-    if ($needBatch) {
-        $TaskId = Get-Random -Minimum 10000 -Maximum 99999
-        $BatchFile = Join-Path $env:TEMP "GodMode_ElevateAll_$TaskId.cmd"
-        $batchLines += "echo ___DONE___"
-        Set-Content -Path $BatchFile -Value ($batchLines -join "`r`n") -Encoding ASCII -Force
-        try {
-            # Already running as SYSTEM -- execute directly without a nested sc.exe service
-            $null = Start-Process -FilePath "cmd.exe" -ArgumentList "/c `"$BatchFile`"" -WindowStyle Hidden -Wait
-            Write-Log -Message "Bulk SYSTEM elevation completed for $count processes." -Type "INFO" -Color Green
-        } catch {
-            Write-Log -Message "Bulk SYSTEM elevation exception: $_" -Type "ERROR" -Color Red
+        $cmdLine = if ($arguments) { "`"$path`" $arguments" } else { "`"$path`"" }
+        $result = [TokenOps]::CreateProcessAsSystem($systemPid, $path, $cmdLine, $false)
+        if ($result -eq 0) {
+            $successCount++
+            Write-Log -Message "SYSTEM elevated: $procName" -Type "INFO" -Color Green
+        } else {
+            $failCount++
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsUser"
+            Write-Log -Message "SYSTEM elevation failed for $procName : $errMsg" -Type "WARN" -Color Yellow
         }
-        Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
     }
-    Write-Log -Message "Aggressive process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
+    Write-Log -Message "Aggressive process elevation complete ($successCount succeeded, $failCount failed, $skipped skipped)." -Type "INFO" -Color Gray
 }
 
 function Monitor-ElevateProcess {
@@ -3527,6 +3626,23 @@ function Monitor-ElevateProcess {
         # Aggressive: if a SYSTEM instance exists, wipe all non-SYSTEM instances so the app is 100% SYSTEM
         Stop-NonSystemInstances -ProcessName "$procName.exe"
         return $true
+    }
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if ($isSystem) {
+        Enable-ElevationPrivileges
+        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -ne 0) {
+            $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
+            $result = [TokenOps]::CreateProcessAsSystem($systemPid, $Path, $cmdLine, [bool]$HideWindow)
+            if ($result -eq 0) {
+                Start-Sleep -Milliseconds 500
+                Stop-NonSystemInstances -ProcessName "$procName.exe"
+                Write-Log -Message "Monitor elevated: $procName (direct token + Session 1)" -Type "INFO" -Color Gray
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
+                return $true
+            }
+        }
     }
     $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
     if ($elevated) {
