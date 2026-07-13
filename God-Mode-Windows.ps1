@@ -3650,6 +3650,115 @@ function Invoke-ParallelElevation {
     return $allResults
 }
 
+function Get-NonSystemProcessesParallel {
+    param(
+        [array]$allProcs,
+        [string[]]$CriticalProcs,
+        [string[]]$systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0"),
+        [int]$MaxThreads = 8,
+        [int]$ChunkSize = 25
+    )
+    # Fast filter: exclude by PID, path, and critical name (no owner check)
+    $candidates = $allProcs | Where-Object {
+        $_.ProcessId -gt 4 -and
+        $_.ExecutablePath -and
+        $_.ExecutablePath -like "*.exe" -and
+        ($CriticalProcs -notcontains [System.IO.Path]::GetFileName($_.ExecutablePath))
+    }
+    if ($candidates.Count -eq 0) { return @() }
+
+    # Check parallel capability
+    $canParallel = $false
+    try {
+        $null = Get-Command Start-ThreadJob -ErrorAction Stop
+        $canParallel = $true
+    } catch {
+        try {
+            Import-Module ThreadJob -ErrorAction Stop
+            $canParallel = $true
+        } catch {}
+    }
+
+    if (-not $canParallel) {
+        # Sequential fallback with CIM/WMI compatibility
+        $results = @()
+        foreach ($proc in $candidates) {
+            try {
+                $owner = $null
+                if ($proc.PSObject.TypeNames[0] -like "*CimInstance*") {
+                    $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                } else {
+                    $owner = $proc.GetOwner().User
+                }
+                if ($owner -and ($systemAccounts -notcontains $owner)) {
+                    $results += $proc
+                }
+            } catch {}
+        }
+        return $results
+    }
+
+    # Build PID lookup and chunks
+    $pidLookup = @{}
+    foreach ($proc in $candidates) {
+        $pidLookup[[int]$proc.ProcessId] = $proc
+    }
+
+    $pids = $candidates | Select-Object -ExpandProperty ProcessId
+    $chunks = @()
+    $currentChunk = @()
+    foreach ($pid in $pids) {
+        $currentChunk += $pid
+        if ($currentChunk.Count -ge $ChunkSize) {
+            $chunks += ,@($currentChunk)
+            $currentChunk = @()
+        }
+    }
+    if ($currentChunk.Count -gt 0) {
+        $chunks += ,@($currentChunk)
+    }
+
+    # Launch parallel threads: each re-queries its PID batch and checks ownership
+    $jobs = @()
+    foreach ($chunk in $chunks) {
+        $filterStr = ($chunk | ForEach-Object { "ProcessId=$([int]$_) " }) -join "OR "
+        $job = Start-ThreadJob -ScriptBlock {
+            param($filter, $sysAccounts)
+            $results = @()
+            try {
+                $procs = Get-CimInstance Win32_Process -Filter $filter -ErrorAction SilentlyContinue
+                foreach ($proc in $procs) {
+                    try {
+                        $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                        if ($owner -and $owner -notin $sysAccounts) {
+                            $results += [int]$proc.ProcessId
+                        }
+                    } catch {}
+                }
+            } catch {}
+            return $results
+        } -ArgumentList $filterStr, $systemAccounts
+        $jobs += $job
+    }
+
+    # Collect results
+    $nonSystemPids = @()
+    foreach ($job in $jobs) {
+        $pids = $job | Wait-Job | Receive-Job -ErrorAction SilentlyContinue
+        if ($pids) { $nonSystemPids += $pids }
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+    }
+
+    # Map PIDs back to original CIM instances
+    $results = @()
+    foreach ($pid in $nonSystemPids) {
+        if ($pidLookup.ContainsKey([int]$pid)) {
+            $results += $pidLookup[[int]$pid]
+        }
+    }
+    return $results
+}
+
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
@@ -3710,21 +3819,8 @@ function Invoke-ExistingProcessElevation {
         Write-Log -Message "Get-CimInstance failed, falling back to Get-WmiObject: $_" -Type "WARN" -Color Yellow
         $allProcs = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue
     }
-    # Aggressive scan: ALL non-system-account processes with valid .exe paths
-    $targetProcs = @()
-    foreach ($proc in $allProcs) {
-        if ($proc.ProcessId -le 4) { continue }
-        if (-not $proc.ExecutablePath) { continue }
-        if ($proc.ExecutablePath -notlike "*.exe") { continue }
-        $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
-        if ($CriticalProcs -contains $procName) { continue }
-        try {
-            $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
-            if (-not $owner) { continue }
-            if ($owner -in $systemAccounts) { continue }
-        } catch { continue }
-        $targetProcs += $proc
-    }
+    # Parallel ownership scan: check all processes in threaded batches to find non-SYSTEM targets
+    $targetProcs = Get-NonSystemProcessesParallel -allProcs $allProcs -CriticalProcs $CriticalProcs -systemAccounts $systemAccounts -MaxThreads 8 -ChunkSize 25
     $total = $targetProcs.Count
     $count = 0
     $skipped = 0

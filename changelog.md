@@ -177,6 +177,13 @@ All notable changes to this project will be documented in this file.
 ||  - **Monitoring loop periodic scan also parallelized.** The 15-second periodic re-elevation block inside `Start-Monitoring` now builds a "due list" of processes that need elevation, then delegates the elevation work to `Invoke-ParallelElevation` with 4 threads instead of looping sequentially. This prevents the monitor loop from spending seconds per process and missing newly launched applications.
 ||- **Deduplication before parallel elevation.** `Invoke-ExistingProcessElevation` now deduplicates the target process list by executable name before spawning threads, so only one elevation attempt per unique process is launched. This avoids race conditions where multiple threads might try to elevate the same app simultaneously.
 ||- **Removed per-process `Start-Sleep -Milliseconds 300` bottleneck.** The old sequential loop paused 300ms between each process; the parallel path removes all sleeps, with threads running concurrently.
+||- **Parallel process ownership scan (`Get-NonSystemProcessesParallel`).** The ownership scan inside `Invoke-ExistingProcessElevation` was the last sequential bottleneck. The new `Get-NonSystemProcessesParallel` helper:
+||  - Fast-filters by PID, path, and critical name (no WMI calls).
+||  - Splits remaining candidates into PID chunks of 25.
+||  - Launches up to 8 `Start-ThreadJob` threads, each querying its batch via `Get-CimInstance -Filter "ProcessId=... OR ProcessId=..."` and checking `GetOwner` per process.
+||  - Collects all non-SYSTEM PIDs, maps them back to the original CIM instances, and returns the deduplicated target list.
+||  - Sequential fallback with CIM/WMI compatibility for environments without `ThreadJob`.
+||  - This eliminates the 200+ sequential `GetOwner` WMI calls that were the slowest part of menu option 7.
 
 ||---
 |---
