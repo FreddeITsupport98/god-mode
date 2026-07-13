@@ -30,6 +30,8 @@ param (
     [switch]$ExportElevationDiagnostics,
     [switch]$ElevateAllProcesses,
     [switch]$SystemDesktop,
+    [switch]$InstallSystemDesktop,
+    [switch]$UninstallSystemDesktop,
     [switch]$DebugMode
 )
 
@@ -4461,6 +4463,12 @@ if ($SystemDesktop) {
     Start-SystemDesktopExplorer
     Exit
 }
+if ($InstallSystemDesktop) {
+    Install-SystemDesktopSession; Exit
+}
+if ($UninstallSystemDesktop) {
+    Uninstall-SystemDesktopSession; Exit
+}
 
 # If no flags are passed, load the Interactive Menu
 do {
@@ -4594,11 +4602,21 @@ do {
             } else {
                 $IsInstalled = (Test-Path $GodModeInstallScript) -and (Get-ScheduledTask -TaskName $GodModeTaskName -ErrorAction SilentlyContinue)
                 if (-not $IsInstalled) {
-                    Install-GodModePersistence
-                    Write-Host "God Mode service installed." -ForegroundColor Green
+                    Write-Host "[INFO] Elevating to SYSTEM for God Mode service installation..." -ForegroundColor Cyan
+                    $tempScript = Join-Path $env:TEMP "GodMode_Svc_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                    Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                    $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -InstallGodMode" -MaxWaitSeconds 180
+                    Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                    if ($result.Success) { Write-Host "God Mode service installed as SYSTEM." -ForegroundColor Green }
+                    else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
                 } else {
-                    Uninstall-GodModePersistence
-                    Write-Host "God Mode service uninstalled." -ForegroundColor Yellow
+                    Write-Host "[INFO] Elevating to SYSTEM for God Mode service uninstallation..." -ForegroundColor Cyan
+                    $tempScript = Join-Path $env:TEMP "GodMode_Svc_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                    Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                    $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -UninstallGodMode" -MaxWaitSeconds 180
+                    Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                    if ($result.Success) { Write-Host "God Mode service uninstalled as SYSTEM." -ForegroundColor Green }
+                    else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
                 }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -4609,8 +4627,13 @@ do {
                 Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
                 Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
-                Enable-GodMode
-                Write-Host "God Mode enabled." -ForegroundColor Green
+                Write-Host "[INFO] Elevating to SYSTEM to enable God Mode..." -ForegroundColor Cyan
+                $tempScript = Join-Path $env:TEMP "GodMode_Ena_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ToggleOn" -MaxWaitSeconds 180
+                Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                if ($result.Success) { Write-Host "God Mode enabled as SYSTEM." -ForegroundColor Green }
+                else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
@@ -4620,8 +4643,13 @@ do {
                 Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can use God Mode.`n" -ForegroundColor Red
                 Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
-                Disable-GodMode
-                Write-Host "God Mode disabled." -ForegroundColor Yellow
+                Write-Host "[INFO] Elevating to SYSTEM to disable God Mode..." -ForegroundColor Cyan
+                $tempScript = Join-Path $env:TEMP "GodMode_Dis_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ToggleOff" -MaxWaitSeconds 180
+                Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                if ($result.Success) { Write-Host "God Mode disabled as SYSTEM." -ForegroundColor Green }
+                else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
@@ -4671,9 +4699,21 @@ do {
                 Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
                 if (Test-SystemDesktopSession) {
-                    Uninstall-SystemDesktopSession
+                    Write-Host "[INFO] Elevating to SYSTEM to uninstall SYSTEM desktop session..." -ForegroundColor Cyan
+                    $tempScript = Join-Path $env:TEMP "GodMode_Dsk_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                    Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                    $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -UninstallSystemDesktop" -MaxWaitSeconds 180
+                    Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                    if ($result.Success) { Write-Host "SYSTEM desktop session uninstalled as SYSTEM." -ForegroundColor Green }
+                    else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
                 } else {
-                    Install-SystemDesktopSession
+                    Write-Host "[INFO] Elevating to SYSTEM to install SYSTEM desktop session..." -ForegroundColor Cyan
+                    $tempScript = Join-Path $env:TEMP "GodMode_Dsk_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+                    Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+                    $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -InstallSystemDesktop" -MaxWaitSeconds 180
+                    Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+                    if ($result.Success) { Write-Host "SYSTEM desktop session installed as SYSTEM." -ForegroundColor Green }
+                    else { Write-Host "SYSTEM elevation failed: $($result.Output)" -ForegroundColor Red }
                 }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")

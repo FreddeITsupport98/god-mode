@@ -34,7 +34,15 @@ All notable changes to this project will be documented in this file.
   - `Test-SystemDesktopSession`: Returns `$true` if the scheduled task exists.
   - Menu label dynamically shows `[17] UNINSTALL SYSTEM DESKTOP SESSION (Active)` when installed, or `[17] INSTALL SYSTEM DESKTOP SESSION (Run Explorer as SYSTEM)` when not. Guarded by `Test-BuiltInAdmin`.
   - New CLI flag `-SystemDesktop` triggers `Start-SystemDesktopExplorer` directly for non-interactive use.
+  - New CLI flags `-InstallSystemDesktop` and `-UninstallSystemDesktop` for non-interactive system desktop session installation/removal.
   - Prompt updated from `(1-16)` to `(1-17)`.
+
+### Changed (2026-07-13 22:45:00 UTC)
+- **Menu options [6], [7], [8], and [17] now auto-elevate to SYSTEM.** Previously, these options would fail silently or produce access-denied errors when run from an Administrator session because God Mode tasks require `S-1-5-18` (SYSTEM) privileges to register tasks, modify protected registry keys, and launch the monitoring loop.
+  - When you select option `[6] INSTALL/UNINSTALL GOD MODE SERVICE`, `[7] ENABLE GOD MODE`, `[8] DISABLE GOD MODE`, or `[17] INSTALL/UNINSTALL SYSTEM DESKTOP SESSION`, the script now detects if the current process is not SYSTEM. If not, it copies itself to a temporary file and uses `Invoke-AsSystem` (temporary `sc.exe` service elevation) to relaunch the script with the appropriate CLI flag (`-InstallGodMode`, `-UninstallGodMode`, `-ToggleOn`, `-ToggleOff`, `-InstallSystemDesktop`, `-UninstallSystemDesktop`).
+  - The original Administrator process waits for the SYSTEM-elevated child to complete and reports success/failure back to the user.
+  - This eliminates the need to manually run `psexec -s` or use a separate SYSTEM shell to install God Mode or the desktop session. The script now handles the elevation automatically.
+  - `Test-BuiltInAdmin` already accepts SYSTEM (`S-1-5-18`) so the SYSTEM-elevated child passes the built-in admin check without modification.
 
 ### Added (2026-07-13 21:18:00 UTC)
 - `Invoke-AsSystem` multi-method elevation engine: attempts direct token duplication first (stealing a SYSTEM token from `winlogon.exe` / `csrss.exe` via `CreateProcessWithTokenW`), falls back to a temporary `sc.exe` service launch, and finally falls back to the original Task Scheduler helper. This eliminates the previous failure mode where the Task Scheduler helper killed the target process but never actually elevated it.
