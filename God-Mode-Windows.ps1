@@ -28,6 +28,7 @@ param (
     [switch]$UninstallGodMode,
     [switch]$DumpLogs,
     [switch]$ExportElevationDiagnostics,
+    [switch]$ElevateAllProcesses,
     [switch]$DebugMode
 )
 
@@ -86,6 +87,7 @@ if (-not $Principal.IsInRole($Role)) {
         if ($DebugMode) { $ArgsString += " -DebugMode" }
         if ($Verbose) { $ArgsString += " -Verbose" }
         if ($ExportElevationDiagnostics) { $ArgsString += " -ExportElevationDiagnostics" }
+        if ($ElevateAllProcesses) { $ArgsString += " -ElevateAllProcesses" }
 
         $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
@@ -3029,27 +3031,53 @@ function Stop-NonSystemInstances {
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
-        Write-Log -Message "Not running as SYSTEM -- skipping existing-process elevation. Token elevation requires SYSTEM privileges. After reboot, the monitoring loop (running as SYSTEM) will elevate all processes." -Type "INFO" -Color Gray
+        Write-Log -Message "Not running as SYSTEM -- escalating to SYSTEM via temporary service for aggressive process takeover." -Type "INFO" -Color Yellow
+        $tempScript = Join-Path $env:TEMP "GodMode_ElevateAll_$(Get-Random -Minimum 10000 -Maximum 99999).ps1"
+        Copy-Item -Path $PSCommandPath -Destination $tempScript -Force
+        $result = Invoke-AsSystem -Command "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$tempScript`" -ElevateAllProcesses" -MaxWaitSeconds 60
+        Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
+        if ($result.Success) {
+            Write-Log -Message "Aggressive elevation completed via SYSTEM service. All processes should now be SYSTEM." -Type "INFO" -Color Green
+        } else {
+            Write-Log -Message "Aggressive elevation failed: $($result.Output)" -Type "ERROR" -Color Red
+        }
         return
     }
-    Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
+    Write-Log -Message "SYSTEM context confirmed. Aggressively elevating ALL user processes to SYSTEM..." -Type "INFO" -Color Green
+    # Critical processes that must never be killed/restarted (core OS + script host)
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
+    $systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0")
     try {
-        $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+        $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
     } catch {
         Write-Log -Message "Get-CimInstance failed, falling back to Get-WmiObject: $_" -Type "WARN" -Color Yellow
-        $ExistingProcesses = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
+        $allProcs = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue
     }
-    $total = ($ExistingProcesses | Measure-Object).Count
+    # Aggressive scan: ALL non-system-account processes with valid .exe paths
+    $targetProcs = @()
+    foreach ($proc in $allProcs) {
+        if ($proc.ProcessId -le 4) { continue }
+        if (-not $proc.ExecutablePath) { continue }
+        if ($proc.ExecutablePath -notlike "*.exe") { continue }
+        $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
+        if ($CriticalProcs -contains $procName) { continue }
+        try {
+            $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+            if (-not $owner) { continue }
+            if ($owner -in $systemAccounts) { continue }
+        } catch { continue }
+        $targetProcs += $proc
+    }
+    $total = $targetProcs.Count
     $count = 0
     $skipped = 0
-    foreach ($proc in $ExistingProcesses) {
+    Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate." -Type "INFO" -Color Yellow
+    foreach ($proc in $targetProcs) {
         $count++
         if ($count % 5 -eq 0 -or $count -eq $total) {
             Write-Log -Message "Elevating process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
         }
         $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
-        if ($CriticalProcs -contains $procName) { $skipped++; continue }
         $path = $proc.ExecutablePath
         $arguments = ""
         if ($proc.CommandLine) {
@@ -3066,16 +3094,13 @@ function Invoke-ExistingProcessElevation {
                 }
             }
         }
-        # Use token-only elevation (no kill, no scheduled-task fallback) so we don't
-        # destroy existing desktop apps when the current session lacks privileges.
-        # The monitor loop running as SYSTEM after reboot will handle full elevation.
         Monitor-ElevateProcess -Path $path -Arguments $arguments
     }
-    Write-Log -Message "Existing process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
+    Write-Log -Message "Aggressive process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
 }
 
 function Monitor-ElevateProcess {
-    param([string]$Path, [string]$Arguments = "")
+    param([string]$Path, [string]$Arguments = "", [switch]$HideWindow)
     if (-not (Test-Path $Path)) {
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Target path does not exist: $Path" -RootCause "Executable missing. The process may have been uninstalled or moved."
         return $false
@@ -3086,7 +3111,7 @@ function Monitor-ElevateProcess {
         Stop-NonSystemInstances -ProcessName "$procName.exe"
         return $true
     }
-    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
+    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
     if ($stolen) {
         # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
         Start-Sleep -Milliseconds 500
@@ -3196,51 +3221,51 @@ function Start-Monitoring {
                         if (Test-SystemProcessExists -ProcessName $procName) {
                             Stop-NonSystemInstances -ProcessName $procName
                         } else {
-                            Monitor-ElevateProcess -Path $path -Arguments $arguments
-                        }
-                        Start-Sleep -Milliseconds 100
+                        Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
                     }
+                    Start-Sleep -Milliseconds 100
                 }
             }
+        }
 
-            # --- New Process Elevation ---
-            # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
-            $Now = Get-Date
-            $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-                try {
-                    $_.SessionId -gt 0 -and
-                    $_.CreationDate -and
-                    ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-10)
-                } catch { $false }
-            }
+        # --- New Process Elevation ---
+        # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
+        $Now = Get-Date
+        $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            try {
+                $_.SessionId -gt 0 -and
+                $_.CreationDate -and
+                ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-10)
+            } catch { $false }
+        }
 
-            foreach ($proc in $newProcesses) {
-                if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
-                    $path = $proc.ExecutablePath
-                    $arguments = ""
-                    if ($proc.CommandLine) {
-                        $cmdLine = $proc.CommandLine
-                        # Extract arguments from command line
-                        if ($cmdLine.StartsWith('"')) {
-                            $endQuote = $cmdLine.IndexOf('"', 1)
-                            if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
-                                $arguments = $cmdLine.Substring($endQuote + 1).Trim()
-                            }
-                        } else {
-                            $firstSpace = $cmdLine.IndexOf(' ')
-                            if ($firstSpace -gt 0) {
-                                $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
-                            }
+        foreach ($proc in $newProcesses) {
+            if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
+                $path = $proc.ExecutablePath
+                $arguments = ""
+                if ($proc.CommandLine) {
+                    $cmdLine = $proc.CommandLine
+                    # Extract arguments from command line
+                    if ($cmdLine.StartsWith('"')) {
+                        $endQuote = $cmdLine.IndexOf('"', 1)
+                        if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                            $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                        }
+                    } else {
+                        $firstSpace = $cmdLine.IndexOf(' ')
+                        if ($firstSpace -gt 0) {
+                            $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
                         }
                     }
+                }
 
-                    # PID-based tracking: each process instance gets elevated once
-                    if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
-                        $lastElevatedPid[$proc.ProcessId] = Get-Date
-                        Monitor-ElevateProcess -Path $path -Arguments $arguments
-                    }
+                # PID-based tracking: each process instance gets elevated once
+                if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
+                    $lastElevatedPid[$proc.ProcessId] = Get-Date
+                    Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
                 }
             }
+        }
         }
         catch {
             Write-DebugLog -FunctionName "Start-Monitoring" -Action "ERROR" -Message "Loop exception" -ErrorRecord $_
@@ -4008,10 +4033,14 @@ if ($DumpLogs) {
 if ($ExportElevationDiagnostics) {
     $diagPath = Export-ElevationDiagnostics -Trigger "ManualCLI"
     if ($diagPath) {
-        Write-Host "[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
+        Write-Host "`n[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
     } else {
-        Write-Host "[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
+        Write-Host "`n[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
     }
+    Exit
+}
+if ($ElevateAllProcesses) {
+    Invoke-ExistingProcessElevation
     Exit
 }
 
