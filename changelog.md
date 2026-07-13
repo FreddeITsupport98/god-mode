@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+### Changed (2026-07-13 21:58:00 UTC)
+- **Replaced token-stealing elevation with service-based elevation.** The `CreateProcessWithTokenW` / `DuplicateTokenEx` token-stealing path (Method 1) has been removed entirely from `Invoke-AsSystem`. The primary elevation mechanism is now a temporary `sc.exe` service that runs as SYSTEM. This avoids the `SeAssignPrimaryTokenPrivilege` dependency that was failing on the user's machine (Win32 error 1008 / 1300).
+- New `Start-ProcessWithService` helper: creates a demand-start `sc.exe` service, starts it, waits 2 seconds, stops and deletes it. This is used by `Monitor-ElevateProcess` and `Invoke-HybridElevation` to spawn individual processes as SYSTEM.
+- `Invoke-ExistingProcessElevation` (SYSTEM branch) now batches all target processes into a **single** temporary service instead of spawning one service per process. It builds one batch file containing `start` commands for every process that needs elevation, then launches the batch via one `sc.exe` service. This is far more efficient and avoids service-name collisions.
+- `explorer.exe` added to the `$CriticalProcs` list in `Invoke-ExistingProcessElevation` so it is never killed or restarted by the aggressive bulk elevation logic.
+
 ### Added (2026-07-13 21:18:00 UTC)
 - `Invoke-AsSystem` multi-method elevation engine: attempts direct token duplication first (stealing a SYSTEM token from `winlogon.exe` / `csrss.exe` via `CreateProcessWithTokenW`), falls back to a temporary `sc.exe` service launch, and finally falls back to the original Task Scheduler helper. This eliminates the previous failure mode where the Task Scheduler helper killed the target process but never actually elevated it.
 - `sc.exe` temporary service elevation path: creates a demand-start service running as SYSTEM, executes the command, deletes the service, and reads the result from a temp file. Useful when token privileges are missing or Task Scheduler is unavailable.

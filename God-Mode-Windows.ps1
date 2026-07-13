@@ -1267,54 +1267,9 @@ function Invoke-AsSystem {
 
     $TaskId = Get-Random -Minimum 10000 -Maximum 99999
     $CommonTemp = $env:TEMP
-    $ResultFile = Join-Path $CommonTemp "InvokeAsSystem_Result_$TaskId.txt"
-    $BatchFile = Join-Path $CommonTemp "InvokeAsSystem_Batch_$TaskId.cmd"
+    Write-Log -Message "[Invoke-AsSystem] Starting service-based SYSTEM elevation (TaskId=$TaskId)." -Type "INFO" -Color Yellow
 
-    Write-Log -Message "[Invoke-AsSystem] Starting multi-method SYSTEM elevation (TaskId=$TaskId)." -Type "INFO" -Color Yellow
-
-    # Build a batch wrapper that redirects all output to the result file and appends a done marker
-    $BatchContent = "@echo off`r`n$Command > `"$ResultFile`" 2>&1`r`necho ___DONE___ >> `"$ResultFile`""
-    Set-Content -Path $BatchFile -Value $BatchContent -Encoding ASCII -Force
-
-    # --- Method 1: Token Duplication (direct SYSTEM spawn) ---
-    try {
-        Enable-ElevationPrivileges
-        $systemPid = Find-SystemProcessCandidate
-        if ($systemPid -ne 0) {
-            Write-DebugLog -FunctionName "Invoke-AsSystem" -Action "INFO" -Message "Method 1: Token duplication using PID=$systemPid"
-            $err = [TokenOps]::CreateProcessFromToken($systemPid, "cmd.exe", "cmd.exe /c `"$BatchFile`"", $true)
-            if ($err -eq 0) {
-                Write-Log -Message "[Invoke-AsSystem] Token duplication succeeded (PID=$systemPid)." -Type "INFO" -Color Green
-                $waited = 0
-                while ($waited -lt $MaxWaitSeconds) {
-                    Start-Sleep -Seconds 1
-                    $waited++
-                    if (Test-Path $ResultFile) {
-                        $content = Get-Content -Path $ResultFile -Raw -ErrorAction SilentlyContinue
-                        if ($content -and $content.Contains("___DONE___")) {
-                            $output = ($content -replace "___DONE___", "").Trim()
-                            Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
-                            Remove-Item -Path $BatchFile -Force -ErrorAction SilentlyContinue
-                            return [PSCustomObject]@{ Success = $true; Output = $output }
-                        }
-                    }
-                }
-                Write-Log -Message "[Invoke-AsSystem] Token duplication process did not write result within timeout." -Type "WARN" -Color Yellow
-            } else {
-                $errMsg = Get-Win32ErrorRootCause -ErrorCode $err -Context "CreateProcessWithTokenW"
-                Write-Log -Message "[Invoke-AsSystem] Token duplication failed: $errMsg" -Type "WARN" -Color Yellow
-            }
-        } else {
-            Write-Log -Message "[Invoke-AsSystem] No suitable SYSTEM process found for token duplication." -Type "WARN" -Color Yellow
-        }
-    } catch {
-        Write-Log -Message "[Invoke-AsSystem] Token duplication exception: $_" -Type "WARN" -Color Yellow
-    }
-
-    # Cleanup Method 1 artifacts
-    Remove-Item -Path $ResultFile -Force -ErrorAction SilentlyContinue
-
-    # --- Method 2: Temporary Service (sc.exe) ---
+    # --- Method 1: Temporary Service (sc.exe) ---
     $ServiceName = "InvokeAsSystemSvc_$TaskId"
     $ResultFile2 = Join-Path $CommonTemp "InvokeAsSystem_SvcResult_$TaskId.txt"
     $BatchFile2 = Join-Path $CommonTemp "InvokeAsSystem_SvcBatch_$TaskId.cmd"
@@ -2235,6 +2190,40 @@ function Start-ProcessWithStolenToken {
     }
 }
 
+function Start-ProcessWithService {
+    param(
+        [string]$Path,
+        [string]$Arguments = "",
+        [switch]$HideWindow
+    )
+    $TaskId = Get-Random -Minimum 10000 -Maximum 99999
+    $ServiceName = "ElevateProc_$TaskId"
+    $BatchFile = Join-Path $env:TEMP "ElevateProc_Batch_$TaskId.cmd"
+
+    $windowOpt = if ($HideWindow) { "/b /min" } else { "" }
+    $batchArgs = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
+
+    $BatchContent = "@echo off`r`nstart $windowOpt `"`" $batchArgs`r`necho ___DONE___"
+    Set-Content -Path $BatchFile -Value $BatchContent -Encoding ASCII -Force
+
+    try {
+        sc.exe create $ServiceName binPath= "cmd.exe /c `"$BatchFile`"" start= demand | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            sc.exe start $ServiceName | Out-Null
+            Start-Sleep -Seconds 2
+            sc.exe stop $ServiceName | Out-Null
+            sc.exe delete $ServiceName | Out-Null
+            Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
+            return $true
+        }
+    } catch {}
+
+    sc.exe stop $ServiceName | Out-Null
+    sc.exe delete $ServiceName | Out-Null
+    Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
+    return $false
+}
+
 function Invoke-HybridElevation {
     param(
         [string]$Path,
@@ -2254,16 +2243,16 @@ function Invoke-HybridElevation {
 
     Write-Log -Message "Hybrid elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
 
-    # --- Phase 1: Token stealing ---
-    Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1: Token-steal attempt for $procName"
-    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
-    if ($stolen) {
-        Write-Log -Message "Token-steal elevation succeeded for $procName" -Type "INFO" -Color Green
+    # --- Phase 1: Service elevation ---
+    Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1: Service-elevation attempt for $procName"
+    $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow
+    if ($elevated) {
+        Write-Log -Message "Service-elevation succeeded for $procName" -Type "INFO" -Color Green
         Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "EXIT" -Message "Phase 1 succeeded for $procName"
         return $true
     }
 
-    Write-Log -Message "Token-steal failed for $procName, falling back to scheduled task..." -Type "WARN" -Color Yellow
+    Write-Log -Message "Service-elevation failed for $procName, falling back to scheduled task..." -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1 failed. Proceeding to Phase 2 (scheduled task)."
 
     # --- Phase 2: Scheduled task fallback (original method) ---
@@ -3045,7 +3034,7 @@ function Invoke-ExistingProcessElevation {
     }
     Write-Log -Message "SYSTEM context confirmed. Aggressively elevating ALL user processes to SYSTEM..." -Type "INFO" -Color Green
     # Critical processes that must never be killed/restarted (core OS + script host)
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe")
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe")
     $systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0")
     try {
         $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
@@ -3072,12 +3061,20 @@ function Invoke-ExistingProcessElevation {
     $count = 0
     $skipped = 0
     Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate." -Type "INFO" -Color Yellow
+    $batchLines = @("@echo off")
+    $needBatch = $false
     foreach ($proc in $targetProcs) {
         $count++
         if ($count % 5 -eq 0 -or $count -eq $total) {
-            Write-Log -Message "Elevating process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
+            Write-Log -Message "Preparing process $count of $total ($skipped skipped)..." -Type "INFO" -Color Gray
         }
-        $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
+        $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
+        if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+            Stop-NonSystemInstances -ProcessName "$procName.exe"
+            $skipped++
+            continue
+        }
+        $needBatch = $true
         $path = $proc.ExecutablePath
         $arguments = ""
         if ($proc.CommandLine) {
@@ -3094,7 +3091,29 @@ function Invoke-ExistingProcessElevation {
                 }
             }
         }
-        Monitor-ElevateProcess -Path $path -Arguments $arguments
+        $batchLines += "start `"`" `"$path`" $arguments"
+    }
+    if ($needBatch) {
+        $TaskId = Get-Random -Minimum 10000 -Maximum 99999
+        $ServiceName = "GodModeElevate_$TaskId"
+        $BatchFile = Join-Path $env:TEMP "GodMode_ElevateAll_$TaskId.cmd"
+        $batchLines += "echo ___DONE___"
+        Set-Content -Path $BatchFile -Value ($batchLines -join "`r`n") -Encoding ASCII -Force
+        try {
+            $null = sc.exe create $ServiceName binPath= "cmd.exe /c `"$BatchFile`"" start= demand
+            if ($LASTEXITCODE -eq 0) {
+                $null = sc.exe start $ServiceName
+                Start-Sleep -Seconds 5
+                $null = sc.exe stop $ServiceName
+                $null = sc.exe delete $ServiceName
+                Write-Log -Message "Bulk service elevation completed for $count processes." -Type "INFO" -Color Green
+            } else {
+                Write-Log -Message "Bulk service elevation failed: sc.exe create exit $LASTEXITCODE" -Type "ERROR" -Color Red
+            }
+        } catch {
+            Write-Log -Message "Bulk service elevation exception: $_" -Type "ERROR" -Color Red
+        }
+        Remove-Item $BatchFile -Force -ErrorAction SilentlyContinue
     }
     Write-Log -Message "Aggressive process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
 }
@@ -3111,18 +3130,18 @@ function Monitor-ElevateProcess {
         Stop-NonSystemInstances -ProcessName "$procName.exe"
         return $true
     }
-    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
-    if ($stolen) {
+    $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
+    if ($elevated) {
         # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
         Start-Sleep -Milliseconds 500
         Stop-NonSystemInstances -ProcessName "$procName.exe"
-        Write-Log -Message "Monitor elevated: $procName (token-steal + purge)" -Type "INFO" -Color Gray
+        Write-Log -Message "Monitor elevated: $procName (service + purge)" -Type "INFO" -Color Gray
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
     } else {
-        $rootCause = "Monitor token-steal failed for $procName. Most likely: no Session 1 SYSTEM process available, or all SYSTEM processes are PPL-protected. This is expected in some configurations; the process will remain at its current privilege level."
-        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Token-steal failed for $procName" -RootCause $rootCause
+        $rootCause = "Monitor service-elevation failed for $procName. sc.exe service creation may be blocked, or the target executable is not valid as a service path. This is expected in some configurations; the process will remain at its current privilege level."
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Service-elevation failed for $procName" -RootCause $rootCause
     }
-    return $stolen
+    return $elevated
 }
 
 function Start-Monitoring {
