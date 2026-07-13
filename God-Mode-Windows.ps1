@@ -3519,7 +3519,24 @@ function Invoke-ExistingProcessElevation {
                 Unregister-ScheduledTask -TaskName $tn -Confirm:$false -ErrorAction SilentlyContinue
                 Remove-Item -Path $ts -Force -ErrorAction SilentlyContinue
             } -ArgumentList $taskName, $tempScript | Out-Null
-            Write-Log -Message "SYSTEM elevation task scheduled and running in background. Processes will be elevated to SYSTEM in Session 1." -Type "INFO" -Color Green
+            Write-Log -Message "SYSTEM elevation task scheduled and running. Waiting for completion..." -Type "INFO" -Color Yellow
+            # Wait for the task to finish (it runs Invoke-ExistingProcessElevation as SYSTEM then exits)
+            $maxWait = 120
+            $waited = 0
+            while ($waited -lt $maxWait) {
+                Start-Sleep -Seconds 1
+                $waited++
+                $taskInfo = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                if (-not $taskInfo -or $taskInfo.State -eq 'Ready') { break }
+            }
+            if ($waited -ge $maxWait) {
+                Write-Log -Message "SYSTEM elevation task did not finish within timeout ($maxWait s)." -Type "WARN" -Color Yellow
+            } else {
+                Write-Log -Message "SYSTEM elevation task completed." -Type "INFO" -Color Green
+            }
+            # Ensure cleanup even if the background job failed
+            Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+            Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
         } catch {
             Write-Log -Message "Scheduled task fallback failed: $_" -Type "ERROR" -Color Red
             Remove-Item -Path $tempScript -Force -ErrorAction SilentlyContinue
@@ -3688,17 +3705,17 @@ function Start-Monitoring {
 
     while ($true) {
         try {
-            Start-Sleep -Seconds 2
+            Start-Sleep -Milliseconds 500
             $loopCount++
-            if ($loopCount % 30 -eq 0) {
+            if ($loopCount % 120 -eq 0) {
                 Write-Log -Message "Monitor heartbeat: loop $loopCount, PIDs tracked: $($lastElevatedPid.Count)" -Type "INFO" -Color Gray
             }
 
-            # --- Cleanup old PID entries to prevent memory growth ---
-            if ((Get-Date) - $lastPidCleanup -gt [TimeSpan]::FromMinutes(5)) {
+        # --- Cleanup old PID entries to prevent memory growth ---
+            if ((Get-Date) - $lastPidCleanup -gt [TimeSpan]::FromMinutes(2)) {
                 $lastPidCleanup = Get-Date
                 $now = Get-Date
-                $oldPids = $lastElevatedPid.GetEnumerator() | Where-Object { $_.Value -lt $now.AddMinutes(-10) } | Select-Object -ExpandProperty Key
+                $oldPids = $lastElevatedPid.GetEnumerator() | Where-Object { $_.Value -lt $now.AddMinutes(-5) } | Select-Object -ExpandProperty Key
                 foreach ($pid in $oldPids) { $lastElevatedPid.Remove($pid) | Out-Null }
             }
 
@@ -3725,8 +3742,8 @@ function Start-Monitoring {
                 }
             }
 
-            # --- Periodic Existing Process Elevation: Re-elevate every 60 seconds ---
-            if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(60)) {
+            # --- Periodic Existing Process Elevation: Re-elevate every 15 seconds ---
+            if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(15)) {
                 $lastExistingElevate = Get-Date
                 $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
                 foreach ($proc in $ExistingProcesses) {
@@ -3748,7 +3765,7 @@ function Start-Monitoring {
                             }
                         }
                     }
-                    if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
+                    if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-15)) {
                         $lastElevated[$path] = Get-Date
                         # If there is already a SYSTEM instance, kill any non-SYSTEM instances
                         if (Test-SystemProcessExists -ProcessName $procName) {
@@ -3768,7 +3785,7 @@ function Start-Monitoring {
             try {
                 $_.SessionId -gt 0 -and
                 $_.CreationDate -and
-                ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-10)
+                ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-5)
             } catch { $false }
         }
 
