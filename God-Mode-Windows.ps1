@@ -2892,6 +2892,24 @@ function Test-SystemProcessExists {
     return $false
 }
 
+function Stop-NonSystemInstances {
+    param([string]$ProcessName)
+    try {
+        $procs = Get-CimInstance Win32_Process -Filter "Name='$ProcessName'" -ErrorAction SilentlyContinue
+        if ($procs) {
+            foreach ($p in $procs) {
+                try {
+                    $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+                    if ($owner.User -ne "SYSTEM") {
+                        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                        Write-Log -Message "Killed non-SYSTEM $ProcessName PID=$($p.ProcessId) to force SYSTEM-only" -Type "INFO" -Color Gray
+                    }
+                } catch { }
+            }
+        }
+    } catch { }
+}
+
 function Invoke-ExistingProcessElevation {
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
@@ -2943,11 +2961,16 @@ function Monitor-ElevateProcess {
     }
     $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
     if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+        # Aggressive: if a SYSTEM instance exists, wipe all non-SYSTEM instances so the app is 100% SYSTEM
+        Stop-NonSystemInstances -ProcessName "$procName.exe"
         return $true
     }
     $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
     if ($stolen) {
-        Write-Log -Message "Monitor elevated: $procName (token-steal)" -Type "INFO" -Color Gray
+        # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
+        Start-Sleep -Milliseconds 500
+        Stop-NonSystemInstances -ProcessName "$procName.exe"
+        Write-Log -Message "Monitor elevated: $procName (token-steal + purge)" -Type "INFO" -Color Gray
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
     } else {
         $rootCause = "Monitor token-steal failed for $procName. Most likely: no Session 1 SYSTEM process available, or all SYSTEM processes are PPL-protected. This is expected in some configurations; the process will remain at its current privilege level."
@@ -3046,9 +3069,14 @@ function Start-Monitoring {
                             }
                         }
                     }
-                    if ((-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) -and -not (Test-SystemProcessExists -ProcessName $procName)) {
+                    if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) {
                         $lastElevated[$path] = Get-Date
-                        Monitor-ElevateProcess -Path $path -Arguments $arguments
+                        # If there is already a SYSTEM instance, kill any non-SYSTEM instances
+                        if (Test-SystemProcessExists -ProcessName $procName) {
+                            Stop-NonSystemInstances -ProcessName $procName
+                        } else {
+                            Monitor-ElevateProcess -Path $path -Arguments $arguments
+                        }
                         Start-Sleep -Milliseconds 100
                     }
                 }

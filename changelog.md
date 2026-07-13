@@ -92,9 +92,17 @@ All notable changes to this project will be documented in this file.
 ||||||||||- **Invoke-ExistingProcessElevation no longer kills apps on token-steal failure (2026-07-13 20:10:00 UTC):**
 ||||||||||  - `Invoke-ExistingProcessElevation` (called by menu option 7) was using `Elevate-Process` which includes the scheduled-task fallback. When token stealing failed (missing `SeAssignPrimaryTokenPrivilege` in interactive admin session), the fallback killed Chrome/Explorer and restarted them in Session 0, making them invisible.
 ||||||||||  - Fixed by switching `Invoke-ExistingProcessElevation` to use `Monitor-ElevateProcess` (token-only, no kill, no scheduled-task fallback). This preserves existing desktop apps during the initial enable. After reboot, the monitor loop runs as SYSTEM with full privileges and correctly elevates new processes.
-||||||||||  - Added clarifying comment explaining the design: existing apps stay alive at their current privilege level during menu 7 enable; true SYSTEM elevation happens after reboot via the monitor loop.
+|||||||||||  - Added clarifying comment explaining the design: existing apps stay alive at their current privilege level during menu 7 enable; true SYSTEM elevation happens after reboot via the monitor loop.
 
-### Improved
+|### Fixed (2026-07-13 20:33:00 UTC)
+||||||||||||  - **Duplicate Administrator + SYSTEM processes (Chrome, etc.):** After reboot, the monitor loop successfully elevated new processes to SYSTEM, but existing Administrator instances of single-instance apps (Chrome, Edge, Firefox) remained alive. This produced duplicate processes — some running as SYSTEM and some as Administrator.
+||||||||||||  - New function `Stop-NonSystemInstances` scans all processes by name, checks ownership via WMI `GetOwner`, and force-kills every instance whose owner is **not** `SYSTEM`. This is called aggressively in two places:
+||||||||||||    1. `Monitor-ElevateProcess` — whenever a SYSTEM instance already exists, all non-SYSTEM duplicates are purged before returning. This prevents the new-process detector from leaving Administrator Chrome children alive.
+||||||||||||    2. After `Start-ProcessWithStolenToken` successfully spawns a SYSTEM instance, it waits 500ms then calls `Stop-NonSystemInstances` to purge any Administrator/user duplicates that existed before the elevation. This ensures the app is 100% SYSTEM-only immediately after elevation.
+||||||||||||  - The periodic existing-process elevation block (60-second) inside `Start-Monitoring` now also checks: if a SYSTEM instance exists, it calls `Stop-NonSystemInstances` instead of skipping. Previously it skipped when `Test-SystemProcessExists` returned `$true`, leaving Administrator duplicates untouched.
+||||||||||||  - **TrustedInstaller ruled out as token source:** The user asked about using `TrustedInstaller` as a token source. The diagnostic dump shows `TrustedInstaller` is PPL-protected (`CanOpen=True` but `CanQuery=False`), so `OpenProcessToken` is denied with `ERROR_ACCESS_DENIED`. Even if accessible, TrustedInstaller runs in Session 0 with a non-interactive token lacking `WinSta0\Default`, making it unsuitable for spawning visible desktop apps. The correct token sources remain `winlogon.exe` / `csrss.exe` SYSTEM tokens in Session 1.
+
+|### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.
 
 ---
