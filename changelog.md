@@ -60,7 +60,16 @@ All notable changes to this project will be documented in this file.
 |||- **All processes failed elevation (single-instance detection):** `Elevate-Process` tried to spawn a new process via a temporary scheduled task, but single-instance apps (Chrome, Explorer, etc.) detected the existing running instance and immediately exited. This produced `Failed to elevate` for every single process and nothing appeared as SYSTEM in Task Manager.
 |||  - `Elevate-Process` now kills the existing process first (`Stop-Process -Force`), waits 800ms, then launches the new instance as SYSTEM. Also skips if an instance is already running as SYSTEM (via `Test-SystemProcessExists`), so the loop doesn't repeatedly re-kill processes that have already been elevated.
 |||  - `Test-SystemProcessExists` had a WMI `GetOwner` bug where `Invoke-CimMethod` returns a PSCustomObject with `User` property, not a direct `User` property — fixed.
-|||  - Wait time increased from 1 second to 3 seconds (30 x 100ms polls) for the scheduled task to enter the `Running` state.
+||||  - Wait time increased from 1 second to 3 seconds (30 x 100ms polls) for the scheduled task to enter the `Running` state.
+
+### Added (2026-07-13 19:32:00 UTC)
+|||- **Hybrid Token-Stealing Elevation for Option 7 (God Mode):** Added a dual-path elevation engine that tries to steal a SYSTEM token from a running process before falling back to the scheduled-task method. This makes post-reboot elevation more robust across different Windows builds where SYSTEM processes vary.
+|||  - New C# P/Invoke class `TokenOps` added via `Add-Type`: exposes `OpenProcess`, `OpenProcessToken`, `DuplicateTokenEx`, `CreateProcessWithTokenW`, `LookupPrivilegeValue`, `AdjustTokenPrivileges`, and `EnablePrivilege`/`CreateProcessFromToken` helpers.
+|||  - `Enable-ElevationPrivileges` enables `SeDebugPrivilege`, `SeAssignPrimaryTokenPrivilege`, and `SeImpersonatePrivilege` in the current process token.
+|||  - `Find-SystemProcessCandidate` dynamically searches for a suitable SYSTEM process to steal from. It tries a priority list of well-known stable processes (`lsass.exe`, `services.exe`, `winlogon.exe`, `svchost.exe`, `MsMpEng.exe`, `SearchIndexer.exe`) first, then falls back to scanning up to 30 non-critical processes via WMI `GetOwner`.
+|||  - `Start-ProcessWithStolenToken` wraps the token duplication and `CreateProcessWithTokenW` call, passing `WinSta0\Default` as the desktop so GUI apps have a chance to start.
+|||  - `Invoke-HybridElevation` orchestrates the two phases: Phase 1 attempts token stealing; Phase 2 falls back to the original scheduled-task elevation (kill existing instance, register temp task, start, wait, unregister). Returns `$true` on success.
+|||  - `Elevate-Process` is now a thin wrapper around `Invoke-HybridElevation`, so both `Invoke-ExistingProcessElevation` (menu option 7) and `Start-Monitoring` (post-reboot monitor loop) automatically benefit from the hybrid approach without any caller changes.
 
 ### Improved
 - Project structure reorganized with `tests/` folder for regression scripts.
