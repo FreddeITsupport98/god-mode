@@ -141,16 +141,29 @@ function Write-DebugLog {
         [string]$FunctionName,
         [string]$Action = "ENTRY", # ENTRY, EXIT, ERROR, WARN, INFO
         [string]$Message = "",
-        [System.Management.Automation.ErrorRecord]$ErrorRecord = $null
+        [System.Management.Automation.ErrorRecord]$ErrorRecord = $null,
+        [string]$RootCause = ""
     )
     $TimeStamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $Line = $MyInvocation.ScriptLineNumber
     try {
+        $Detail = "[$TimeStamp] [DEBUG] [$Action] [$FunctionName] [$Line] $Message"
         if ($ErrorRecord) {
             $Stack = $ErrorRecord.ScriptStackTrace -replace "`r`n", " | "
-            $Detail = "[$TimeStamp] [DEBUG] [$Action] [$FunctionName] [$Line] $Message | Exception: $($ErrorRecord.Exception.Message) | Stack: $Stack"
-        } else {
-            $Detail = "[$TimeStamp] [DEBUG] [$Action] [$FunctionName] [$Line] $Message"
+            $Detail += " | Exception: $($ErrorRecord.Exception.Message) | Stack: $Stack"
+            if (-not $RootCause) {
+                $exMsg = $ErrorRecord.Exception.Message
+                if ($exMsg -match "Access is denied" -or $exMsg -match "0x5" -or $exMsg -match "error 5") {
+                    $RootCause = "Access Denied. Likely causes: PPL protection on target process, missing SeDebugPrivilege, UAC token filtering removing admin rights, or wrong access mask."
+                } elseif ($exMsg -match "0x57" -or $exMsg -match "invalid parameter" -or $exMsg -match "87") {
+                    $RootCause = "Invalid parameter. Likely causes: malformed STARTUPINFO, wrong desktop name (must be WinSta0\Default), or invalid creation flags."
+                } elseif ($exMsg -match "privilege" -or $exMsg -match "1314") {
+                    $RootCause = "Privilege not held. The current process token lacks SeDebugPrivilege, SeAssignPrimaryTokenPrivilege, or SeImpersonatePrivilege. Run as Administrator or SYSTEM."
+                }
+            }
+        }
+        if ($RootCause) {
+            $Detail += " | ROOT_CAUSE: $RootCause"
         }
         $Detail | Out-File -FilePath $DebugLogFile -Append -Encoding UTF8 -ErrorAction SilentlyContinue
         # Also mirror to main log if DebugMode is enabled
@@ -242,6 +255,205 @@ function Export-RawDebugDump {
         Write-Log -Message "Failed to create raw debug dump: $_" -Type "ERROR" -Color Red
         return $null
     }
+}
+
+# ============================================================================
+# 1a. ADVANCED ELEVATION DIAGNOSTICS & ROOT-CAUSE ERROR MAPPING
+# ============================================================================
+
+function Get-Win32ErrorRootCause {
+    param(
+        [int]$ErrorCode,
+        [string]$Context = "general"
+    )
+    $baseMsg = ([ComponentModel.Win32Exception]$ErrorCode).Message
+    $rootCause = switch ($ErrorCode) {
+        5 {
+            $ctx = switch ($Context) {
+                "OpenProcess" { "The target process is likely protected by Protected Process Light (PPL) or runs in a higher integrity level. Current token may lack SeDebugPrivilege, or the access mask is rejected. Mitigation: use PROCESS_QUERY_LIMITED_INFORMATION (0x1000) and pick a non-PPL SYSTEM process (winlogon.exe, dwm.exe in Session 1)." }
+                "OpenProcessToken" { "Token query access denied. The target process is protected (PPL) or the current token does not have the required privilege. Try a different SYSTEM process." }
+                "DuplicateTokenEx" { "Token duplication denied. The source token may be restricted, filtered, or the current process lacks SeImpersonatePrivilege / SeAssignPrimaryTokenPrivilege." }
+                "CreateProcessWithTokenW" { "Process creation denied. The duplicated token may not have the correct Session ID / WindowStation (WinSta0\Default) for interactive desktop apps. Ensure the source process is in Session 1." }
+                default { "Access Denied. Most likely causes: (1) PPL protection on target process, (2) missing SeDebugPrivilege, (3) wrong access mask, (4) integrity level mismatch." }
+            }
+            "ERROR_ACCESS_DENIED ($baseMsg) | Root cause: $ctx"
+        }
+        87 {
+            "ERROR_INVALID_PARAMETER ($baseMsg). Root cause: a structure field, desktop name, or creation flag is wrong. Verify STARTUPINFO.cb = sizeof(STARTUPINFO), lpDesktop = 'WinSta0\Default', and creation flags are valid."
+        }
+        6 {
+            "ERROR_INVALID_HANDLE ($baseMsg). Root cause: a handle was closed prematurely, is stale, or was never opened. Check that CloseHandle is not called before the handle is used."
+        }
+        1314 {
+            "ERROR_PRIVILEGE_NOT_HELD ($baseMsg). Root cause: the current process token does not hold the required privilege (SeDebugPrivilege, SeAssignPrimaryTokenPrivilege, or SeImpersonatePrivilege). Run as Administrator and ensure Enable-ElevationPrivileges succeeds first."
+        }
+        1307 {
+            "ERROR_INVALID_OWNER ($baseMsg). Root cause: the duplicated token cannot be assigned as the primary token of a new process. The token may be an identification token instead of an impersonation/primary token."
+        }
+        2 {
+            "ERROR_FILE_NOT_FOUND ($baseMsg). Root cause: the executable path passed to CreateProcessWithTokenW does not exist or is not accessible from the SYSTEM token context."
+        }
+        8 {
+            "ERROR_NOT_ENOUGH_MEMORY ($baseMsg). Root cause: system is low on memory or the token/process handle table is exhausted."
+        }
+        998 {
+            "ERROR_NOACCESS ($baseMsg). Root cause: invalid pointer or memory access. A handle pointer may be null or point to freed memory."
+        }
+        122 {
+            "ERROR_INSUFFICIENT_BUFFER ($baseMsg). Root cause: a buffer passed to a Win32 API was too small. Usually not applicable to token ops; check privilege structure sizes."
+        }
+        default {
+            "Win32 error $ErrorCode ($baseMsg). No specific root cause mapped; treat as generic API failure."
+        }
+    }
+    return $rootCause
+}
+
+function Get-ElevationPrivilegeStatus {
+    $results = @()
+    $privNames = @(
+        "SeDebugPrivilege",
+        "SeAssignPrimaryTokenPrivilege",
+        "SeImpersonatePrivilege",
+        "SeTcbPrivilege",
+        "SeIncreaseQuotaPrivilege",
+        "SeLoadDriverPrivilege"
+    )
+    foreach ($privName in $privNames) {
+        $enabled = $false
+        try {
+            $enabled = [TokenOps]::EnablePrivilege($privName)
+        } catch {
+            $enabled = $false
+        }
+        $results += [PSCustomObject]@{
+            Privilege = $privName
+            Enabled = $enabled
+            Required = ($privName -in @("SeDebugPrivilege","SeAssignPrimaryTokenPrivilege","SeImpersonatePrivilege"))
+        }
+    }
+    $missing = ($results | Where-Object { $_.Required -and -not $_.Enabled }).Privilege -join ", "
+    $diagnostics = "Current token elevation privilege diagnostics: "
+    if ($missing) {
+        $diagnostics += "MISSING REQUIRED PRIVILEGES: $missing. These are mandatory for token stealing. If you are Administrator but not SYSTEM, SeDebugPrivilege may be removed by UAC token filtering. Use a fully elevated (RunAsAdmin) shell or SYSTEM shell."
+    } else {
+        $diagnostics += "All required privileges are present. If token stealing still fails, look for PPL protection or Session/WindowStation mismatch."
+    }
+    Write-DebugLog -FunctionName "Get-ElevationPrivilegeStatus" -Action "INFO" -Message $diagnostics
+    return $results
+}
+
+function Get-ProcessElevationContext {
+    param([int]$ProcessId)
+    $context = [PSCustomObject]@{
+        PID = $ProcessId
+        Name = "Unknown"
+        SessionId = -1
+        Owner = "Unknown"
+        IsSystem = $false
+        CanOpen = $false
+        CanQueryToken = $false
+        CanDuplicate = $false
+        RootCause = ""
+        Recommend = ""
+    }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if ($proc) { $context.Name = $proc.Name }
+    } catch {}
+    try {
+        $wmi = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        if ($wmi) {
+            $context.SessionId = $wmi.SessionId
+            try {
+                $owner = ($wmi | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                $context.Owner = $owner
+                $context.IsSystem = ($owner -eq "SYSTEM")
+            } catch {}
+        }
+    } catch {}
+    if ($context.IsSystem) {
+        $hProc = [TokenOps]::OpenProcess([TokenOps]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $ProcessId)
+        if ($hProc -eq [IntPtr]::Zero) {
+            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            $context.CanOpen = $false
+            $context.RootCause = "OpenProcess failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcess')"
+            $context.Recommend = "This process is protected (likely PPL). Do NOT use it as token source. Pick a Session 1 SYSTEM process like winlogon.exe or dwm.exe."
+        } else {
+            $context.CanOpen = $true
+            try {
+                $hToken = [IntPtr]::Zero
+                if ([TokenOps]::OpenProcessToken($hProc, [TokenOps]::TOKEN_DUPLICATE -bor [TokenOps]::TOKEN_QUERY, [ref]$hToken)) {
+                    $context.CanQueryToken = $true
+                    try {
+                        $hDup = [IntPtr]::Zero
+                        if ([TokenOps]::DuplicateTokenEx($hToken, [TokenOps]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOps]::SecurityImpersonation, [TokenOps]::TokenPrimary, [ref]$hDup)) {
+                            $context.CanDuplicate = $true
+                            [TokenOps]::CloseHandle($hDup)
+                        } else {
+                            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                            $context.CanDuplicate = $false
+                            $context.RootCause = "DuplicateTokenEx failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'DuplicateTokenEx')"
+                            $context.Recommend = "Token is restricted or filtered. Try a different SYSTEM process."
+                        }
+                    } finally {
+                        [TokenOps]::CloseHandle($hToken)
+                    }
+                } else {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    $context.CanQueryToken = $false
+                    $context.RootCause = "OpenProcessToken failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcessToken')"
+                    $context.Recommend = "Process token is protected. Try a different SYSTEM process."
+                }
+            } finally {
+                [TokenOps]::CloseHandle($hProc)
+            }
+        }
+    } else {
+        $context.RootCause = "Not a SYSTEM process. Owner = $($context.Owner)"
+        $context.Recommend = "Only SYSTEM processes can be used as token source."
+    }
+    return $context
+}
+
+function Export-ElevationDiagnostics {
+    param([string]$Trigger = "Auto")
+    $dump = @()
+    $dump += "===== ELEVATION DIAGNOSTICS DUMP ====="
+    $dump += "Trigger: $Trigger"
+    $dump += "Timestamp: $(Get-Date)"
+    $dump += "Script PID: $PID"
+    $dump += "User: $([Environment]::UserName)"
+    $dump += "IsAdmin: $(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+    $dump += "IsBuiltInAdmin: $(([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -like '*-500'))"
+    $dump += ""
+    $dump += "----- PRIVILEGE STATUS -----"
+    $privStatus = Get-ElevationPrivilegeStatus
+    $dump += ($privStatus | Format-Table -AutoSize | Out-String)
+    $dump += ""
+    $dump += "----- SYSTEM PROCESSES (Top 40) -----"
+    $sysProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -gt 4 } | Sort-Object SessionId -Descending | Select-Object -First 40
+    foreach ($sp in $sysProcs) {
+        $ctx = Get-ProcessElevationContext -ProcessId $sp.ProcessId
+        $dump += "PID=$($ctx.PID) Name=$($ctx.Name) Session=$($ctx.SessionId) Owner=$($ctx.Owner) CanOpen=$($ctx.CanOpen) CanQuery=$($ctx.CanQueryToken) CanDup=$($ctx.CanDuplicate) IsSystem=$($ctx.IsSystem)"
+        if ($ctx.RootCause) { $dump += "  -> RootCause: $($ctx.RootCause)" }
+        if ($ctx.Recommend) { $dump += "  -> Recommend: $($ctx.Recommend)" }
+    }
+    $dump += ""
+    $dump += "----- LAST WIN32 ERRORS (session) -----"
+    $lastErr = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    if ($lastErr -ne 0) {
+        $dump += "Last Win32 error in this thread: $lastErr -> $(Get-Win32ErrorRootCause -ErrorCode $lastErr)"
+    } else {
+        $dump += "No pending Win32 error in this thread."
+    }
+    $dump += ""
+    $dump += "----- END ELEVATION DIAGNOSTICS -----"
+    $dumpPath = Join-Path $env:TEMP "GodMode_ElevationDiagnostics_$(Get-Date -Format 'yyyy-MM-dd_HH-mm-ss').log"
+    $dump -join "`r`n" | Out-File -FilePath $dumpPath -Encoding UTF8 -Force
+    Write-Log -Message "Elevation diagnostics exported to: $dumpPath" -Type "DEBUG" -Color Gray
+    Write-DebugLog -FunctionName "Export-ElevationDiagnostics" -Action "INFO" -Message "Dump written to $dumpPath"
+    return $dumpPath
 }
 
 # Global uncaught error trap: dump raw debug state and log, then break
@@ -1686,7 +1898,9 @@ public class TokenOps {
             };
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-            return AdjustTokenPrivileges(hToken, false, ref tp, (uint)Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+            bool ok = AdjustTokenPrivileges(hToken, false, ref tp, (uint)Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+            int err = Marshal.GetLastWin32Error();
+            return ok && err == 0;
         } finally {
             CloseHandle(hToken);
         }
@@ -1766,38 +1980,70 @@ try {
 }
 
 function Enable-ElevationPrivileges {
-    try {
-        [TokenOps]::EnablePrivilege([TokenOps]::SE_DEBUG_NAME) | Out-Null
-        [TokenOps]::EnablePrivilege([TokenOps]::SE_ASSIGNPRIMARYTOKEN_NAME) | Out-Null
-        [TokenOps]::EnablePrivilege([TokenOps]::SE_IMPERSONATE_NAME) | Out-Null
-        Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "EXIT" -Message "Privileges enabled"
-    } catch {
-        Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "ERROR" -Message "Failed to enable privileges" -ErrorRecord $_
+    $privResults = @()
+    $required = @("SeDebugPrivilege", "SeAssignPrimaryTokenPrivilege", "SeImpersonatePrivilege")
+    foreach ($privName in $required) {
+        try {
+            $rc = [TokenOps]::EnablePrivilege($privName)
+            $privResults += [PSCustomObject]@{ Name = $privName; Result = $rc }
+            if (-not $rc) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $rootCause = Get-Win32ErrorRootCause -ErrorCode $err -Context "general"
+                Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "ERROR" -Message "Failed to enable $privName | Win32=$err" -RootCause $rootCause
+                Write-Log -Message "Privilege fail: $privName -> $rootCause" -Type "WARN" -Color Yellow
+            } else {
+                Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "INFO" -Message "$privName enabled successfully"
+            }
+        } catch {
+            Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "ERROR" -Message "Exception enabling $privName | $($_.Exception.Message)" -ErrorRecord $_
+        }
+    }
+    $missing = ($privResults | Where-Object { -not $_.Result }).Name
+    if ($missing) {
+        Write-Log -Message "CRITICAL: Missing required privileges: $missing. Token stealing will likely fail. Exporting diagnostics..." -Type "ERROR" -Color Red
+        Export-ElevationDiagnostics -Trigger "MissingPrivileges"
+    } else {
+        Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "EXIT" -Message "All required privileges enabled. Results: $($privResults | ConvertTo-Json -Compress)"
     }
 }
 
 function Find-SystemProcessCandidate {
     param([int]$MaxScan = 30)
-    # Get all processes with WMI in one shot (fast)
     $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
-    if (-not $allProcs) { return 0 }
+    if (-not $allProcs) {
+        Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "ERROR" -Message "Get-CimInstance Win32_Process returned nothing. WMI may be broken or restricted."
+        return 0
+    }
 
-    # Phase 1: Prioritize Session 1 (interactive desktop) SYSTEM processes.
-    # These are the ONLY tokens that can spawn desktop apps visible to the user.
+    $diagnostics = @()
+    $diagnostics += "Scan started. Total processes: $($allProcs.Count)"
+
     $session1Names = @("winlogon.exe","dwm.exe","fontdrvhost.exe")
     foreach ($name in $session1Names) {
         $candidates = $allProcs | Where-Object { $_.Name -eq $name -and $_.SessionId -eq 1 }
         foreach ($proc in $candidates) {
             try {
                 $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
-                if ($owner -eq "SYSTEM" -and [TokenOps]::TestOpenProcess($proc.ProcessId)) {
-                    return $proc.ProcessId
+                if ($owner -eq "SYSTEM") {
+                    $test = [TokenOps]::TestOpenProcess($proc.ProcessId)
+                    if ($test) {
+                        $diagnostics += "SUCCESS: Selected Session 1 SYSTEM process: $($proc.Name) PID=$($proc.ProcessId)"
+                        Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "INFO" -Message ($diagnostics -join " | ")
+                        return $proc.ProcessId
+                    } else {
+                        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        $rc = Get-Win32ErrorRootCause -ErrorCode $err -Context "OpenProcess"
+                        $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 Owner=SYSTEM | TestOpenProcess failed | $rc"
+                    }
+                } else {
+                    $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 Owner=$owner (not SYSTEM)"
                 }
-            } catch {}
+            } catch {
+                $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 | WMI GetOwner exception: $($_.Exception.Message)"
+            }
         }
     }
 
-    # Phase 2: Any other non-critical SYSTEM process that we can actually open
     $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe","lsass.exe","MsMpEng.exe")
     $scanned = 0
     foreach ($proc in ($allProcs | Where-Object { $_.ProcessId -gt 4 -and $_.Name -notin $excludeNames } | Sort-Object { $_.SessionId } -Descending)) {
@@ -1805,11 +2051,26 @@ function Find-SystemProcessCandidate {
         $scanned++
         try {
             $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
-            if ($owner -eq "SYSTEM" -and [TokenOps]::TestOpenProcess($proc.ProcessId)) {
-                return $proc.ProcessId
+            if ($owner -eq "SYSTEM") {
+                $test = [TokenOps]::TestOpenProcess($proc.ProcessId)
+                if ($test) {
+                    $diagnostics += "SUCCESS: Selected fallback SYSTEM process: $($proc.Name) PID=$($proc.ProcessId) Session=$($proc.SessionId)"
+                    Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "INFO" -Message ($diagnostics -join " | ")
+                    return $proc.ProcessId
+                } else {
+                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                    $rc = Get-Win32ErrorRootCause -ErrorCode $err -Context "OpenProcess"
+                    $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=$($proc.SessionId) Owner=SYSTEM | TestOpenProcess failed | $rc"
+                }
+            } else {
+                $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=$($proc.SessionId) Owner=$owner (not SYSTEM)"
             }
-        } catch {}
+        } catch {
+            $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) | WMI GetOwner exception: $($_.Exception.Message)"
+        }
     }
+    Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "ERROR" -Message "No usable SYSTEM process found after $scanned scans. Details: $($diagnostics -join ' | ')" -RootCause "All SYSTEM candidates rejected due to PPL protection, missing privileges, or session mismatch. Check Export-ElevationDiagnostics dump."
+    Export-ElevationDiagnostics -Trigger "NoSystemProcessCandidate"
     return 0
 }
 
@@ -1823,22 +2084,30 @@ function Start-ProcessWithStolenToken {
         Enable-ElevationPrivileges
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -eq 0) {
-            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "No suitable SYSTEM process found"
+            $rootCause = "No accessible SYSTEM process found. Either all SYSTEM processes are PPL-protected, current token lacks SeDebugPrivilege, or no SYSTEM processes are running."
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Find-SystemProcessCandidate returned 0" -RootCause $rootCause
             return $false
         }
         $cmd = "`"$Path`""
         if ($Arguments) { $cmd += " $Arguments" }
+        Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "INFO" -Message "Attempting token steal from PID=$systemPid for target=$Path"
         $result = [TokenOps]::CreateProcessFromToken($systemPid, $Path, $cmd, [bool]$HideWindow)
         if ($result -eq 0) {
-            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "EXIT" -Message "Success PID=$systemPid"
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "EXIT" -Message "Success PID=$systemPid spawned=$Path"
             return $true
         } else {
-            $err = [ComponentModel.Win32Exception]$result
-            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Win32 error $result ($($err.Message)) PID=$systemPid"
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessWithTokenW"
+            $rootCause = "Win32 error $result during CreateProcessWithTokenW. $errMsg"
+            Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Failed to spawn $Path from PID=$systemPid | Error=$result" -RootCause $rootCause
+            Write-Log -Message "Token-steal failed: $errMsg (PID=$systemPid)" -Type "WARN" -Color Yellow
+            if ($result -eq 5 -or $result -eq 87 -or $result -eq 1307) {
+                $ctx = Get-ProcessElevationContext -ProcessId $systemPid
+                Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "INFO" -Message "Source process context: Session=$($ctx.SessionId), Name=$($ctx.Name), CanDup=$($ctx.CanDuplicate). If Session=0, GUI apps will be invisible. Session 1 SYSTEM processes are required for visible desktop apps."
+            }
             return $false
         }
     } catch {
-        Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Exception" -ErrorRecord $_
+        Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Unhandled exception: $($_.Exception.Message)" -ErrorRecord $_
         return $false
     }
 }
@@ -1848,24 +2117,31 @@ function Invoke-HybridElevation {
         [string]$Path,
         [string]$Arguments = ""
     )
-    if (-not (Test-Path $Path)) { return $false }
+    if (-not (Test-Path $Path)) {
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "ERROR" -Message "Target path does not exist: $Path" -RootCause "The executable file is missing or inaccessible. Verify the path and that the installer did not move it."
+        return $false
+    }
     $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
 
     # Skip if an instance is already running as SYSTEM
     if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "$procName already running as SYSTEM. Skipping."
         return $true
     }
 
     Write-Log -Message "Hybrid elevating: $Path $Arguments" -Type "STEALTH" -Color Gray
 
     # --- Phase 1: Token stealing ---
+    Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1: Token-steal attempt for $procName"
     $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
     if ($stolen) {
         Write-Log -Message "Token-steal elevation succeeded for $procName" -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "EXIT" -Message "Phase 1 succeeded for $procName"
         return $true
     }
 
     Write-Log -Message "Token-steal failed for $procName, falling back to scheduled task..." -Type "WARN" -Color Yellow
+    Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1 failed. Proceeding to Phase 2 (scheduled task)."
 
     # --- Phase 2: Scheduled task fallback (original method) ---
     try {
@@ -1896,11 +2172,14 @@ function Invoke-HybridElevation {
 
         if (-not $started) {
             Write-Log -Message "Elevated task did not start: $Path" -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "ERROR" -Message "Scheduled task fallback did not enter Running state for $Path" -RootCause "Task Scheduler may be disabled, the Task Scheduler service may be stopped, or the executable path is invalid for a service-account context."
             return $false
         }
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "EXIT" -Message "Phase 2 succeeded for $procName"
         return $true
     } catch {
         Write-Log -Message "Failed to elevate: $Path | Exception: $($_.Exception.Message)" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "ERROR" -Message "Phase 2 exception for $Path" -ErrorRecord $_
         return $false
     }
 }
@@ -2650,19 +2929,21 @@ function Invoke-ExistingProcessElevation {
 
 function Monitor-ElevateProcess {
     param([string]$Path, [string]$Arguments = "")
-    if (-not (Test-Path $Path)) { return $false }
+    if (-not (Test-Path $Path)) {
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Target path does not exist: $Path" -RootCause "Executable missing. The process may have been uninstalled or moved."
+        return $false
+    }
     $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-
-    # Skip if already running as SYSTEM
-    if (Test-SystemProcessExists -ProcessName "$procName.exe") { return $true }
-
-    # In the monitoring loop we only try token-steal; we NEVER kill existing
-    # processes (that would destroy Chrome, Explorer, etc.) and we do NOT use
-    # the scheduled-task fallback because it runs in Session 0 and won't show
-    # on the desktop.
+    if (Test-SystemProcessExists -ProcessName "$procName.exe") {
+        return $true
+    }
     $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
     if ($stolen) {
         Write-Log -Message "Monitor elevated: $procName (token-steal)" -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
+    } else {
+        $rootCause = "Monitor token-steal failed for $procName. Most likely: no Session 1 SYSTEM process available, or all SYSTEM processes are PPL-protected. This is expected in some configurations; the process will remain at its current privilege level."
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Token-steal failed for $procName" -RootCause $rootCause
     }
     return $stolen
 }
