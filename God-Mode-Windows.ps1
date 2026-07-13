@@ -2041,6 +2041,9 @@ public class TokenOps {
             CloseHandle(hProcess);
         }
     }
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool SetThreadToken(IntPtr ThreadHandle, IntPtr TokenHandle);
 }
 "@
 
@@ -2186,6 +2189,252 @@ function Start-ProcessWithStolenToken {
         }
     } catch {
         Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Unhandled exception: $($_.Exception.Message)" -ErrorRecord $_
+        return $false
+    }
+}
+
+$script:__SystemImpersonationToken = [IntPtr]::Zero
+$script:__SystemImpersonationActive = $false
+
+function Enable-SystemImpersonation {
+    try {
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -eq 0) {
+            Write-Host "[ERROR] No accessible SYSTEM process found for token theft." -ForegroundColor Red
+            return $false
+        }
+        $hProcess = [TokenOps]::OpenProcess([TokenOps]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $systemPid)
+        if ($hProcess -eq [IntPtr]::Zero) {
+            Write-Host "[ERROR] Failed to open SYSTEM process PID=$systemPid." -ForegroundColor Red
+            return $false
+        }
+        try {
+            $hToken = [IntPtr]::Zero
+            if (-not [TokenOps]::OpenProcessToken($hProcess, [TokenOps]::TOKEN_DUPLICATE -bor [TokenOps]::TOKEN_QUERY, [ref]$hToken)) {
+                Write-Host "[ERROR] Failed to open process token for PID=$systemPid." -ForegroundColor Red
+                return $false
+            }
+            try {
+                $hImpToken = [IntPtr]::Zero
+                if (-not [TokenOps]::DuplicateTokenEx($hToken, [TokenOps]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOps]::SecurityImpersonation, [TokenOps]::TokenImpersonation, [ref]$hImpToken)) {
+                    Write-Host "[ERROR] Failed to duplicate token for impersonation." -ForegroundColor Red
+                    return $false
+                }
+                if ([TokenOps]::SetThreadToken([IntPtr]::Zero, $hImpToken)) {
+                    $script:__SystemImpersonationToken = $hImpToken
+                    $script:__SystemImpersonationActive = $true
+                    $currentName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+                    Write-Host "[SUCCESS] SYSTEM impersonation enabled on current thread." -ForegroundColor Green
+                    Write-Host "[INFO] Current identity: $currentName" -ForegroundColor Cyan
+                    return $true
+                } else {
+                    [TokenOps]::CloseHandle($hImpToken)
+                    Write-Host "[ERROR] SetThreadToken failed." -ForegroundColor Red
+                    return $false
+                }
+            } finally {
+                [TokenOps]::CloseHandle($hToken)
+            }
+        } finally {
+            [TokenOps]::CloseHandle($hProcess)
+        }
+    } catch {
+        Write-Host "[ERROR] Exception during SYSTEM impersonation: $($_.Exception.Message)" -ForegroundColor Red
+        return $false
+    }
+}
+
+function Disable-SystemImpersonation {
+    if ($script:__SystemImpersonationActive) {
+        [TokenOps]::SetThreadToken([IntPtr]::Zero, [IntPtr]::Zero) | Out-Null
+        if ($script:__SystemImpersonationToken -ne [IntPtr]::Zero) {
+            [TokenOps]::CloseHandle($script:__SystemImpersonationToken) | Out-Null
+            $script:__SystemImpersonationToken = [IntPtr]::Zero
+        }
+        $script:__SystemImpersonationActive = $false
+        $currentName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+        Write-Host "[SUCCESS] SYSTEM impersonation disabled. Reverted to original token." -ForegroundColor Green
+        Write-Host "[INFO] Current identity: $currentName" -ForegroundColor Cyan
+    } else {
+        Write-Host "[INFO] SYSTEM impersonation is not currently active." -ForegroundColor Yellow
+    }
+}
+
+function Install-PersistentSystemImpersonation {
+    Write-DebugLog -FunctionName "Install-PersistentSystemImpersonation" -Action "ENTRY"
+    try {
+        $ProfilePath = $PROFILE.CurrentUserAllHosts
+        if (-not $ProfilePath) {
+            $ProfilePath = Join-Path $env:USERPROFILE "Documents\WindowsPowerShell\Profile.ps1"
+        }
+        $ProfileDir = Split-Path -Parent $ProfilePath
+        if (-not (Test-Path $ProfileDir)) {
+            New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+        }
+
+        $HookContent = @'
+# <GODMODE_PERSISTENT_IMPERSONATION>
+# Auto-enable SYSTEM impersonation on every PowerShell startup. Baked into God Mode.
+if ($env:USERNAME -ne "SYSTEM") {
+    try {
+        $TokenOpsType = @"
+using System;
+using System.Runtime.InteropServices;
+public class TokenOpsMini {
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern bool CloseHandle(IntPtr hObject);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool DuplicateTokenEx(IntPtr hExistingToken, uint dwDesiredAccess, IntPtr lpTokenAttributes, int ImpersonationLevel, int TokenType, out IntPtr phNewToken);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool SetThreadToken(IntPtr ThreadHandle, IntPtr TokenHandle);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, out LUID lpLuid);
+    [DllImport("advapi32.dll", SetLastError = true)] public static extern bool AdjustTokenPrivileges(IntPtr TokenHandle, bool DisableAllPrivileges, ref TOKEN_PRIVILEGES NewState, uint BufferLength, IntPtr PreviousState, IntPtr ReturnLength);
+    [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetCurrentProcess();
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+    public const uint TOKEN_DUPLICATE = 0x0002;
+    public const uint TOKEN_QUERY = 0x0008;
+    public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
+    public const uint TOKEN_ALL_ACCESS = 0xF01FF;
+    public const int SecurityImpersonation = 2;
+    public const int TokenImpersonation = 2;
+    public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+    public struct LUID { public uint LowPart; public int HighPart; }
+    public struct LUID_AND_ATTRIBUTES { public LUID Luid; public uint Attributes; }
+    public struct TOKEN_PRIVILEGES { public uint PrivilegeCount; [MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)] public LUID_AND_ATTRIBUTES[] Privileges; }
+    public static bool EnablePrivilege(string privilegeName) {
+        IntPtr hToken = IntPtr.Zero;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, out hToken)) return false;
+        try {
+            LUID luid; if (!LookupPrivilegeValue(null, privilegeName, out luid)) return false;
+            TOKEN_PRIVILEGES tp = new TOKEN_PRIVILEGES { PrivilegeCount = 1, Privileges = new LUID_AND_ATTRIBUTES[3] };
+            tp.Privileges[0].Luid = luid; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            bool ok = AdjustTokenPrivileges(hToken, false, ref tp, (uint)Marshal.SizeOf(tp), IntPtr.Zero, IntPtr.Zero);
+            return ok && Marshal.GetLastWin32Error() == 0;
+        } finally { CloseHandle(hToken); }
+    }
+}
+"@
+        Add-Type -TypeDefinition $TokenOpsType -ErrorAction SilentlyContinue | Out-Null
+        [TokenOpsMini]::EnablePrivilege("SeDebugPrivilege") | Out-Null
+        [TokenOpsMini]::EnablePrivilege("SeImpersonatePrivilege") | Out-Null
+        $systemPid = 0
+        $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+        foreach ($name in @("winlogon.exe","dwm.exe","fontdrvhost.exe")) {
+            foreach ($proc in ($allProcs | Where-Object { $_.Name -eq $name -and $_.SessionId -eq 1 })) {
+                try {
+                    $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                    if ($owner -eq "SYSTEM") {
+                        $hProc = [TokenOpsMini]::OpenProcess([TokenOpsMini]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $proc.ProcessId)
+                        if ($hProc -ne [IntPtr]::Zero) {
+                            $hToken = [IntPtr]::Zero
+                            if ([TokenOpsMini]::OpenProcessToken($hProc, [TokenOpsMini]::TOKEN_DUPLICATE -bor [TokenOpsMini]::TOKEN_QUERY, [ref]$hToken)) {
+                                $hImp = [IntPtr]::Zero
+                                if ([TokenOpsMini]::DuplicateTokenEx($hToken, [TokenOpsMini]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOpsMini]::SecurityImpersonation, [TokenOpsMini]::TokenImpersonation, [ref]$hImp)) {
+                                    if ([TokenOpsMini]::SetThreadToken([IntPtr]::Zero, $hImp)) { $systemPid = $proc.ProcessId; [TokenOpsMini]::CloseHandle($hToken); [TokenOpsMini]::CloseHandle($hProc); break }
+                                    [TokenOpsMini]::CloseHandle($hImp)
+                                }
+                                [TokenOpsMini]::CloseHandle($hToken)
+                            }
+                            [TokenOpsMini]::CloseHandle($hProc)
+                        }
+                    }
+                } catch {}
+                if ($systemPid -ne 0) { break }
+            }
+            if ($systemPid -ne 0) { break }
+        }
+        if ($systemPid -eq 0) {
+            foreach ($proc in ($allProcs | Where-Object { $_.ProcessId -gt 4 -and $_.Name -notin @("System","Registry","smss.exe","csrss.exe","wininit.exe","lsass.exe","MsMpEng.exe") } | Sort-Object SessionId -Descending)) {
+                try {
+                    $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                    if ($owner -eq "SYSTEM") {
+                        $hProc = [TokenOpsMini]::OpenProcess([TokenOpsMini]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $proc.ProcessId)
+                        if ($hProc -ne [IntPtr]::Zero) {
+                            $hToken = [IntPtr]::Zero
+                            if ([TokenOpsMini]::OpenProcessToken($hProc, [TokenOpsMini]::TOKEN_DUPLICATE -bor [TokenOpsMini]::TOKEN_QUERY, [ref]$hToken)) {
+                                $hImp = [IntPtr]::Zero
+                                if ([TokenOpsMini]::DuplicateTokenEx($hToken, [TokenOpsMini]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOpsMini]::SecurityImpersonation, [TokenOpsMini]::TokenImpersonation, [ref]$hImp)) {
+                                    if ([TokenOpsMini]::SetThreadToken([IntPtr]::Zero, $hImp)) { $systemPid = $proc.ProcessId; [TokenOpsMini]::CloseHandle($hToken); [TokenOpsMini]::CloseHandle($hProc); break }
+                                    [TokenOpsMini]::CloseHandle($hImp)
+                                }
+                                [TokenOpsMini]::CloseHandle($hToken)
+                            }
+                            [TokenOpsMini]::CloseHandle($hProc)
+                        }
+                    }
+                } catch {}
+                if ($systemPid -ne 0) { break }
+            }
+        }
+    } catch {}
+}
+# </GODMODE_PERSISTENT_IMPERSONATION>
+'@
+
+        if (-not (Test-Path $ProfilePath)) {
+            New-Item -ItemType File -Path $ProfilePath -Force | Out-Null
+        }
+        $existing = Get-Content -Path $ProfilePath -Raw -ErrorAction SilentlyContinue
+        if ($existing -and $existing.Contains("GODMODE_PERSISTENT_IMPERSONATION")) {
+            Write-Host "[INFO] Persistent SYSTEM impersonation profile hook is already installed." -ForegroundColor Yellow
+            Write-DebugLog -FunctionName "Install-PersistentSystemImpersonation" -Action "EXIT" -Message "Already installed."
+            return
+        }
+        Add-Content -Path $ProfilePath -Value $HookContent -Encoding UTF8 -ErrorAction Stop
+        Write-Host "[SUCCESS] Persistent SYSTEM impersonation installed." -ForegroundColor Green
+        Write-Host "[INFO] Every new PowerShell window will now auto-impersonate SYSTEM." -ForegroundColor Cyan
+        # Also immediately enable full system-wide God Mode so all programs
+        # and services are elevated without waiting for a reboot.
+        Write-Host "[INFO] Launching system-wide God Mode elevation for all processes..." -ForegroundColor Cyan
+        Enable-GodMode
+        Write-Host "[SUCCESS] System-wide elevation active. All processes now run as SYSTEM." -ForegroundColor Green
+        Write-DebugLog -FunctionName "Install-PersistentSystemImpersonation" -Action "EXIT" -Message "Success with system-wide God Mode enabled"
+    } catch {
+        Write-Host "[ERROR] Failed to install persistent SYSTEM impersonation: $($_.Exception.Message)" -ForegroundColor Red
+        Write-DebugLog -FunctionName "Install-PersistentSystemImpersonation" -Action "ERROR" -Message "Failed to install" -ErrorRecord $_
+    }
+}
+
+function Uninstall-PersistentSystemImpersonation {
+    Write-DebugLog -FunctionName "Uninstall-PersistentSystemImpersonation" -Action "ENTRY"
+    try {
+        $ProfilePath = $PROFILE.CurrentUserAllHosts
+        if (-not $ProfilePath) {
+            $ProfilePath = Join-Path $env:USERPROFILE "Documents\WindowsPowerShell\Profile.ps1"
+        }
+        if (-not (Test-Path $ProfilePath)) {
+            Write-Host "[INFO] No profile found. Nothing to uninstall." -ForegroundColor Yellow
+            return
+        }
+        $content = Get-Content -Path $ProfilePath -Raw -ErrorAction SilentlyContinue
+        if (-not $content -or -not $content.Contains("GODMODE_PERSISTENT_IMPERSONATION")) {
+            Write-Host "[INFO] Persistent SYSTEM impersonation profile hook not found." -ForegroundColor Yellow
+            return
+        }
+        $pattern = '(?s)# <GODMODE_PERSISTENT_IMPERSONATION>.*# </GODMODE_PERSISTENT_IMPERSONATION>'
+        $cleaned = [regex]::Replace($content, $pattern, "").Trim()
+        if ($cleaned) {
+            Set-Content -Path $ProfilePath -Value $cleaned -Encoding UTF8 -Force
+        } else {
+            Remove-Item -Path $ProfilePath -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host "[SUCCESS] Persistent SYSTEM impersonation uninstalled." -ForegroundColor Green
+        Write-DebugLog -FunctionName "Uninstall-PersistentSystemImpersonation" -Action "EXIT" -Message "Success"
+    } catch {
+        Write-Host "[ERROR] Failed to uninstall persistent SYSTEM impersonation: $($_.Exception.Message)" -ForegroundColor Red
+        Write-DebugLog -FunctionName "Uninstall-PersistentSystemImpersonation" -Action "ERROR" -Message "Failed to uninstall" -ErrorRecord $_
+    }
+}
+
+function Test-PersistentSystemImpersonation {
+    try {
+        $ProfilePath = $PROFILE.CurrentUserAllHosts
+        if (-not $ProfilePath) {
+            $ProfilePath = Join-Path $env:USERPROFILE "Documents\WindowsPowerShell\Profile.ps1"
+        }
+        if (-not (Test-Path $ProfilePath)) { return $false }
+        $content = Get-Content -Path $ProfilePath -Raw -ErrorAction SilentlyContinue
+        return ($content -and $content.Contains("GODMODE_PERSISTENT_IMPERSONATION"))
+    } catch {
         return $false
     }
 }
@@ -4129,8 +4378,22 @@ do {
     Write-Host "[13] VERIFY SYSTEM CONTEXT" -ForegroundColor Cyan
     Write-Host "[14] EXPORT ELEVATION DIAGNOSTICS" -ForegroundColor Cyan
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "  TOKEN IMPERSONATION   " -ForegroundColor White
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    if ($script:__SystemImpersonationActive) {
+        Write-Host "[15] DISABLE SYSTEM IMPERSONATION (Active)" -ForegroundColor Red
+    } else {
+        Write-Host "[15] IMPERSONATE SYSTEM TOKEN (Enable)" -ForegroundColor Magenta
+    }
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    if (Test-PersistentSystemImpersonation) {
+        Write-Host "[16] UNINSTALL PERSISTENT SYSTEM IMPERSONATION (Active)" -ForegroundColor Red
+    } else {
+        Write-Host "[16] INSTALL PERSISTENT SYSTEM IMPERSONATION (System-Wide + All PowerShell sessions)" -ForegroundColor Magenta
+    }
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-14)"
+    $Choice = Read-Host "Select an administrative action (1-16)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -4216,6 +4479,34 @@ do {
                 Write-Host "`n[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
             } else {
                 Write-Host "`n[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "15" {
+            if ($script:__SystemImpersonationActive) {
+                Disable-SystemImpersonation
+            } else {
+                if (-not (Test-BuiltInAdmin)) {
+                    $sidInfo = Get-CurrentUserSidInfo
+                    Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can impersonate SYSTEM.`n" -ForegroundColor Red
+                    Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
+                } else {
+                    Enable-SystemImpersonation
+                }
+            }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "16" {
+            if (-not (Test-BuiltInAdmin)) {
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can install persistent SYSTEM impersonation.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
+            } else {
+                if (Test-PersistentSystemImpersonation) {
+                    Uninstall-PersistentSystemImpersonation
+                } else {
+                    Install-PersistentSystemImpersonation
+                }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }

@@ -10,6 +10,21 @@ All notable changes to this project will be documented in this file.
 - `Invoke-ExistingProcessElevation` (SYSTEM branch) now batches all target processes into a **single** temporary service instead of spawning one service per process. It builds one batch file containing `start` commands for every process that needs elevation, then launches the batch via one `sc.exe` service. This is far more efficient and avoids service-name collisions.
 - `explorer.exe` added to the `$CriticalProcs` list in `Invoke-ExistingProcessElevation` so it is never killed or restarted by the aggressive bulk elevation logic.
 
+### Added (2026-07-13 22:17:00 UTC)
+- **Menu option [15] IMPERSONATE SYSTEM TOKEN (Toggle).** Administrator can now attach a live SYSTEM token to the current thread via `SetThreadToken`, making the entire PowerShell session operate as SYSTEM without spawning a new process or rebooting.
+  - `Enable-SystemImpersonation`: Finds a suitable SYSTEM process (e.g., `winlogon.exe`), opens its token, duplicates it as an impersonation token, and calls `SetThreadToken` on the current thread. Uses the existing `Find-SystemProcessCandidate` and `TokenOps` P/Invoke infrastructure. Does not require `SeAssignPrimaryTokenPrivilege` (which is missing in the user's filtered Administrator token); only requires `SeDebugPrivilege` and `SeImpersonatePrivilege`, both of which are already enabled.
+  - `Disable-SystemImpersonation`: Reverts the thread token via `SetThreadToken(0, 0)` and closes the stored handle.
+  - New `SetThreadToken` P/Invoke added to the `TokenOps` C# class.
+  - Menu label dynamically shows `[15] IMPERSONATE SYSTEM TOKEN (Enable)` when inactive, or `[15] DISABLE SYSTEM IMPERSONATION (Active)` when active. Guarded by `Test-BuiltInAdmin` so only the built-in Administrator can use it.
+
+### Added (2026-07-13 22:25:00 UTC)
+- **Menu option [16] PERSISTENT SYSTEM IMPERSONATION (Toggle).** Automatically re-enables SYSTEM token impersonation on every new PowerShell window via a profile hook in `$PROFILE.CurrentUserAllHosts`, AND immediately launches system-wide God Mode elevation so all programs and services run as SYSTEM without waiting for a reboot.
+  - `Install-PersistentSystemImpersonation`: Writes a self-contained profile hook (no external file dependencies) that bakes a lightweight `TokenOpsMini` C# class, enables `SeDebugPrivilege`/`SeImpersonatePrivilege`, finds a suitable SYSTEM process, and calls `SetThreadToken` on the current thread. The hook is idempotent — it skips installation if already present. After installing the hook, it immediately calls `Enable-GodMode` to start the system-wide monitor in the current session so all processes elevate immediately.
+  - `Uninstall-PersistentSystemImpersonation`: Removes the profile hook by detecting `# <GODMODE_PERSISTENT_IMPERSONATION>` / `# </GODMODE_PERSISTENT_IMPERSONATION>` markers and removing the block. If the profile becomes empty, it deletes the file entirely.
+  - `Test-PersistentSystemImpersonation`: Returns `$true` if the profile hook markers are present.
+  - Menu label dynamically shows `[16] UNINSTALL PERSISTENT SYSTEM IMPERSONATION (Active)` when installed, or `[16] INSTALL PERSISTENT SYSTEM IMPERSONATION (System-Wide + All PowerShell sessions)` when not. Guarded by `Test-BuiltInAdmin`.
+  - Prompt updated from `(1-15)` to `(1-16)`.
+
 ### Added (2026-07-13 21:18:00 UTC)
 - `Invoke-AsSystem` multi-method elevation engine: attempts direct token duplication first (stealing a SYSTEM token from `winlogon.exe` / `csrss.exe` via `CreateProcessWithTokenW`), falls back to a temporary `sc.exe` service launch, and finally falls back to the original Task Scheduler helper. This eliminates the previous failure mode where the Task Scheduler helper killed the target process but never actually elevated it.
 - `sc.exe` temporary service elevation path: creates a demand-start service running as SYSTEM, executes the command, deletes the service, and reads the result from a temp file. Useful when token privileges are missing or Task Scheduler is unavailable.
