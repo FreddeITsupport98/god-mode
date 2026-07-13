@@ -304,6 +304,9 @@ function Get-Win32ErrorRootCause {
         122 {
             "ERROR_INSUFFICIENT_BUFFER ($baseMsg). Root cause: a buffer passed to a Win32 API was too small. Usually not applicable to token ops; check privilege structure sizes."
         }
+        1300 {
+            "ERROR_NOT_ALL_ASSIGNED ($baseMsg). Root cause: the current process token holds the privilege name but it is disabled or not fully assigned. Typical when running as Administrator (filtered token) rather than SYSTEM. Token stealing may still work if SeImpersonatePrivilege is present; SeAssignPrimaryTokenPrivilege is strictly required only for CreateProcessWithTokenW with a primary token. If this is the only missing privilege, try using an impersonation token path instead."
+        }
         default {
             "Win32 error $ErrorCode ($baseMsg). No specific root cause mapped; treat as generic API failure."
         }
@@ -1984,6 +1987,8 @@ try {
     Write-Log -Message "TokenOps P/Invoke already loaded or compilation failed: $_" -Type "WARN" -Color Yellow
 }
 
+$script:__ElevPrivWarned = $false
+
 function Enable-ElevationPrivileges {
     $privResults = @()
     $required = @("SeDebugPrivilege", "SeAssignPrimaryTokenPrivilege", "SeImpersonatePrivilege")
@@ -2005,8 +2010,13 @@ function Enable-ElevationPrivileges {
     }
     $missing = ($privResults | Where-Object { -not $_.Result }).Name
     if ($missing) {
-        Write-Log -Message "CRITICAL: Missing required privileges: $missing. Token stealing will likely fail. Exporting diagnostics..." -Type "ERROR" -Color Red
-        Export-ElevationDiagnostics -Trigger "MissingPrivileges"
+        if (-not $script:__ElevPrivWarned) {
+            $script:__ElevPrivWarned = $true
+            Write-Log -Message "CRITICAL: Missing required privileges: $missing. Token stealing will likely fail. Exporting diagnostics..." -Type "ERROR" -Color Red
+            Export-ElevationDiagnostics -Trigger "MissingPrivileges"
+        } else {
+            Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "INFO" -Message "Missing privileges already warned once this session: $missing"
+        }
     } else {
         Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "EXIT" -Message "All required privileges enabled. Results: $($privResults | ConvertTo-Json -Compress)"
     }
@@ -2911,6 +2921,11 @@ function Stop-NonSystemInstances {
 }
 
 function Invoke-ExistingProcessElevation {
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if (-not $isSystem) {
+        Write-Log -Message "Not running as SYSTEM — skipping existing-process elevation. Token elevation requires SYSTEM privileges. After reboot, the monitoring loop (running as SYSTEM) will elevate all processes." -Type "INFO" -Color Gray
+        return
+    }
     Write-Log -Message "Elevating existing user-session processes to SYSTEM..." -Type "INFO" -Color Gray
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
     try {
