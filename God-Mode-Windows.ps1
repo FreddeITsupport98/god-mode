@@ -1597,6 +1597,7 @@ public class TokenOps {
     public static extern IntPtr GetCurrentProcess();
 
     public const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     public const uint PROCESS_VM_READ = 0x0010;
     public const uint TOKEN_DUPLICATE = 0x0002;
     public const uint TOKEN_QUERY = 0x0008;
@@ -1691,8 +1692,27 @@ public class TokenOps {
         }
     }
 
+    public static bool TestOpenProcess(int pid) {
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+        if (hProcess == IntPtr.Zero) return false;
+        try {
+            IntPtr hToken = IntPtr.Zero;
+            if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, out hToken)) return false;
+            try {
+                IntPtr hDupToken = IntPtr.Zero;
+                if (!DuplicateTokenEx(hToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hDupToken)) return false;
+                CloseHandle(hDupToken);
+                return true;
+            } finally {
+                CloseHandle(hToken);
+            }
+        } finally {
+            CloseHandle(hProcess);
+        }
+    }
+
     public static int CreateProcessFromToken(int pid, string appName, string cmdLine, bool hideWindow) {
-        IntPtr hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid);
+        IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
         if (hProcess == IntPtr.Zero) return Marshal.GetLastWin32Error();
         try {
             IntPtr hToken = IntPtr.Zero;
@@ -1758,30 +1778,34 @@ function Enable-ElevationPrivileges {
 
 function Find-SystemProcessCandidate {
     param([int]$MaxScan = 30)
-    # Try well-known stable SYSTEM processes first (fast path)
-    $priorityNames = @("lsass.exe","services.exe","winlogon.exe","svchost.exe","MsMpEng.exe","SearchIndexer.exe")
-    foreach ($name in $priorityNames) {
-        $procs = Get-Process -Name ($name -replace '\.exe$','') -ErrorAction SilentlyContinue
-        foreach ($p in $procs) {
+    # Get all processes with WMI in one shot (fast)
+    $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
+    if (-not $allProcs) { return 0 }
+
+    # Phase 1: Prioritize Session 1 (interactive desktop) SYSTEM processes.
+    # These are the ONLY tokens that can spawn desktop apps visible to the user.
+    $session1Names = @("winlogon.exe","dwm.exe","fontdrvhost.exe")
+    foreach ($name in $session1Names) {
+        $candidates = $allProcs | Where-Object { $_.Name -eq $name -and $_.SessionId -eq 1 }
+        foreach ($proc in $candidates) {
             try {
-                $cim = Get-CimInstance Win32_Process -Filter "ProcessId=$($p.Id)" -ErrorAction SilentlyContinue
-                if ($cim) {
-                    $owner = ($cim | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
-                    if ($owner -eq "SYSTEM") { return $p.Id }
+                $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
+                if ($owner -eq "SYSTEM" -and [TokenOps]::TestOpenProcess($proc.ProcessId)) {
+                    return $proc.ProcessId
                 }
             } catch {}
         }
     }
-    # Fallback: scan all processes via WMI and pick the first non-critical SYSTEM process
-    $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe")
-    $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessId -gt 4 }
+
+    # Phase 2: Any other non-critical SYSTEM process that we can actually open
+    $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe","lsass.exe","MsMpEng.exe")
     $scanned = 0
-    foreach ($proc in $allProcs) {
+    foreach ($proc in ($allProcs | Where-Object { $_.ProcessId -gt 4 -and $_.Name -notin $excludeNames } | Sort-Object { $_.SessionId } -Descending)) {
         if ($scanned -ge $MaxScan) { break }
         $scanned++
         try {
             $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
-            if ($owner -eq "SYSTEM" -and ($proc.Name -notin $excludeNames)) {
+            if ($owner -eq "SYSTEM" -and [TokenOps]::TestOpenProcess($proc.ProcessId)) {
                 return $proc.ProcessId
             }
         } catch {}
@@ -2624,6 +2648,25 @@ function Invoke-ExistingProcessElevation {
     Write-Log -Message "Existing process elevation complete ($count total, $skipped critical skipped)." -Type "INFO" -Color Gray
 }
 
+function Monitor-ElevateProcess {
+    param([string]$Path, [string]$Arguments = "")
+    if (-not (Test-Path $Path)) { return $false }
+    $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+
+    # Skip if already running as SYSTEM
+    if (Test-SystemProcessExists -ProcessName "$procName.exe") { return $true }
+
+    # In the monitoring loop we only try token-steal; we NEVER kill existing
+    # processes (that would destroy Chrome, Explorer, etc.) and we do NOT use
+    # the scheduled-task fallback because it runs in Session 0 and won't show
+    # on the desktop.
+    $stolen = Start-ProcessWithStolenToken -Path $Path -Arguments $Arguments -HideWindow
+    if ($stolen) {
+        Write-Log -Message "Monitor elevated: $procName (token-steal)" -Type "INFO" -Color Gray
+    }
+    return $stolen
+}
+
 function Start-Monitoring {
     Write-DebugLog -FunctionName "Start-Monitoring" -Action "ENTRY"
     $Flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
@@ -2647,6 +2690,7 @@ function Start-Monitoring {
     $lastKillCheck = [datetime]::MinValue
     $lastExistingElevate = [datetime]::MinValue
     $lastPidCleanup = [datetime]::MinValue
+    $loopCount = 0
 
     # --- One-time elevation of all existing user-session processes at startup ---
     Invoke-ExistingProcessElevation
@@ -2654,6 +2698,10 @@ function Start-Monitoring {
     while ($true) {
         try {
             Start-Sleep -Seconds 2
+            $loopCount++
+            if ($loopCount % 30 -eq 0) {
+                Write-Log -Message "Monitor heartbeat: loop $loopCount, PIDs tracked: $($lastElevatedPid.Count)" -Type "INFO" -Color Gray
+            }
 
             # --- Cleanup old PID entries to prevent memory growth ---
             if ((Get-Date) - $lastPidCleanup -gt [TimeSpan]::FromMinutes(5)) {
@@ -2709,9 +2757,9 @@ function Start-Monitoring {
                             }
                         }
                     }
-                if ((-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) -and -not (Test-SystemProcessExists -ProcessName $procName)) {
+                    if ((-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-60)) -and -not (Test-SystemProcessExists -ProcessName $procName)) {
                         $lastElevated[$path] = Get-Date
-                        Elevate-Process -Path $path -Arguments $arguments
+                        Monitor-ElevateProcess -Path $path -Arguments $arguments
                         Start-Sleep -Milliseconds 100
                     }
                 }
@@ -2751,7 +2799,7 @@ function Start-Monitoring {
                     # PID-based tracking: each process instance gets elevated once
                     if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
                         $lastElevatedPid[$proc.ProcessId] = Get-Date
-                        Elevate-Process -Path $path -Arguments $arguments
+                        Monitor-ElevateProcess -Path $path -Arguments $arguments
                     }
                 }
             }
