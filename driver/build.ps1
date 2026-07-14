@@ -7,6 +7,7 @@
 #
 # Usage: pwsh -File driver\build.ps1  (or powershell -File driver\build.ps1 on older systems)
 
+param([string]$OutDir = (Join-Path $env:TEMP "GodModeBuild"))
 $DriverDir = $PSScriptRoot
 $ErrorActionPreference = "Stop"
 
@@ -55,7 +56,6 @@ Write-Host "==============================================" -ForegroundColor Cya
 Write-Host "  God Mode C Component Builder" -ForegroundColor Cyan
 Write-Host "==============================================" -ForegroundColor Cyan
 
-$OutDir = $DriverDir
 if (-not (Test-Path $OutDir)) { New-Item -ItemType Directory -Path $OutDir -Force | Out-Null }
 
 if (Test-Tool "cl") {

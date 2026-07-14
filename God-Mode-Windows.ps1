@@ -3700,12 +3700,18 @@ function Unblock-TaskManager {
 }
 
 function Install-ProcessHook {
+    [CmdletBinding()]
+    param([switch]$Force)
     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ENTRY"
     $success = $false
     try {
         $DriverDir = Join-Path $PSScriptRoot "driver"
-        $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
-        $HookDll = Join-Path $DriverDir "gmhook.dll"
+        $BuildOutDir = Join-Path $env:TEMP "GodModeBuild"
+        if ($Force -and (Test-Path $BuildOutDir)) {
+            Remove-Item -Path $BuildOutDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        $ProxyExe = Join-Path $BuildOutDir "gmproxy.exe"
+        $HookDll = Join-Path $BuildOutDir "gmhook.dll"
         $BuildScript = Join-Path $DriverDir "build.ps1"
     $BuildLog = Join-Path ([Environment]::GetFolderPath("Desktop")) "GodMode_DriverBuild.log"
 
@@ -3762,7 +3768,7 @@ function Install-ProcessHook {
                             $env:PATH = "$MsysBin;$env:PATH"
                             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Temporarily added MSYS2 bin to PATH: $MsysBin"
                         }
-                        $BuildOutput = & $ShellExe -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
+                        $BuildOutput = & $ShellExe -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" -OutDir "$BuildOutDir" 2>&1
                         $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
                         $BuildExit = $LASTEXITCODE
                         # Small pause to ensure filesystem is consistent before Test-Path checks
@@ -4834,7 +4840,7 @@ function Enable-GodMode {
     # --- Install C process hook (IFEO proxy + explorer DLL) FIRST before any dangerous system changes ---
     # This is a critical gate: if build or install fails, the rest of the script
     # must NOT proceed to avoid enabling dangerous mode without C hooks.
-    $HookOk = Install-ProcessHook
+    $HookOk = Install-ProcessHook -Force
     if (-not $HookOk) {
         $DesktopPath = [Environment]::GetFolderPath("Desktop")
         $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
