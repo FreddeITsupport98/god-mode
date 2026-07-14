@@ -7,7 +7,7 @@
 #
 # Usage: pwsh -File driver\build.ps1  (or powershell -File driver\build.ps1 on older systems)
 
-$DriverDir = Join-Path $PSScriptRoot "driver"
+$DriverDir = $PSScriptRoot
 $ErrorActionPreference = "Stop"
 
 function Test-Tool {
