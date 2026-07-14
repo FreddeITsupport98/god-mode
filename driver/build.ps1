@@ -1,4 +1,4 @@
-# build.ps1 — God Mode Driver/Proxy Build Script
+# build.ps1 -- God Mode Driver/Proxy Build Script
 # Builds gmproxy.exe (IFEO proxy) and gmhook.dll (shell hook) from C sources.
 # Requires either:
 #   - Visual Studio (cl.exe / link.exe) in PATH, or
@@ -20,14 +20,14 @@ function Build-WithMSVC {
     param([string]$OutDir)
     Write-Host "[BUILD] Using MSVC (cl.exe)" -ForegroundColor Cyan
 
-    # gmproxy.exe — IFEO proxy
+    # gmproxy.exe -- IFEO proxy
     $proxySrc = Join-Path $DriverDir "gmproxy.c"
     $proxyOut = Join-Path $OutDir "gmproxy.exe"
     cl /nologo /O2 /W3 /Fe:"$proxyOut" "$proxySrc" kernel32.lib advapi32.lib ntdll.lib
     if ($LASTEXITCODE -ne 0) { throw "gmproxy.exe build failed" }
     Write-Host "[BUILD] gmproxy.exe -> $proxyOut" -ForegroundColor Green
 
-    # gmhook.dll — shell hook
+    # gmhook.dll -- shell hook
     $hookSrc = Join-Path $DriverDir "gmhook.c"
     $hookOut = Join-Path $OutDir "gmhook.dll"
     cl /nologo /O2 /W3 /LD /Fe:"$hookOut" "$hookSrc" kernel32.lib advapi32.lib ntdll.lib user32.lib

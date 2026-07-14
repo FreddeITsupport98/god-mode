@@ -85,6 +85,20 @@ static BOOL hookInstalled = FALSE;
 static DWORD gSystemPid = 0;
 static HANDLE gSystemToken = NULL;
 static HMODULE gHModule = NULL;
+static CRITICAL_SECTION gHookLock;
+
+/* Lazy-resolve CreateProcessWithTokenW from advapi32.dll.
+   DllMain might run before advapi32.dll is loaded in the target process.
+   We resolve on first use instead of failing silently. */
+static CreateProcessWithTokenW_t ResolveCreateProcessWithTokenW(void) {
+    if (pCreateWithToken) return pCreateWithToken;
+    HMODULE hAdvapi = GetModuleHandleW(L"advapi32.dll");
+    if (!hAdvapi) hAdvapi = LoadLibraryW(L"advapi32.dll");
+    if (hAdvapi) {
+        pCreateWithToken = (CreateProcessWithTokenW_t)GetProcAddress(hAdvapi, "CreateProcessWithTokenW");
+    }
+    return pCreateWithToken;
+}
 
 static BOOL EnablePrivilege(LPCWSTR privName) {
     HANDLE hToken;
@@ -235,19 +249,37 @@ static BOOL WINAPI HookCreateProcessW(
         }
     }
 
-    /* Create the child process directly with the stolen SYSTEM primary token.
-       CreateProcessWithTokenW only requires SeImpersonatePrivilege (held by the
-       Administrator token), so this works from an interactive Admin session where
-       the old NtSetInformationProcess token-swap (SeAssignPrimaryTokenPrivilege)
-       could never succeed. The child is BORN as SYSTEM. */
-    if (pCreateWithToken) {
-        BOOL ret = pCreateWithToken(gSystemToken, 0, lpApplicationName, lpCommandLine,
-            dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
-            lpProcessInformation);
-        if (ret) return TRUE;
-        /* CreateProcessWithTokenW failed (rare: bad flags/inheritance). Fall back to
-           the original CreateProcessW so the app still launches unelevated instead
-           of vanishing — no flashing, no silent close. */
+    /* Ensure CreateProcessWithTokenW is resolved (advapi32 may not be loaded at DllMain time). */
+    CreateProcessWithTokenW_t pCpwt = ResolveCreateProcessWithTokenW();
+    if (pCpwt) {
+        /* CreateProcessWithTokenW requires lpDesktop to be specified for cross-session
+           tokens. If the caller passed NULL, we must copy STARTUPINFO and set it. */
+        STARTUPINFOW siCopy = {0};
+        LPSTARTUPINFOW pSi;
+        if (lpStartupInfo) {
+            if (lpStartupInfo->cb >= sizeof(STARTUPINFOW)) {
+                siCopy = *lpStartupInfo;
+            } else {
+                memcpy(&siCopy, lpStartupInfo, lpStartupInfo->cb);
+            }
+            if (!siCopy.lpDesktop) siCopy.lpDesktop = L"Winsta0\\Default";
+            pSi = &siCopy;
+        } else {
+            siCopy.cb = sizeof(siCopy);
+            siCopy.lpDesktop = L"Winsta0\\Default";
+            pSi = &siCopy;
+        }
+
+        /* CreateProcessWithTokenW does not support EXTENDED_STARTUPINFO_PRESENT.
+           If the caller used it, fall back to the original path. */
+        if (!(dwCreationFlags & 0x00080000)) { /* EXTENDED_STARTUPINFO_PRESENT = 0x00080000 */
+            BOOL ret = pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
+                dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi,
+                lpProcessInformation);
+            if (ret) return TRUE;
+            /* If CreateProcessWithTokenW fails, fall back so the app still launches
+               unelevated instead of vanishing — no flashing, no silent close. */
+        }
     }
 
     return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
@@ -255,9 +287,8 @@ static BOOL WINAPI HookCreateProcessW(
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
 }
 
-/* IAT hook: much safer on x64 because we never touch instruction bytes. */
-static BOOL InstallIATHook(void) {
-    HMODULE hMod = GetModuleHandle(NULL);
+/* IAT hook helper: patch a single module's IAT for CreateProcessW. */
+static BOOL HookModuleIAT(HMODULE hMod) {
     if (!hMod) return FALSE;
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
@@ -274,6 +305,7 @@ static BOOL InstallIATHook(void) {
     void* realAddr = GetProcAddress(hKernel, "CreateProcessW");
     if (!realAddr) return FALSE;
 
+    BOOL hooked = FALSE;
     for (; importDesc->Name; importDesc++) {
         PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->OriginalFirstThunk);
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
@@ -289,56 +321,102 @@ static BOOL InstallIATHook(void) {
                 DWORD oldProtect;
                 if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
                                    PAGE_READWRITE, &oldProtect)) {
-                    pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                    if (!pOrigCreateProcessW) {
+                        pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                    }
                     thunk->u1.Function = (ULONG_PTR)HookCreateProcessW;
                     VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
                                    oldProtect, &oldProtect);
-                    return TRUE;
+                    hooked = TRUE;
                 }
             }
         } else {
-            /* OriginalFirstThunk is NULL; match by address */
             for (; thunk->u1.Function; thunk++) {
                 if (thunk->u1.Function == (ULONG_PTR)realAddr) {
                     DWORD oldProtect;
                     if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
                                        PAGE_READWRITE, &oldProtect)) {
-                        pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                        if (!pOrigCreateProcessW) {
+                            pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                        }
                         thunk->u1.Function = (ULONG_PTR)HookCreateProcessW;
                         VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
                                        oldProtect, &oldProtect);
-                        return TRUE;
+                        hooked = TRUE;
                     }
                 }
             }
         }
     }
-    return FALSE;
+    return hooked;
+}
+
+/* Enumerate all loaded modules and hook each one's IAT.
+   Modern browsers (Firefox, Chrome, Edge) and explorer call CreateProcessW
+   from their loaded DLLs, not the main executable. */
+static BOOL InstallIATHook(void) {
+    BOOL hooked = FALSE;
+
+    /* Hook the main executable first */
+    hooked |= HookModuleIAT(GetModuleHandle(NULL));
+
+    /* Enumerate all loaded modules and hook each one */
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    HMODULE hPsapi = GetModuleHandleW(L"psapi.dll");
+    if (!hPsapi) hPsapi = LoadLibraryW(L"psapi.dll");
+    if (hPsapi) {
+        typedef BOOL (WINAPI *EnumProcessModules_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
+        EnumProcessModules_t pEnum = (EnumProcessModules_t)GetProcAddress(hPsapi, "EnumProcessModules");
+        if (pEnum && pEnum(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
+            DWORD count = cbNeeded / sizeof(HMODULE);
+            for (DWORD i = 0; i < count; i++) {
+                if (hMods[i] != GetModuleHandle(NULL)) {
+                    hooked |= HookModuleIAT(hMods[i]);
+                }
+            }
+        }
+    }
+    return hooked;
 }
 
 static void RemoveIATHook(void) {
     if (!pOrigCreateProcessW) return;
-    HMODULE hMod = GetModuleHandle(NULL);
-    if (!hMod) return;
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
-    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
-    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
-        ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-    if (!importDesc) return;
 
-    for (; importDesc->Name; importDesc++) {
-        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
-        if (!thunk) continue;
-        for (; thunk->u1.Function; thunk++) {
-            if (thunk->u1.Function == (ULONG_PTR)HookCreateProcessW) {
-                DWORD oldProtect;
-                if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
-                                   PAGE_READWRITE, &oldProtect)) {
-                    thunk->u1.Function = (ULONG_PTR)pOrigCreateProcessW;
-                    VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
-                                   oldProtect, &oldProtect);
+    HMODULE hMods[1024];
+    DWORD cbNeeded;
+    HMODULE hPsapi = GetModuleHandleW(L"psapi.dll");
+    if (!hPsapi) hPsapi = LoadLibraryW(L"psapi.dll");
+    if (hPsapi) {
+        typedef BOOL (WINAPI *EnumProcessModules_t)(HANDLE, HMODULE*, DWORD, LPDWORD);
+        EnumProcessModules_t pEnum = (EnumProcessModules_t)GetProcAddress(hPsapi, "EnumProcessModules");
+        if (pEnum && pEnum(GetCurrentProcess(), hMods, sizeof(hMods), &cbNeeded)) {
+            DWORD count = cbNeeded / sizeof(HMODULE);
+            for (DWORD i = 0; i < count; i++) {
+                HMODULE hMod = hMods[i];
+                PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
+                if (dos->e_magic != IMAGE_DOS_SIGNATURE) continue;
+                PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
+                if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
+                PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
+                    ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+                if (!importDesc) continue;
+                for (; importDesc->Name; importDesc++) {
+                    PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
+                    if (!thunk) continue;
+                    for (; thunk->u1.Function; thunk++) {
+                        if (thunk->u1.Function == (ULONG_PTR)HookCreateProcessW) {
+                            DWORD oldProtect;
+                            if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                             PAGE_READWRITE, &oldProtect)) {
+                                thunk->u1.Function = (ULONG_PTR)pOrigCreateProcessW;
+                                VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                               oldProtect, &oldProtect);
+                            }
+                            break;
+                        }
+                    }
                 }
-                break;
             }
         }
     }
@@ -349,17 +427,20 @@ static void RemoveIATHook(void) {
 /* GetMsgProc for SetWindowsHookEx global injection */
 __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && !hookInstalled) {
-        wchar_t modName[MAX_PATH];
-        GetModuleFileNameW(NULL, modName, MAX_PATH);
-        wchar_t* baseName = wcsrchr(modName, L'\\');
-        if (baseName) baseName++; else baseName = modName;
-        if (!IsCriticalProcess(baseName)) {
-            EnablePrivilege(L"SeDebugPrivilege");
-            EnablePrivilege(L"SeImpersonatePrivilege");
-            EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
-            if (!gSystemToken) PrepareSystemToken();
-            hookInstalled = InstallIATHook();
+        EnterCriticalSection(&gHookLock);
+        if (!hookInstalled) {
+            wchar_t modName[MAX_PATH];
+            GetModuleFileNameW(NULL, modName, MAX_PATH);
+            wchar_t* baseName = wcsrchr(modName, L'\\');
+            if (baseName) baseName++; else baseName = modName;
+            if (!IsCriticalProcess(baseName)) {
+                EnablePrivilege(L"SeDebugPrivilege");
+                EnablePrivilege(L"SeImpersonatePrivilege");
+                if (!gSystemToken) PrepareSystemToken();
+                hookInstalled = InstallIATHook();
+            }
         }
+        LeaveCriticalSection(&gHookLock);
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
@@ -426,27 +507,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         gHModule = hModule;
         DisableThreadLibraryCalls(hModule);
+        InitializeCriticalSection(&gHookLock);
         pNtSetInfo = (NtSetInformationProcess_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
+        /* Resolve pCreateWithToken eagerly if advapi32.dll is already loaded;
+           if not, ResolveCreateProcessWithTokenW() will lazy-load it on first use. */
         pCreateWithToken = (CreateProcessWithTokenW_t)GetProcAddress(GetModuleHandleW(L"advapi32.dll"), "CreateProcessWithTokenW");
-        if (pCreateWithToken) {
-            /* Only install hook if this process is not critical */
-            wchar_t modName[MAX_PATH];
-            GetModuleFileNameW(NULL, modName, MAX_PATH);
-            wchar_t* baseName = wcsrchr(modName, L'\\');
-            if (baseName) baseName++; else baseName = modName;
-            if (!IsCriticalProcess(baseName)) {
-                EnablePrivilege(L"SeDebugPrivilege");
-                EnablePrivilege(L"SeImpersonatePrivilege");
-                EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
-                if (!gSystemToken) PrepareSystemToken();
-                hookInstalled = InstallIATHook();
-            }
+        /* Only install hook if this process is not critical */
+        wchar_t modName[MAX_PATH];
+        GetModuleFileNameW(NULL, modName, MAX_PATH);
+        wchar_t* baseName = wcsrchr(modName, L'\\');
+        if (baseName) baseName++; else baseName = modName;
+        if (!IsCriticalProcess(baseName)) {
+            EnablePrivilege(L"SeDebugPrivilege");
+            EnablePrivilege(L"SeImpersonatePrivilege");
+            if (!gSystemToken) PrepareSystemToken();
+            EnterCriticalSection(&gHookLock);
+            hookInstalled = InstallIATHook();
+            LeaveCriticalSection(&gHookLock);
         }
     } else if (reason == DLL_PROCESS_DETACH) {
         if (hookInstalled) {
+            EnterCriticalSection(&gHookLock);
             RemoveIATHook();
+            hookInstalled = FALSE;
+            LeaveCriticalSection(&gHookLock);
         }
         if (gSystemToken) CloseHandle(gSystemToken);
+        DeleteCriticalSection(&gHookLock);
     }
     return TRUE;
 }

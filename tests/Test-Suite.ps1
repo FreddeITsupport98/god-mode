@@ -118,7 +118,7 @@ $IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 Add-Assertion -Name "Running as Administrator" -Pass $IsAdmin -Details "Tests requiring admin checks will be skipped."
 
 # ============================================================================
-# 5. INTEGRITY CHECK (God_mode.ps1) — NO-SIDE-EFFECT
+# 5. INTEGRITY CHECK (God_mode.ps1) -- NO-SIDE-EFFECT
 # ============================================================================
 Write-Section "INTEGRITY CHECK (NO-SIDE-EFFECT)"
 if ($IsAdmin -and (Test-Path $DnsScript)) {
@@ -133,7 +133,7 @@ if ($IsAdmin -and (Test-Path $DnsScript)) {
 }
 
 # ============================================================================
-# 6. UNINSTALLER VALIDATION — NO-SIDE-EFFECT
+# 6. UNINSTALLER VALIDATION -- NO-SIDE-EFFECT
 # ============================================================================
 Write-Section "UNINSTALLER VALIDATION (NO-SIDE-EFFECT)"
 if (Test-Path $DnsScript) {
@@ -154,7 +154,7 @@ if (Test-Path $DnsScript) {
 }
 
 # ============================================================================
-# 7. INSTALLER VALIDATION — NO-SIDE-EFFECT
+# 7. INSTALLER VALIDATION -- NO-SIDE-EFFECT
 # ============================================================================
 Write-Section "INSTALLER VALIDATION (NO-SIDE-EFFECT)"
 if (Test-Path $DnsScript) {

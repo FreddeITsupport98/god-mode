@@ -4026,7 +4026,7 @@ public class GmHookGlobal {
 function Uninstall-ProcessHook {
     Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "ENTRY"
     try {
-        # Remove IFEO Debugger entries (legacy cleanup — covers both old 6-app and expanded 40+ app lists)
+        # Remove IFEO Debugger entries (legacy cleanup -- covers both old 6-app and expanded 40+ app lists)
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $LegacyIfeoApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe",
             "opera.exe", "brave.exe", "vivaldi.exe", "iexplore.exe", "notepad++.exe", "wordpad.exe",
