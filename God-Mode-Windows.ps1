@@ -3797,37 +3797,85 @@ function Install-ProcessHook {
         # Ensure install directory exists before copying binaries
         if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
 
+        $destProxy = Join-Path $GodModeInstallDir "gmproxy.exe"
+        $destHook  = Join-Path $GodModeInstallDir "gmhook.dll"
+
+        # --- Copy gmproxy.exe with explicit verification (Copy-Item -EA SilentlyContinue hides real errors) ---
         if (-not (Test-Path $ProxyExe)) {
             Write-Log -Message "gmproxy.exe still missing after build attempt. Skipping IFEO proxy install." -Type "WARN" -Color Yellow
             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe still missing after build"
         } else {
-            $destProxy = Join-Path $GodModeInstallDir "gmproxy.exe"
-            try { Copy-Item -Path $ProxyExe -Destination $destProxy -Force -ErrorAction SilentlyContinue } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Copy-Item gmproxy.exe failed: $_" }
-            Write-Log -Message "gmproxy.exe installed to $destProxy" -Type "INFO" -Color Gray
-
-            # Register IFEO Debugger for user-mode apps (not taskmgr or explorer)
-            $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-            $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
-            foreach ($app in $TargetApps) {
+            $copyOk = $false
+            try {
+                [System.IO.File]::Copy($ProxyExe, $destProxy, $true)
+                Start-Sleep -Milliseconds 100
+                if (Test-Path $destProxy) { $copyOk = $true }
+            } catch {
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "File.Copy gmproxy.exe failed: $_"
+                # Fallback: try cmd copy
                 try {
-                    $appPath = Join-Path $IfeoPath $app
-                    if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
-                    Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
-                } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "IFEO registration for $app failed: $_" }
+                    $null = & cmd /c "copy `"$ProxyExe`" `"$destProxy`" /Y" 2>&1
+                    Start-Sleep -Milliseconds 100
+                    if (Test-Path $destProxy) { $copyOk = $true }
+                } catch {
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "cmd copy gmproxy.exe fallback failed: $_"
+                }
             }
-            Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
+            if ($copyOk) {
+                Write-Log -Message "gmproxy.exe installed to $destProxy" -Type "INFO" -Color Gray
+            } else {
+                Write-Log -Message "gmproxy.exe copy failed (all methods). Skipping IFEO proxy install." -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe not present at destination after copy attempts"
+            }
+
+            # Register IFEO Debugger only if proxy actually exists at destination
+            if (Test-Path $destProxy) {
+                $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
+                foreach ($app in $TargetApps) {
+                    try {
+                        $appPath = Join-Path $IfeoPath $app
+                        if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
+                        Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
+                    } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "IFEO registration for $app failed: $_" }
+                }
+                Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
+            } else {
+                Write-Log -Message "IFEO registration skipped because gmproxy.exe is not at destination." -Type "WARN" -Color Yellow
+            }
         }
 
-        $success = $true
-        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Build+IFEO succeeded. success=$success"
-
+        # --- Copy gmhook.dll with explicit verification ---
         if (-not (Test-Path $HookDll)) {
             Write-Log -Message "gmhook.dll still missing after build attempt. Skipping DLL injection." -Type "WARN" -Color Yellow
             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll still missing after build"
         } else {
-            $destHook = Join-Path $GodModeInstallDir "gmhook.dll"
-            try { Copy-Item -Path $HookDll -Destination $destHook -Force -ErrorAction SilentlyContinue } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Copy-Item gmhook.dll failed: $_" }
-            Write-Log -Message "gmhook.dll installed to $destHook" -Type "INFO" -Color Gray
+            $copyOk = $false
+            try {
+                [System.IO.File]::Copy($HookDll, $destHook, $true)
+                Start-Sleep -Milliseconds 100
+                if (Test-Path $destHook) { $copyOk = $true }
+            } catch {
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "File.Copy gmhook.dll failed: $_"
+                try {
+                    $null = & cmd /c "copy `"$HookDll`" `"$destHook`" /Y" 2>&1
+                    Start-Sleep -Milliseconds 100
+                    if (Test-Path $destHook) { $copyOk = $true }
+                } catch {
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "cmd copy gmhook.dll fallback failed: $_"
+                }
+            }
+            if ($copyOk) {
+                Write-Log -Message "gmhook.dll installed to $destHook" -Type "INFO" -Color Gray
+            } else {
+                Write-Log -Message "gmhook.dll copy failed (all methods). Skipping DLL injection." -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll not present at destination after copy attempts"
+            }
+        }
+
+        # Success means the proxy exists; DLL injection is non-critical
+        $success = (Test-Path $destProxy)
+        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "destProxy exists=$success, destHook exists=$(Test-Path $destHook)"
 
             # Inject into explorer.exe using a simple PowerShell injector
             $explorer = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
