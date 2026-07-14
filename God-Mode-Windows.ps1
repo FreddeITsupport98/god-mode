@@ -5854,7 +5854,7 @@ do {
     Write-Host "[12] EXIT TERMINAL" -ForegroundColor Gray
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[13] VERIFY SYSTEM CONTEXT" -ForegroundColor Cyan
-    Write-Host "[14] EXPORT ELEVATION DIAGNOSTICS" -ForegroundColor Cyan
+Write-Host "[14] INSTALL/ENABLE PROCESS HOOK (gmhook.dll)" -ForegroundColor Cyan
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  TOKEN IMPERSONATION   " -ForegroundColor White
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
@@ -5958,11 +5958,17 @@ do {
         "9" { Show-GodModeStatus; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "13" { Test-SystemContext; Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") }
         "14" {
-            $diagPath = Export-ElevationDiagnostics -Trigger "ManualMenu"
-            if ($diagPath) {
-                Write-Host "`n[SUCCESS] Elevation diagnostics exported to: $diagPath" -ForegroundColor Green
+            if (-not (Test-BuiltInAdmin)) {
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can install the process hook.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
             } else {
-                Write-Host "`n[ERROR] Failed to export elevation diagnostics." -ForegroundColor Red
+                $hookOk = Install-ProcessHook
+                if ($hookOk) {
+                    Write-Host "`n[SUCCESS] Process hook installed and injected." -ForegroundColor Green
+                } else {
+                    Write-Host "`n[WARNING] Process hook installation reported issues. Check logs for details." -ForegroundColor Yellow
+                }
             }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
