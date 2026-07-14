@@ -231,7 +231,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!usedHardlink) {
         wchar_t tempDir[MAX_PATH] = {0};
         GetTempPathW(MAX_PATH, tempDir);
-        swprintf(hardlinkPath, MAX_PATH, L"%s\gmproxy_%lu_%s", tempDir, GetCurrentProcessId(), baseName);
+        swprintf(hardlinkPath, MAX_PATH, L"%s\\gmproxy_%lu_%s", tempDir, GetCurrentProcessId(), baseName);
         usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
     }
 

