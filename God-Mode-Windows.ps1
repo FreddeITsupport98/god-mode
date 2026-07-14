@@ -3186,7 +3186,7 @@ function Export-GodModeLogs {
         $HookSrc = Join-Path $DriverDir "gmhook.dll"
         $ProxyDest = Join-Path $GodModeInstallDir "gmproxy.exe"
         $HookDest = Join-Path $GodModeInstallDir "gmhook.dll"
-        $BuildLog = Join-Path $env:TEMP "GodMode_DriverBuild.log"
+    $BuildLog = Join-Path ([Environment]::GetFolderPath("Desktop")) "GodMode_DriverBuild.log"
 
         $LogContent += "`r`nSource gmproxy.exe: $(if (Test-Path $ProxySrc) { 'EXISTS' } else { 'MISSING' }) ($ProxySrc)"
         $LogContent += "`r`nSource gmhook.dll:  $(if (Test-Path $HookSrc)  { 'EXISTS' } else { 'MISSING' }) ($HookSrc)"
@@ -3694,37 +3694,54 @@ function Install-ProcessHook {
         $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
         $HookDll = Join-Path $DriverDir "gmhook.dll"
         $BuildScript = Join-Path $DriverDir "build.ps1"
-        $BuildLog = Join-Path $env:TEMP "GodMode_DriverBuild.log"
+    $BuildLog = Join-Path ([Environment]::GetFolderPath("Desktop")) "GodMode_DriverBuild.log"
 
     # --- Auto-build if binaries are missing ---
         $NeedBuild = (-not (Test-Path $ProxyExe)) -or (-not (Test-Path $HookDll))
         if ($NeedBuild) {
-            # Auto-install MSYS2 GCC if MSYS2 is present but gcc is missing
+            # Pre-flight: check if any compiler is available before attempting build
             $CompilerStatus = Get-CompilerStatus
             if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+                # Auto-install MSYS2 GCC if MSYS2 is present but gcc is missing
                 $MsysRoot = Get-MSYS2Root
                 if ($MsysRoot) {
                     $GccInstalled = Install-MSYS2GCC -MsysRoot $MsysRoot
                     if ($GccInstalled) {
-                        # Refresh PATH to include newly installed gcc
                         $UcrtBin = Join-Path $MsysRoot "ucrt64\bin"
                         if (Test-Path $UcrtBin) {
                             $env:PATH = "$UcrtBin;$env:PATH"
                             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Added $UcrtBin to PATH after auto-install"
                         }
+                        # Re-check compiler status after auto-install
+                        $CompilerStatus = Get-CompilerStatus
+                    } else {
+                        Write-Log -Message "MSYS2 GCC auto-install failed. Cannot compile C components." -Type "ERROR" -Color Red
+                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "MSYS2 GCC auto-install failed in $MsysRoot"
                     }
                 }
             }
+            # If still no compiler, abort process hook installation with clear cause
+            if ($CompilerStatus -eq $null -or $CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+                $Cause = if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+                    "MSYS2 is installed but gcc.exe is still missing (pacman may have failed or requires manual refresh)."
+                } else {
+                    "No C compiler detected (MSVC cl.exe, MinGW gcc, MSYS2 gcc, or Linux x86_64-w64-mingw32-gcc). Install MSYS2 or Visual Studio Build Tools."
+                }
+                Write-Log -Message "C components need compilation but no compiler is available: $Cause Process hook installation aborted." -Type "ERROR" -Color Red
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Compilation impossible: $Cause"
+                return
+            }
             if (Test-Path $BuildScript) {
                 Write-Log -Message "C components missing (gmproxy.exe or gmhook.dll). Running auto-build: $BuildScript" -Type "INFO" -Color Yellow
-                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build starting: $BuildScript"
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build starting: $BuildScript (compiler: $CompilerStatus)"
                 try {
                     $PwshPath = Get-Command "pwsh" -ErrorAction SilentlyContinue
                     $PsPath = Get-Command "powershell" -ErrorAction SilentlyContinue
                     $ShellExe = if ($PwshPath) { $PwshPath.Source } elseif ($PsPath) { $PsPath.Source } else { $null }
                     if (-not $ShellExe) {
-                        Write-Log -Message "Neither pwsh nor powershell found in PATH. Cannot auto-build C components." -Type "WARN" -Color Yellow
-                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "No PowerShell interpreter found for auto-build"
+                        Write-Log -Message "Neither pwsh nor powershell found in PATH. Cannot auto-build C components." -Type "ERROR" -Color Red
+                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "No PowerShell interpreter found for auto-build"
+                        return
                     } else {
                         # If gcc is missing from PATH but MSYS2 is installed in a known dir, temporarily add it
                         $MsysBin = Get-MSYS2Path
@@ -3742,6 +3759,10 @@ function Install-ProcessHook {
                                 $BuildErr = Get-Content -Raw $BuildLog -ErrorAction SilentlyContinue
                                 Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build output: $BuildErr"
                             }
+                            # Abort process hook installation if build failed
+                            Write-Log -Message "C component build failed. Process hook installation aborted." -Type "ERROR" -Color Red
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build failed - binaries missing. Aborting hook install."
+                            return
                         } else {
                             Write-Log -Message "Auto-build succeeded." -Type "INFO" -Color Green
                             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build succeeded"
@@ -3750,11 +3771,24 @@ function Install-ProcessHook {
                 } catch {
                     Write-Log -Message "Auto-build exception: $_" -Type "ERROR" -Color Red
                     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build exception: $_"
+                    Write-Log -Message "C component build exception. Process hook installation aborted." -Type "ERROR" -Color Red
+                    return
                 }
             } else {
-                Write-Log -Message "Build script not found: $BuildScript. Cannot auto-build C components." -Type "WARN" -Color Yellow
-                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Build script missing: $BuildScript"
+                Write-Log -Message "Build script not found: $BuildScript. Cannot auto-build C components." -Type "ERROR" -Color Red
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build script missing: $BuildScript"
+                return
             }
+        }
+
+        # Final binary verification before installation
+        if (-not (Test-Path $ProxyExe) -or -not (Test-Path $HookDll)) {
+            $Missing = @()
+            if (-not (Test-Path $ProxyExe)) { $Missing += "gmproxy.exe" }
+            if (-not (Test-Path $HookDll)) { $Missing += "gmhook.dll" }
+            Write-Log -Message "C binaries still missing after build: $($Missing -join ', '). Process hook installation aborted. Check $BuildLog for details." -Type "ERROR" -Color Red
+            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Missing binaries: $($Missing -join ', ') - aborting hook install"
+            return
         }
 
         if (-not (Test-Path $ProxyExe)) {
@@ -4613,6 +4647,61 @@ function Start-Monitoring {
 
 function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
+
+    # --- Pre-flight C compiler check: abort before any system modifications if C components cannot be built ---
+    $DriverDir = Join-Path $PSScriptRoot "driver"
+    $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
+    $HookDll = Join-Path $DriverDir "gmhook.dll"
+    if (-not (Test-Path $ProxyExe) -or -not (Test-Path $HookDll)) {
+        $CompilerStatus = Get-CompilerStatus
+        if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+            $MsysRoot = Get-MSYS2Root
+            if ($MsysRoot) {
+                Write-Log -Message "C components missing (gmproxy.exe / gmhook.dll). MSYS2 found without gcc. Auto-installing..." -Type "INFO" -Color Cyan
+                $GccInstalled = Install-MSYS2GCC -MsysRoot $MsysRoot
+                if ($GccInstalled) {
+                    $UcrtBin = Join-Path $MsysRoot "ucrt64\bin"
+                    if (Test-Path $UcrtBin) {
+                        $env:PATH = "$UcrtBin;$env:PATH"
+                    }
+                    $CompilerStatus = Get-CompilerStatus
+                } else {
+                    $DesktopPath = [Environment]::GetFolderPath("Desktop")
+                    $ErrorLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
+                    "MSYS2 GCC auto-install failed in $MsysRoot. Cannot build C components." | Out-File -FilePath $ErrorLog -Encoding UTF8 -Force
+                    Write-Log -Message "C components cannot be built - MSYS2 gcc auto-install failed. Error log: $ErrorLog" -Type "ERROR" -Color Red
+                    Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "MSYS2 GCC auto-install failed - aborting God Mode"
+                    return
+                }
+            }
+        }
+        if ($CompilerStatus -eq $null -or $CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+            $DesktopPath = [Environment]::GetFolderPath("Desktop")
+            $ErrorLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
+            $ErrorContent = @"
+[ERROR] God Mode activation aborted - C components missing and no compiler available.
+
+Missing binaries:
+- gmproxy.exe
+- gmhook.dll
+
+Compiler status: $CompilerStatus
+
+To build C components, install one of:
+1. Visual Studio Build Tools (provides cl.exe)
+2. MSYS2 UCRT64 + mingw-w64-ucrt-x86_64-gcc
+   Download: https://github.com/msys2/msys2-installer/releases/latest
+   Then run: pacman -S mingw-w64-ucrt-x86_64-gcc
+3. Linux cross-compiler: x86_64-w64-mingw32-gcc
+
+Press [7] again after installing a compiler.
+"@
+            $ErrorContent | Out-File -FilePath $ErrorLog -Encoding UTF8 -Force
+            Write-Log -Message "C components missing and no compiler available. God Mode activation aborted. Details: $ErrorLog" -Type "ERROR" -Color Red
+            Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "No compiler available for C components - aborting God Mode activation"
+            return
+        }
+    }
 
     # Ensure the installed script exists before registering tasks that depend on it
     if (-not (Test-Path $GodModeInstallScript)) {
