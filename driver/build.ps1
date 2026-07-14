@@ -40,7 +40,7 @@ function Build-WithMinGW {
 
     $proxySrc = Join-Path $DriverDir "gmproxy.c"
     $proxyOut = Join-Path $OutDir "gmproxy.exe"
-    & $Prefix -O2 -Wall -o "$proxyOut" "$proxySrc" -ladvapi32 -lkernel32 -lntdll
+    & $Prefix -O2 -Wall -municode -o "$proxyOut" "$proxySrc" -ladvapi32 -lkernel32 -lntdll
     if ($LASTEXITCODE -ne 0) { throw "gmproxy.exe build failed" }
     Write-Host "[BUILD] gmproxy.exe -> $proxyOut" -ForegroundColor Green
 
