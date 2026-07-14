@@ -200,7 +200,21 @@ static BOOL WINAPI HookCreateProcessW(
     LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation)
 {
+    char buf[1024];
+    sprintf(buf, "[GMHOOK] CreateProcessW hook: app=%S cmd=%S\n",
+            lpApplicationName ? lpApplicationName : L"(null)",
+            lpCommandLine ? lpCommandLine : L"(null)");
+    OutputDebugStringA(buf);
+
+    if (!pOrigCreateProcessW) {
+        HMODULE hKb = GetModuleHandleW(L"kernelbase.dll");
+        HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+        if (hKb) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hKb, "CreateProcessW");
+        if (!pOrigCreateProcessW && hK32) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hK32, "CreateProcessW");
+    }
+
     if (!lpApplicationName && !lpCommandLine) {
+        OutputDebugStringA("[GMHOOK] Both app and cmd are NULL, passing through.\n");
         return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
             lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
             lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
@@ -231,8 +245,12 @@ static BOOL WINAPI HookCreateProcessW(
         if (slash) baseName = slash + 1;
     }
 
+    sprintf(buf, "[GMHOOK] baseName=%S\n", baseName ? baseName : L"(null)");
+    OutputDebugStringA(buf);
+
     /* Pass through critical OS processes untouched */
     if (IsCriticalProcess(baseName)) {
+        OutputDebugStringA("[GMHOOK] Critical process, passing through.\n");
         return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
             lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
             lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
@@ -240,13 +258,16 @@ static BOOL WINAPI HookCreateProcessW(
 
     /* Ensure token is ready */
     if (!gSystemToken) {
+        OutputDebugStringA("[GMHOOK] gSystemToken missing, preparing...\n");
         EnablePrivilege(L"SeDebugPrivilege");
         EnablePrivilege(L"SeImpersonatePrivilege");
         if (!PrepareSystemToken()) {
+            OutputDebugStringA("[GMHOOK] PrepareSystemToken failed, falling back.\n");
             return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
                 lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
         }
+        OutputDebugStringA("[GMHOOK] gSystemToken prepared OK.\n");
     }
 
     /* Ensure CreateProcessWithTokenW is resolved (advapi32 may not be loaded at DllMain time). */
@@ -273,15 +294,24 @@ static BOOL WINAPI HookCreateProcessW(
         /* CreateProcessWithTokenW does not support EXTENDED_STARTUPINFO_PRESENT.
            If the caller used it, fall back to the original path. */
         if (!(dwCreationFlags & 0x00080000)) { /* EXTENDED_STARTUPINFO_PRESENT = 0x00080000 */
+            OutputDebugStringA("[GMHOOK] Calling CreateProcessWithTokenW...\n");
             BOOL ret = pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
                 dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi,
                 lpProcessInformation);
-            if (ret) return TRUE;
-            /* If CreateProcessWithTokenW fails, fall back so the app still launches
-               unelevated instead of vanishing — no flashing, no silent close. */
+            if (ret) {
+                OutputDebugStringA("[GMHOOK] CreateProcessWithTokenW SUCCEEDED.\n");
+                return TRUE;
+            }
+            sprintf(buf, "[GMHOOK] CreateProcessWithTokenW FAILED: GLE=%lu\n", GetLastError());
+            OutputDebugStringA(buf);
+        } else {
+            OutputDebugStringA("[GMHOOK] EXTENDED_STARTUPINFO_PRESENT set, falling back.\n");
         }
+    } else {
+        OutputDebugStringA("[GMHOOK] CreateProcessWithTokenW not resolved, falling back.\n");
     }
 
+    OutputDebugStringA("[GMHOOK] Falling back to original CreateProcessW.\n");
     return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
         lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
         lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
@@ -298,16 +328,22 @@ static BOOL HookModuleIAT(HMODULE hMod) {
 
     PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
         ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-    if (!importDesc) return FALSE;
+    if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) return FALSE;
 
     HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
-    if (!hKernel) return FALSE;
-    void* realAddr = GetProcAddress(hKernel, "CreateProcessW");
-    if (!realAddr) return FALSE;
+    HMODULE hKernelBase = GetModuleHandleW(L"kernelbase.dll");
+    void* realAddr = NULL;
+    void* realAddrBase = NULL;
+    if (hKernel) realAddr = GetProcAddress(hKernel, "CreateProcessW");
+    if (hKernelBase) realAddrBase = GetProcAddress(hKernelBase, "CreateProcessW");
+    if (!realAddr && !realAddrBase) return FALSE;
 
     BOOL hooked = FALSE;
     for (; importDesc->Name; importDesc++) {
-        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->OriginalFirstThunk);
+        PIMAGE_THUNK_DATA origThunk = NULL;
+        if (importDesc->OriginalFirstThunk) {
+            origThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->OriginalFirstThunk);
+        }
         PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
         if (!thunk) continue;
 
@@ -332,7 +368,7 @@ static BOOL HookModuleIAT(HMODULE hMod) {
             }
         } else {
             for (; thunk->u1.Function; thunk++) {
-                if (thunk->u1.Function == (ULONG_PTR)realAddr) {
+                if (thunk->u1.Function == (ULONG_PTR)realAddr || thunk->u1.Function == (ULONG_PTR)realAddrBase) {
                     DWORD oldProtect;
                     if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
                                        PAGE_READWRITE, &oldProtect)) {
@@ -400,7 +436,7 @@ static void RemoveIATHook(void) {
                 if (nt->Signature != IMAGE_NT_SIGNATURE) continue;
                 PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
                     ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
-                if (!importDesc) continue;
+                if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) continue;
                 for (; importDesc->Name; importDesc++) {
                     PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
                     if (!thunk) continue;
@@ -438,6 +474,9 @@ __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPAR
                 EnablePrivilege(L"SeImpersonatePrivilege");
                 if (!gSystemToken) PrepareSystemToken();
                 hookInstalled = InstallIATHook();
+                char buf[512];
+                sprintf(buf, "[GMHOOK] GetMsgProc installed hook in %S: %d\n", modName, hookInstalled);
+                OutputDebugStringA(buf);
             }
         }
         LeaveCriticalSection(&gHookLock);
