@@ -3710,6 +3710,12 @@ function Install-ProcessHook {
                         Write-Log -Message "Neither pwsh nor powershell found in PATH. Cannot auto-build C components." -Type "WARN" -Color Yellow
                         Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "No PowerShell interpreter found for auto-build"
                     } else {
+                        # If gcc is missing from PATH but MSYS2 is installed in a known dir, temporarily add it
+                        $MsysBin = Get-MSYS2Path
+                        if ($MsysBin -and -not (Get-Command "gcc" -ErrorAction SilentlyContinue)) {
+                            $env:PATH = "$MsysBin;$env:PATH"
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Temporarily added MSYS2 bin to PATH: $MsysBin"
+                        }
                         $BuildOutput = & $ShellExe -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
                         $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
                         $BuildExit = $LASTEXITCODE
@@ -5267,11 +5273,27 @@ function Show-GodModeStatus {
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 }
 
+function Get-MSYS2Path {
+    $MsysCandidates = @(
+        "C:\msys64\ucrt64\bin",
+        "C:\msys64\mingw64\bin",
+        "C:\msys64\mingw32\bin"
+    )
+    foreach ($p in $MsysCandidates) {
+        if (Test-Path (Join-Path $p "gcc.exe")) { return $p }
+    }
+    return $null
+}
+
 function Get-CompilerStatus {
     $compilers = @()
     if (Get-Command "cl" -ErrorAction SilentlyContinue) { $compilers += "MSVC" }
     if (Get-Command "x86_64-w64-mingw32-gcc" -ErrorAction SilentlyContinue) { $compilers += "MinGW-cross" }
     if (Get-Command "gcc" -ErrorAction SilentlyContinue) { $compilers += "MinGW/MSYS2" }
+    else {
+        $msysPath = Get-MSYS2Path
+        if ($msysPath) { $compilers += "MSYS2 ($msysPath)" }
+    }
     if ($compilers.Count -eq 0) { return $null }
     return ($compilers -join ", ")
 }
