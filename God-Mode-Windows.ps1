@@ -2149,6 +2149,39 @@ public class TokenOps {
             CloseHandle(hProcess);
         }
     }
+
+    public static bool ReplaceProcessTokenForPid(int targetPid, int sourcePid) {
+        const uint PROCESS_SET_INFORMATION = 0x0200;
+        IntPtr hSource = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, sourcePid);
+        if (hSource == IntPtr.Zero) return false;
+        try {
+            IntPtr hSourceToken = IntPtr.Zero;
+            if (!OpenProcessToken(hSource, TOKEN_DUPLICATE | TOKEN_QUERY, out hSourceToken)) return false;
+            try {
+                IntPtr hPrimaryToken = IntPtr.Zero;
+                if (!DuplicateTokenEx(hSourceToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken)) return false;
+                try {
+                    IntPtr hTarget = OpenProcess(PROCESS_SET_INFORMATION, false, targetPid);
+                    if (hTarget == IntPtr.Zero) return false;
+                    try {
+                        PROCESS_ACCESS_TOKEN pat = new PROCESS_ACCESS_TOKEN();
+                        pat.Token = hPrimaryToken;
+                        pat.Thread = IntPtr.Zero;
+                        int status = NtSetInformationProcess(hTarget, ProcessAccessToken, ref pat, Marshal.SizeOf(pat));
+                        return status == 0;
+                    } finally {
+                        CloseHandle(hTarget);
+                    }
+                } finally {
+                    CloseHandle(hPrimaryToken);
+                }
+            } finally {
+                CloseHandle(hSourceToken);
+            }
+        } finally {
+            CloseHandle(hSource);
+        }
+    }
 }
 "@
 
@@ -3538,65 +3571,42 @@ function Unregister-SystemWatchdog {
 function Block-TaskManager {
     Write-DebugLog -FunctionName "Block-TaskManager" -Action "ENTRY"
     try {
+        # Remove any existing IFEO Debugger redirect so taskmgr opens normally
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe"
-        if (-not (Test-Path $IfeoPath)) { New-Item -Path $IfeoPath -Force | Out-Null }
-        # Redirect taskmgr to a non-existent executable so it silently fails to launch
-        Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\notaskmgr.exe" -Force -ErrorAction SilentlyContinue
-
-    # Also set the classic DisableTaskMgr policy (for non-admin fallback block)
+        if (Test-Path $IfeoPath) {
+            Remove-ItemProperty -Path $IfeoPath -Name "Debugger" -ErrorAction SilentlyContinue
+            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+            if ($RegKey) {
+                $Acl = $RegKey.GetAccessControl()
+                $Acl.SetAccessRuleProtection($false, $false)
+                $RegKey.SetAccessControl($Acl)
+                $RegKey.Close()
+            }
+            Remove-Item -Path $IfeoPath -Force -ErrorAction SilentlyContinue
+        }
+        # Remove classic DisableTaskMgr policy so taskmgr opens for everyone
         $PolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
-        if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
-        Set-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -Value 1 -Force -ErrorAction SilentlyContinue
-
-        # Create proxy launcher script and copy of taskmgr for admin SYSTEM launch
+        if (Test-Path $PolicyPath) {
+            Remove-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
+        }
+        # Clean up any old proxy files from hardened dir
         $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
         $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
-
-        # Copy taskmgr to temp, then push into hardened dir via SYSTEM
-        $TempTaskMgr = Join-Path $env:TEMP "gm_taskmgr_$(Get-Random).exe"
-        Copy-Item -Path "C:\Windows\System32\taskmgr.exe" -Destination $TempTaskMgr -Force -ErrorAction SilentlyContinue
-        if (Test-Path $TempTaskMgr) {
-            $copyResult = Invoke-AsSystem -Command "cmd /c copy /y `"$TempTaskMgr`" `"$TaskMgrCopy`""
-            if (-not $copyResult.Success) {
-                Write-Log -Message "Taskmgr copy to install dir failed: $($copyResult.Output)" -Type "WARN" -Color Yellow
+        if (Test-Path $ProxyPath) {
+            $delResult = Invoke-AsSystem -Command "cmd /c del /f /q `"$ProxyPath`""
+            if (-not $delResult.Success) {
+                Write-Log -Message "Failed to remove old taskmgr proxy: $($delResult.Output)" -Type "WARN" -Color Yellow
             }
-            Remove-Item -Path $TempTaskMgr -Force -ErrorAction SilentlyContinue
         }
-
-        $ProxyScript = @'
-# Task Manager SYSTEM Proxy -- admin-only, launches as SYSTEM
-param([string]$OriginalPath = "")
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-if (-not $isAdmin) { exit }
-$main = "C:\ProgramData\GodMode\GodMode.ps1"
-if (Test-Path $main) { & $main -LaunchTaskMgrAsSystem } else { Start-Process "C:\ProgramData\GodMode\taskmgr_real.exe" }
-'@
-        # Write proxy to temp, then push into hardened dir via SYSTEM
-        $TempProxy = Join-Path $env:TEMP "gm_proxy_$(Get-Random).ps1"
-        Set-Content -Path $TempProxy -Value $ProxyScript -Encoding UTF8 -Force
-        $proxyResult = Invoke-AsSystem -Command "cmd /c copy /y `"$TempProxy`" `"$ProxyPath`""
-        if (-not $proxyResult.Success) {
-            Write-Log -Message "Taskmgr proxy copy to install dir failed: $($proxyResult.Output)" -Type "WARN" -Color Yellow
+        if (Test-Path $TaskMgrCopy) {
+            $delResult = Invoke-AsSystem -Command "cmd /c del /f /q `"$TaskMgrCopy`""
+            if (-not $delResult.Success) {
+                Write-Log -Message "Failed to remove old taskmgr copy: $($delResult.Output)" -Type "WARN" -Color Yellow
+            }
         }
-        Remove-Item -Path $TempProxy -Force -ErrorAction SilentlyContinue
-
-        # Set IFEO Debugger to PowerShell proxy (hidden window)
-        Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ProxyPath`"" -Force -ErrorAction SilentlyContinue
-
-        # Harden the IFEO registry key against tampering
-        $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
-        if ($RegKey) {
-            $Acl = $RegKey.GetAccessControl()
-            $Acl.SetAccessRuleProtection($true, $false)
-            $Acl.Access | ForEach-Object { $Acl.RemoveAccessRule($_) | Out-Null }
-            $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidSystem, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
-            $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAdmin, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Allow")))
-            $RegKey.SetAccessControl($Acl)
-            $RegKey.Close()
-        }
-        Write-Log -Message "Task Manager blocked for non-admins; admin launch redirects to SYSTEM proxy." -Type "INFO" -Color Gray
+        Write-Log -Message "Task Manager unblocked (IFEO removed). Watcher will elevate it to SYSTEM in-place." -Type "INFO" -Color Gray
     } catch {
-        Write-Log -Message "Task Manager block failed: $_" -Type "WARN" -Color Yellow
+        Write-Log -Message "Task Manager unblock failed: $_" -Type "WARN" -Color Yellow
     }
     Write-DebugLog -FunctionName "Block-TaskManager" -Action "EXIT" -Message "Complete"
 }
@@ -3620,7 +3630,6 @@ function Unblock-TaskManager {
         if (Test-Path $PolicyPath) {
             Remove-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
         }
-
         # Remove proxy launcher and taskmgr copy from hardened dir via SYSTEM
         $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
         $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
@@ -3636,12 +3645,145 @@ function Unblock-TaskManager {
                 Write-Log -Message "Failed to remove taskmgr copy from hardened dir: $($delResult.Output)" -Type "WARN" -Color Yellow
             }
         }
-
         Write-Log -Message "Task Manager unblocked." -Type "INFO" -Color Gray
     } catch {
         Write-Log -Message "Task Manager unblock failed: $_" -Type "WARN" -Color Yellow
     }
     Write-DebugLog -FunctionName "Unblock-TaskManager" -Action "EXIT" -Message "Complete"
+}
+
+function Install-ProcessHook {
+    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ENTRY"
+    try {
+        $DriverDir = Join-Path $PSScriptRoot "driver"
+        $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
+        $HookDll = Join-Path $DriverDir "gmhook.dll"
+
+        if (-not (Test-Path $ProxyExe)) {
+            Write-Log -Message "gmproxy.exe not found in $DriverDir. Run driver\build.ps1 first." -Type "WARN" -Color Yellow
+        } else {
+            $destProxy = Join-Path $GodModeInstallDir "gmproxy.exe"
+            Copy-Item -Path $ProxyExe -Destination $destProxy -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "gmproxy.exe installed to $destProxy" -Type "INFO" -Color Gray
+
+            # Register IFEO Debugger for user-mode apps (not taskmgr or explorer)
+            $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+            $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
+            foreach ($app in $TargetApps) {
+                $appPath = Join-Path $IfeoPath $app
+                if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
+                Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
+            }
+            Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
+        }
+
+        if (-not (Test-Path $HookDll)) {
+            Write-Log -Message "gmhook.dll not found in $DriverDir. Run driver\build.ps1 first." -Type "WARN" -Color Yellow
+        } else {
+            $destHook = Join-Path $GodModeInstallDir "gmhook.dll"
+            Copy-Item -Path $HookDll -Destination $destHook -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "gmhook.dll installed to $destHook" -Type "INFO" -Color Gray
+
+            # Inject into explorer.exe using a simple PowerShell injector
+            $explorer = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($explorer) {
+                # Use reflective injection via Add-Type compiled inline
+                $InjectorType = @"
+using System;
+using System.Runtime.InteropServices;
+public class GmInjector {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr VirtualAllocEx(IntPtr hProcess, IntPtr lpAddress, uint dwSize, uint flAllocationType, uint flProtect);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, uint nSize, out uint lpNumberOfBytesWritten);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr CreateRemoteThread(IntPtr hProcess, IntPtr lpThreadAttributes, uint dwStackSize, IntPtr lpStartAddress, IntPtr lpParameter, uint dwCreationFlags, out uint lpThreadId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetModuleHandle(string lpModuleName);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool CloseHandle(IntPtr hObject);
+
+    public const uint PROCESS_VM_OPERATION = 0x0008;
+    public const uint PROCESS_VM_WRITE = 0x0020;
+    public const uint PROCESS_CREATE_THREAD = 0x0002;
+    public const uint MEM_COMMIT = 0x1000;
+    public const uint MEM_RESERVE = 0x2000;
+    public const uint PAGE_READWRITE = 0x04;
+
+    public static bool Inject(int pid, string dllPath) {
+        IntPtr hProcess = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_CREATE_THREAD, false, pid);
+        if (hProcess == IntPtr.Zero) return false;
+        try {
+            uint pathLen = (uint)((dllPath.Length + 1) * 2);
+            IntPtr alloc = VirtualAllocEx(hProcess, IntPtr.Zero, pathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (alloc == IntPtr.Zero) return false;
+            byte[] bytes = System.Text.Encoding.Unicode.GetBytes(dllPath + '\0');
+            uint written;
+            if (!WriteProcessMemory(hProcess, alloc, bytes, (uint)bytes.Length, out written)) return false;
+            IntPtr hKernel = GetModuleHandle("kernel32.dll");
+            IntPtr pLoadLibrary = GetProcAddress(hKernel, "LoadLibraryW");
+            if (pLoadLibrary == IntPtr.Zero) return false;
+            uint tid;
+            IntPtr hThread = CreateRemoteThread(hProcess, IntPtr.Zero, 0, pLoadLibrary, alloc, 0, out tid);
+            if (hThread == IntPtr.Zero) return false;
+            CloseHandle(hThread);
+            return true;
+        } finally {
+            CloseHandle(hProcess);
+        }
+    }
+}
+"@
+                try {
+                    Add-Type -TypeDefinition $InjectorType -ErrorAction Stop | Out-Null
+                    $rc = [GmInjector]::Inject($explorer.Id, $destHook)
+                    if ($rc) {
+                        Write-Log -Message "gmhook.dll injected into explorer PID=$($explorer.Id)" -Type "INFO" -Color Green
+                    } else {
+                        Write-Log -Message "gmhook.dll injection into explorer failed ( insufficient privileges or access denied)." -Type "WARN" -Color Yellow
+                    }
+                } catch {
+                    Write-Log -Message "GmInjector compilation/injection failed: $_" -Type "WARN" -Color Yellow
+                }
+            } else {
+                Write-Log -Message "explorer.exe not found; skipping DLL injection." -Type "WARN" -Color Yellow
+            }
+        }
+    } catch {
+        Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
+    }
+    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "EXIT" -Message "Complete"
+}
+
+function Uninstall-ProcessHook {
+    Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "ENTRY"
+    try {
+        # Remove IFEO Debugger entries
+        $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
+        foreach ($app in $TargetApps) {
+            $appPath = Join-Path $IfeoPath $app
+            if (Test-Path $appPath) {
+                Remove-ItemProperty -Path $appPath -Name "Debugger" -ErrorAction SilentlyContinue
+                Remove-Item -Path $appPath -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Remove binaries from install dir
+        $ProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+        $HookDll = Join-Path $GodModeInstallDir "gmhook.dll"
+        if (Test-Path $ProxyExe) { Remove-Item -Path $ProxyExe -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $HookDll) { Remove-Item -Path $HookDll -Force -ErrorAction SilentlyContinue }
+
+        Write-Log -Message "Process hook uninstalled (IFEO keys and binaries removed)." -Type "INFO" -Color Gray
+    } catch {
+        Write-Log -Message "Uninstall-ProcessHook failed: $_" -Type "WARN" -Color Yellow
+    }
+    Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "EXIT" -Message "Complete"
 }
 
 function Elevate-Process {
@@ -3965,7 +4107,7 @@ $script:ProcessCreationWatcher = $null
 
 function Register-ProcessCreationWatcher {
     try {
-        $query = "SELECT * FROM __InstanceCreationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_Process'"
+        $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
         $script:ProcessCreationWatcher = New-Object System.Management.ManagementEventWatcher($query)
         $script:ProcessCreationWatcher.EventArrived += {
             param($sender, $eventArgs)
@@ -4119,7 +4261,7 @@ function Invoke-ExistingProcessElevation {
 }
 
 function Monitor-ElevateProcess {
-    param([string]$Path, [string]$Arguments = "", [switch]$HideWindow)
+    param([string]$Path, [string]$Arguments = "", [int]$ProcessId = 0, [switch]$HideWindow)
     if (-not (Test-Path $Path)) {
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "ERROR" -Message "Target path does not exist: $Path" -RootCause "Executable missing. The process may have been uninstalled or moved."
         return $false
@@ -4131,6 +4273,23 @@ function Monitor-ElevateProcess {
         return $true
     }
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    # --- Phase 0: In-place token replacement (no kill, no relaunch) ---
+    if ($isSystem -and $ProcessId -gt 0) {
+        Enable-ElevationPrivileges
+        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        $systemPid = Find-SystemProcessCandidate
+        if ($systemPid -ne 0) {
+            $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
+            if ($result) {
+                Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement)" -Type "INFO" -Color Gray
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId"
+                return $true
+            } else {
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch"
+            }
+        }
+    }
+    # --- Phase 1: CreateProcessAsSystem (kill-relaunch fallback) ---
     if ($isSystem) {
         Enable-ElevationPrivileges
         [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
@@ -4147,6 +4306,7 @@ function Monitor-ElevateProcess {
             }
         }
     }
+    # --- Phase 2: Service-based elevation (last resort) ---
     $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
     if ($elevated) {
         # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
@@ -4205,7 +4365,7 @@ function Start-Monitoring {
                         $arguments = $evt.Arguments
                         if (-not $lastElevatedPid.ContainsKey($evt.ProcessId)) {
                             $lastElevatedPid[$evt.ProcessId] = Get-Date
-                            Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
+                            Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow
                         }
                     }
                 }
@@ -4477,6 +4637,9 @@ function Enable-GodMode {
     # --- Block Task Manager to prevent manual process termination ---
     Block-TaskManager
 
+    # --- Install C process hook (IFEO proxy + explorer DLL) for in-place elevation ---
+    Install-ProcessHook
+
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Success"
 }
@@ -4488,6 +4651,9 @@ function Disable-GodMode {
     Unregister-ProcessCreationWatcher
     Unregister-SystemWatchdog
     Unblock-TaskManager
+
+    # --- Uninstall C process hook ---
+    Uninstall-ProcessHook
 
     # --- Remove backup task prefixes ---
     $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_", $GodModeTaskPrefix)
@@ -4614,6 +4780,28 @@ function Show-GodModeStatus {
         Write-Host "  Task Manager            : BLOCKED" -ForegroundColor Red
     } else {
         Write-Host "  Task Manager            : UNBLOCKED" -ForegroundColor Green
+    }
+
+    # Process hook (IFEO proxy + explorer DLL) status
+    $HookIfeo = $false
+    $HookDll = $false
+    $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+    $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
+    foreach ($app in $TargetApps) {
+        $appPath = Join-Path $IfeoPath $app
+        if (Test-Path $appPath) {
+            $Debugger = (Get-ItemProperty -Path $appPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+            if ($Debugger -and $Debugger -like "*gmproxy.exe*") { $HookIfeo = $true; break }
+        }
+    }
+    $HookDllPath = Join-Path $GodModeInstallDir "gmhook.dll"
+    if (Test-Path $HookDllPath) { $HookDll = $true }
+    if ($HookIfeo -and $HookDll) {
+        Write-Host "  Process Hook            : INSTALLED (IFEO + DLL)" -ForegroundColor Cyan
+    } elseif ($HookIfeo -or $HookDll) {
+        Write-Host "  Process Hook            : PARTIAL (IFEO=$HookIfeo, DLL=$HookDll)" -ForegroundColor Yellow
+    } else {
+        Write-Host "  Process Hook            : NOT INSTALLED" -ForegroundColor DarkGray
     }
 
     # Defender processes

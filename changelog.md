@@ -216,9 +216,28 @@ All notable changes to this project will be documented in this file.
 ||||- **Conditional polling in `Start-Monitoring`.** When the event watcher is active, the monitor loop skips the `Get-CimInstance` new-process query entirely and trusts the queue. This removes the last remaining per-loop CIM overhead when the watcher is healthy.
 ||||- **Guard elevation blocks in `Start-Monitoring` when running as Administrator.** Previously the periodic existing-process elevation block and the new-process CIM polling block ran unconditionally, calling `Enable-ElevationPrivileges` which failed to enable `SeAssignPrimaryTokenPrivilege` in a filtered Administrator token and auto-generated a full `ElevationDiagnostics` dump every 15 seconds, flooding the log. Added a `$isSystem` guard at the top of the loop; if the monitor is not SYSTEM, it logs a one-line warning and skips all elevation blocks while keeping the resurrection-killer and stealth-mode active. `Invoke-ExistingProcessElevation` already exits early when not SYSTEM, so the startup call is unaffected.
 |
-||||---
+|||||-
 
-### Fixed
+|||||### Added (2026-07-14 01:13:00 UTC)
+|||||- **In-place token replacement via `NtSetInformationProcess`.** Added `ReplaceProcessTokenForPid` to the `TokenOps` C# class. Opens the target process with `PROCESS_SET_INFORMATION`, steals a SYSTEM token from a source process, and calls `NtSetInformationProcess` with `ProcessAccessToken (0x09)` to replace the target's token in-place without killing it. This is the Phase 0 elevation path inside `Monitor-ElevateProcess`.
+|||||  - `Monitor-ElevateProcess` now accepts an optional `ProcessId` parameter. When a new process is detected via the event watcher (or CIM polling), Phase 0 attempts `ReplaceProcessTokenForPid` on the existing PID first. If the replacement succeeds, the process is already running as SYSTEM with no visible flicker or restart.
+|||||  - If Phase 0 fails (e.g., PPL-protected target, access denied), the function falls back to Phase 1 (kill-relaunch via `CreateProcessAsSystem`) and Phase 2 (scheduled-task fallback).
+|||||  - Task Manager is now **unblocked** (IFEO Debugger redirect removed) so it can open normally; the watcher then elevates it to SYSTEM in-place via Phase 0 instead of blocking it entirely.
+|||||- **C IFEO proxy (`gmproxy.exe`).** New Win32 executable `driver/gmproxy.c` intercepts process launches via the Image File Execution Options `Debugger` key. It steals a SYSTEM token from a running process via `Toolhelp32Snapshot`, duplicates it to a primary token, and calls `CreateProcessWithTokenW` or `CreateProcessAsUserW` to launch the intercepted application as SYSTEM on the `WinSta0\Default` desktop. The original command line is passed through as arguments so the user sees the intended application. This avoids the kill-relaunch cycle entirely for hooked apps.
+|||||- **C shell hook DLL (`gmhook.dll`).** New DLL `driver/gmhook.c` injects into `explorer.exe` and hooks `CreateProcessW` via a 5-byte inline JMP. Every time a hooked process is created, the DLL:
+|||||  1. Creates the process `CREATE_SUSPENDED`.
+|||||  2. Replaces the new process token via `NtSetInformationProcess(ProcessAccessToken, 0x09)` with a stolen SYSTEM token.
+|||||  3. Resumes the process.
+|||||  Critical OS processes (e.g., `svchost.exe`, `lsass.exe`, `csrss.exe`, `smss.exe`, `services.exe`, `wininit.exe`, `conhost.exe`, `SearchIndexer.exe`, `fontdrvhost.exe`, `dwm.exe`, `winlogon.exe`) are filtered out so only user-facing applications are elevated.
+|||||- **PowerShell build script (`driver/build.ps1`).** Auto-detects MSVC (`cl.exe`) or MinGW (`x86_64-w64-mingw32-gcc` / `gcc`) and compiles both `gmproxy.exe` and `gmhook.dll`. Exits with a clear error if no compiler is found.
+|||||- **PowerShell installer functions (`Install-ProcessHook`, `Uninstall-ProcessHook`).**
+|||||  - `Install-ProcessHook` copies `gmproxy.exe` and `gmhook.dll` into the hardened install directory (`C:\ProgramData\GodMode`), registers IFEO `Debugger` keys for a curated set of user apps (`chrome.exe`, `firefox.exe`, `msedge.exe`, `notepad.exe`, `cmd.exe`, `powershell.exe`), and injects `gmhook.dll` into `explorer.exe` via a lightweight `CreateRemoteThread` + `LoadLibraryW` injector written in inline C# (`GmInjector`). Logs success/failure for each step.
+|||||  - `Uninstall-ProcessHook` removes all IFEO `Debugger` keys for the curated app list, deletes the copied binaries from the install directory, and logs completion.
+|||||- **Wired into God Mode lifecycle.** `Enable-GodMode` calls `Install-ProcessHook` after `Block-TaskManager`. `Disable-GodMode` calls `Uninstall-ProcessHook` after `Unblock-TaskManager`. `Show-GodModeStatus` displays `Process Hook` status as `INSTALLED (IFEO + DLL)`, `PARTIAL`, or `NOT INSTALLED`.
+|||||- **Event watcher speedup.** `Register-ProcessCreationWatcher` polling interval reduced from `WITHIN 5` to `WITHIN 1` for faster detection of new processes.
+|||||---
+|
+|### Fixed
 - See "Fixed" section under Unreleased for detailed bug fixes applied during this build.
 
 ---
