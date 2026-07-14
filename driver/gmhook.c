@@ -228,11 +228,10 @@ static BOOL WINAPI HookCreateProcessW(
         } pat = { gSystemToken, NULL };
         NTSTATUS status = pNtSetInfo(lpProcessInformation->hProcess, ProcessAccessToken, &pat, sizeof(pat));
         if (status != 0) {
-            /* Token replacement failed — terminate the suspended process so the user doesn't run un-elevated */
-            TerminateProcess(lpProcessInformation->hProcess, 1);
-            CloseHandle(lpProcessInformation->hProcess);
-            CloseHandle(lpProcessInformation->hThread);
-            return FALSE;
+            /* Token replacement failed — let the process run with its original token
+               rather than killing it, which prevents apps from flashing and closing. */
+            ResumeThread(lpProcessInformation->hThread);
+            return TRUE;
         }
     }
 

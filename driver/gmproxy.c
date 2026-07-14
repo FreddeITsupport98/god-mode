@@ -210,6 +210,40 @@ int wmain(int argc, wchar_t* argv[]) {
 
     PROCESS_INFORMATION pi = {0};
 
+    // --- IFEO infinite-loop bypass ---
+    // When we launch the original executable via CreateProcess*, Windows kernel
+    // checks IFEO again and launches gmproxy.exe recursively. To prevent this,
+    // create a hardlink with a unique name in the same directory. IFEO keys are
+    // matched by exact filename, so chrome.exe.gmproxy won't trigger IFEO.
+    // If hardlink fails (different volume), fall back to CopyFile in TEMP.
+    const wchar_t* baseName = wcsrchr(argv[1], L'\\');
+    if (baseName) baseName++; else baseName = argv[1];
+
+    wchar_t hardlinkPath[MAX_PATH] = {0};
+    wchar_t dirPath[MAX_PATH] = {0};
+    wcscpy(dirPath, argv[1]);
+    wchar_t* lastSlash = wcsrchr(dirPath, L'\\');
+    if (lastSlash) lastSlash[1] = 0; /* keep trailing backslash */
+
+    swprintf(hardlinkPath, MAX_PATH, L"%sgmproxy_%lu_%s", dirPath, GetCurrentProcessId(), baseName);
+
+    BOOL usedHardlink = CreateHardLinkW(hardlinkPath, argv[1], NULL);
+    if (!usedHardlink) {
+        wchar_t tempDir[MAX_PATH] = {0};
+        GetTempPathW(MAX_PATH, tempDir);
+        swprintf(hardlinkPath, MAX_PATH, L"%s\gmproxy_%lu_%s", tempDir, GetCurrentProcessId(), baseName);
+        usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
+    }
+
+    if (!usedHardlink) {
+        fwprintf(stderr, L"[GM-PROXY] ERROR: Failed to create hardlink/copy for IFEO bypass. GLE=%lu\n", GetLastError());
+        HeapFree(GetProcessHeap(), 0, cmdLine);
+        CloseHandle(hPrimary);
+        CloseHandle(hSrcToken);
+        CloseHandle(hSrc);
+        return 1;
+    }
+
     // Try CreateProcessWithTokenW (requires Vista+)
     HMODULE hAdv = GetModuleHandleW(L"advapi32.dll");
     CreateProcessWithTokenW_t cpwt = NULL;
@@ -219,13 +253,16 @@ int wmain(int argc, wchar_t* argv[]) {
 
     BOOL ok = FALSE;
     if (cpwt) {
-        ok = cpwt(hPrimary, LOGON_WITH_PROFILE, argv[1], cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
     }
 
     // Fallback: CreateProcessAsUser
     if (!ok) {
-        ok = CreateProcessAsUserW(hPrimary, argv[1], cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
     }
+
+    // Best-effort cleanup of the hardlink/copy (may fail if process is still starting)
+    DeleteFileW(hardlinkPath);
 
     if (!ok) {
         fwprintf(stderr, L"[GM-PROXY] ERROR: CreateProcessAsUser/WithToken failed. GLE=%lu\n", GetLastError());
