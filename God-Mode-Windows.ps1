@@ -4185,6 +4185,10 @@ function Start-Monitoring {
     $lastExistingElevate = [datetime]::MinValue
     $lastPidCleanup = [datetime]::MinValue
     $loopCount = 0
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if (-not $isSystem) {
+        Write-Log -Message "Monitor is running as Administrator (not SYSTEM). Elevation blocks will be skipped; only resurrection-killer and stealth mode are active." -Type "WARN" -Color Yellow
+    }
 
     # --- One-time elevation of all existing user-session processes at startup ---
     Invoke-ExistingProcessElevation
@@ -4244,7 +4248,7 @@ function Start-Monitoring {
             }
 
             # --- Periodic Existing Process Elevation: Re-elevate every 15 seconds ---
-            if ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(15)) {
+            if ($isSystem -and ((Get-Date) - $lastExistingElevate -gt [TimeSpan]::FromSeconds(15))) {
                 $lastExistingElevate = Get-Date
                 $ExistingProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe" }
 
@@ -4300,7 +4304,7 @@ function Start-Monitoring {
         # --- New Process Elevation ---
         # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
         $newProcesses = @()
-        if (-not $script:ProcessCreationWatcherActive) {
+        if ($isSystem -and -not $script:ProcessCreationWatcherActive) {
             $Now = Get-Date
             $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                 try {

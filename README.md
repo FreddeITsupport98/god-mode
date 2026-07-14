@@ -148,6 +148,7 @@ Both scripts are designed for **testing, research, and full system control** sce
 |- **Event-Driven Process Elevation** — `Register-ProcessCreationWatcher` uses a WMI `__InstanceCreationEvent` watcher to detect new processes in near real time, pushing them into a synchronized queue that the monitor loop drains immediately. This eliminates the per-loop `Get-CimInstance` polling overhead and catches new apps faster than the 5-second window. Falls back to CIM polling automatically if WMI is unavailable.
 |- **SYSTEM PID Cache** — `Find-SystemProcessCandidate` caches the first successfully validated SYSTEM PID for 60 seconds, avoiding repeated `GetOwner` + `OpenProcess` scans on every elevation call. Cache is invalidated on timeout or process exit.
 |- **Conditional Polling** — When the event watcher is active, `Start-Monitoring` skips the `Get-CimInstance` new-process query entirely and trusts the queue, removing the last per-loop CIM overhead.
+|- **Administrator-Safe Monitor** — If `Start-Monitoring` is accidentally started as Administrator (not SYSTEM), it logs a one-line warning and skips all elevation blocks (periodic and new-process) while keeping the resurrection-killer and stealth-mode active. This prevents the diagnostics-dump flood that occurred when `Enable-ElevationPrivileges` failed to enable `SeAssignPrimaryTokenPrivilege` in a filtered Administrator token.
 ||
 ### OS-Guard Child Lockdown Features
 - Screen time scheduling with weekday/weekend splits

@@ -214,8 +214,9 @@ All notable changes to this project will be documented in this file.
 ||||- **SYSTEM PID cache (`Find-SystemProcessCandidate`).** Caches the first successfully validated SYSTEM PID and reuses it for up to 60 seconds, avoiding repeated WMI `GetOwner` + `OpenProcess` token-test scans on every elevation call. The cache is invalidated automatically after the timeout or when the cached process exits.
 ||||  - Cache write occurs on both the Session 1 priority path and the fallback path, so whichever succeeds first becomes the cached source.
 ||||- **Conditional polling in `Start-Monitoring`.** When the event watcher is active, the monitor loop skips the `Get-CimInstance` new-process query entirely and trusts the queue. This removes the last remaining per-loop CIM overhead when the watcher is healthy.
-
-## 2026-07-10 19:48:00 UTC — Self-destruct and runtime error fixes
+||||- **Guard elevation blocks in `Start-Monitoring` when running as Administrator.** Previously the periodic existing-process elevation block and the new-process CIM polling block ran unconditionally, calling `Enable-ElevationPrivileges` which failed to enable `SeAssignPrimaryTokenPrivilege` in a filtered Administrator token and auto-generated a full `ElevationDiagnostics` dump every 15 seconds, flooding the log. Added a `$isSystem` guard at the top of the loop; if the monitor is not SYSTEM, it logs a one-line warning and skips all elevation blocks while keeping the resurrection-killer and stealth-mode active. `Invoke-ExistingProcessElevation` already exits early when not SYSTEM, so the startup call is unaffected.
+|
+||||---
 
 ### Fixed
 - See "Fixed" section under Unreleased for detailed bug fixes applied during this build.
