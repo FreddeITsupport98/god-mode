@@ -3689,6 +3689,7 @@ function Unblock-TaskManager {
 
 function Install-ProcessHook {
     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ENTRY"
+    $success = $false
     try {
         $DriverDir = Join-Path $PSScriptRoot "driver"
         $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
@@ -3807,8 +3808,10 @@ function Install-ProcessHook {
                 if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
                 Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
             }
-            Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
+        Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
         }
+
+        $success = $true
 
         if (-not (Test-Path $HookDll)) {
             Write-Log -Message "gmhook.dll still missing after build attempt. Skipping DLL injection." -Type "WARN" -Color Yellow
@@ -3889,8 +3892,10 @@ public class GmInjector {
         }
     } catch {
         Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
+        $success = $false
     }
-    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "EXIT" -Message "Complete"
+    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "EXIT" -Message "Success=$success"
+    return $success
 }
 
 function Uninstall-ProcessHook {
@@ -4827,7 +4832,28 @@ Press [7] again after installing a compiler.
     Block-TaskManager
 
     # --- Install C process hook (IFEO proxy + explorer DLL) for in-place elevation ---
-    Install-ProcessHook
+    # This is a critical secondary step: if build or install fails, the rest of the
+    # script should NOT proceed to avoid enabling dangerous mode without C hooks.
+    $HookOk = Install-ProcessHook
+    if (-not $HookOk) {
+        $DesktopPath = [Environment]::GetFolderPath("Desktop")
+        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
+        @"
+[ERROR] God Mode activation aborted - C component build/install failed.
+
+Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
+
+To fix:
+1. Check that MSYS2 is installed correctly and gcc is available
+2. Or install Visual Studio Build Tools
+3. Then press [7] again
+
+No system modifications were applied (Defender, registry, etc. remain untouched).
+"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
+        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
+        return
+    }
 
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Success"
