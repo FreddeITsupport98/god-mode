@@ -14,15 +14,27 @@
 #include <psapi.h>
 #include <tchar.h>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
+#endif
 
-#define TOKEN_ALL_ACCESS           0xF01FF
-#define TOKEN_DUPLICATE            0x0002
-#define TOKEN_QUERY                0x0008
-#define SecurityImpersonation      2
-#define TokenPrimary               1
-#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
-#define LOGON_WITH_PROFILE         1
+/* TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, SecurityImpersonation,
+   TokenPrimary, PROCESS_QUERY_LIMITED_INFORMATION, and LOGON_WITH_PROFILE
+   are all defined in standard Windows headers (winnt.h / winbase.h). */
+
+static BOOL IsSystemSid(PSID pSid) {
+    if (!IsValidSid(pSid)) return FALSE;
+    PUCHAR pCount = GetSidSubAuthorityCount(pSid);
+    if (!pCount || *pCount != 1) return FALSE;
+    PSID_IDENTIFIER_AUTHORITY pAuth = GetSidIdentifierAuthority(pSid);
+    if (!pAuth) return FALSE;
+    if (pAuth->Value[0] != 0 || pAuth->Value[1] != 0 || pAuth->Value[2] != 0 ||
+        pAuth->Value[3] != 0 || pAuth->Value[4] != 0 || pAuth->Value[5] != 5)
+        return FALSE;
+    PDWORD pSub = GetSidSubAuthority(pSid, 0);
+    if (!pSub) return FALSE;
+    return *pSub == 18; /* SECURITY_LOCAL_SYSTEM_RID */
+}
 
 typedef BOOL (WINAPI *CreateProcessWithTokenW_t)(
     HANDLE hToken,
@@ -55,7 +67,6 @@ static DWORD FindSystemProcessForToken(void) {
 
     PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
-    DWORD result = 0;
 
     const wchar_t* priorityNames[] = { L"winlogon.exe", L"dwm.exe", L"fontdrvhost.exe", NULL };
 
@@ -77,16 +88,11 @@ static DWORD FindSystemProcessForToken(void) {
                                 BYTE userBuf[256];
                                 if (GetTokenInformation(hToken, TokenUser, userBuf, sizeof(userBuf), &len)) {
                                     TOKEN_USER* tu = (TOKEN_USER*)userBuf;
-                                    WCHAR sidStr[256] = {0};
-                                    if (ConvertSidToStringSidW(tu->User.Sid, &sidStr)) {
-                                        if (wcscmp(sidStr, L"S-1-5-18") == 0) {
-                                            LocalFree(sidStr);
-                                            CloseHandle(hToken);
-                                            CloseHandle(hProcess);
-                                            CloseHandle(hSnap);
-                                            return pe.th32ProcessID;
-                                        }
-                                        LocalFree(sidStr);
+                                    if (IsSystemSid(tu->User.Sid)) {
+                                        CloseHandle(hToken);
+                                        CloseHandle(hProcess);
+                                        CloseHandle(hSnap);
+                                        return pe.th32ProcessID;
                                     }
                                 }
                             }
@@ -114,16 +120,11 @@ static DWORD FindSystemProcessForToken(void) {
                     DWORD len;
                     if (GetTokenInformation(hToken, TokenUser, userBuf, sizeof(userBuf), &len)) {
                         TOKEN_USER* tu = (TOKEN_USER*)userBuf;
-                        WCHAR sidStr[256] = {0};
-                        if (ConvertSidToStringSidW(tu->User.Sid, &sidStr)) {
-                            if (wcscmp(sidStr, L"S-1-5-18") == 0) {
-                                LocalFree(sidStr);
-                                CloseHandle(hToken);
-                                CloseHandle(hProcess);
-                                CloseHandle(hSnap);
-                                return pe.th32ProcessID;
-                            }
-                            LocalFree(sidStr);
+                        if (IsSystemSid(tu->User.Sid)) {
+                            CloseHandle(hToken);
+                            CloseHandle(hProcess);
+                            CloseHandle(hSnap);
+                            return pe.th32ProcessID;
                         }
                     }
                     CloseHandle(hToken);

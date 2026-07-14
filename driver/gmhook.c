@@ -13,20 +13,32 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 
+#ifdef _MSC_VER
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "kernel32.lib")
+#endif
 
-#define TOKEN_ALL_ACCESS           0xF01FF
-#define TOKEN_DUPLICATE            0x0002
-#define TOKEN_QUERY                0x0008
-#define SecurityImpersonation      2
-#define TokenPrimary               1
-#define PROCESS_QUERY_LIMITED_INFORMATION 0x1000
-#define PROCESS_SET_INFORMATION    0x0200
+/* TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, SecurityImpersonation,
+   TokenPrimary, PROCESS_QUERY_LIMITED_INFORMATION, and PROCESS_SET_INFORMATION
+   are all defined in standard Windows headers (winnt.h / winbase.h). */
 
 /* NtSetInformationProcess and ProcessAccessToken */
 #define ProcessAccessToken 9
+
+static BOOL IsSystemSid(PSID pSid) {
+    if (!IsValidSid(pSid)) return FALSE;
+    PUCHAR pCount = GetSidSubAuthorityCount(pSid);
+    if (!pCount || *pCount != 1) return FALSE;
+    PSID_IDENTIFIER_AUTHORITY pAuth = GetSidIdentifierAuthority(pSid);
+    if (!pAuth) return FALSE;
+    if (pAuth->Value[0] != 0 || pAuth->Value[1] != 0 || pAuth->Value[2] != 0 ||
+        pAuth->Value[3] != 0 || pAuth->Value[4] != 0 || pAuth->Value[5] != 5)
+        return FALSE;
+    PDWORD pSub = GetSidSubAuthority(pSid, 0);
+    if (!pSub) return FALSE;
+    return *pSub == 18; /* SECURITY_LOCAL_SYSTEM_RID */
+}
 
 typedef NTSTATUS (NTAPI *NtSetInformationProcess_t)(
     HANDLE ProcessHandle,
@@ -85,16 +97,11 @@ static DWORD FindSystemPid(void) {
                             DWORD len;
                             if (GetTokenInformation(hTok, TokenUser, buf, sizeof(buf), &len)) {
                                 TOKEN_USER* tu = (TOKEN_USER*)buf;
-                                WCHAR* sidStr = NULL;
-                                if (ConvertSidToStringSidW(tu->User.Sid, &sidStr)) {
-                                    if (wcscmp(sidStr, L"S-1-5-18") == 0) {
-                                        LocalFree(sidStr);
-                                        CloseHandle(hTok);
-                                        CloseHandle(hProc);
-                                        CloseHandle(hSnap);
-                                        return pe.th32ProcessID;
-                                    }
-                                    LocalFree(sidStr);
+                                if (IsSystemSid(tu->User.Sid)) {
+                                    CloseHandle(hTok);
+                                    CloseHandle(hProc);
+                                    CloseHandle(hSnap);
+                                    return pe.th32ProcessID;
                                 }
                             }
                             CloseHandle(hTok);
