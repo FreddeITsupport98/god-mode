@@ -3178,6 +3178,41 @@ function Export-GodModeLogs {
         if (Test-Path $DebugLogFile) { $LogContent += Get-Content -Raw -Path $DebugLogFile -ErrorAction SilentlyContinue } else { $LogContent += "[No debug log found]" }
         if (Test-Path $GodModeLogFile) { $LogContent += "`r`n===== GOD MODE LOG ====="; $LogContent += Get-Content -Raw -Path $GodModeLogFile -ErrorAction SilentlyContinue }
 
+        # Driver / Hook status
+        $LogContent += "`r`n===== DRIVER / HOOK STATUS ====="
+        $ScriptRoot = Split-Path $PSCommandPath -Parent
+        $DriverDir = Join-Path $ScriptRoot "driver"
+        $ProxySrc = Join-Path $DriverDir "gmproxy.exe"
+        $HookSrc = Join-Path $DriverDir "gmhook.dll"
+        $ProxyDest = Join-Path $GodModeInstallDir "gmproxy.exe"
+        $HookDest = Join-Path $GodModeInstallDir "gmhook.dll"
+        $BuildLog = Join-Path $env:TEMP "GodMode_DriverBuild.log"
+
+        $LogContent += "`r`nSource gmproxy.exe: $(if (Test-Path $ProxySrc) { 'EXISTS' } else { 'MISSING' }) ($ProxySrc)"
+        $LogContent += "`r`nSource gmhook.dll:  $(if (Test-Path $HookSrc)  { 'EXISTS' } else { 'MISSING' }) ($HookSrc)"
+        $LogContent += "`r`nInstalled gmproxy.exe: $(if (Test-Path $ProxyDest) { 'EXISTS' } else { 'MISSING' }) ($ProxyDest)"
+        $LogContent += "`r`nInstalled gmhook.dll:  $(if (Test-Path $HookDest)  { 'EXISTS' } else { 'MISSING' }) ($HookDest)"
+
+        $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $TargetApps = @("chrome.exe","firefox.exe","msedge.exe","notepad.exe","cmd.exe","powershell.exe")
+        foreach ($app in $TargetApps) {
+            $appPath = Join-Path $IfeoPath $app
+            $Debugger = $null
+            try {
+                if (Test-Path $appPath) {
+                    $Debugger = (Get-ItemProperty -Path $appPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+                }
+            } catch { }
+            $LogContent += "`r`n  IFEO [$app]: $(if ($Debugger -and $Debugger -like '*gmproxy*') { 'HOOKED (gmproxy)' } elseif ($Debugger) { 'OTHER DEBUGGER: ' + $Debugger } else { 'NOT HOOKED' })"
+        }
+
+        $LogContent += "`r`nexplorer.exe injection status: $(if (Get-Process -Name 'explorer' -ErrorAction SilentlyContinue) { 'explorer RUNNING' } else { 'explorer NOT RUNNING' })"
+
+        if (Test-Path $BuildLog) {
+            $LogContent += "`r`n`r`n----- LAST DRIVER BUILD LOG ($BuildLog) -----`r`n"
+            $LogContent += Get-Content -Raw -Path $BuildLog -ErrorAction SilentlyContinue
+        }
+
         # Error summary from debug log
         $ErrorCount = 0
         if (Test-Path $DebugLogFile) {
@@ -3658,9 +3693,43 @@ function Install-ProcessHook {
         $DriverDir = Join-Path $PSScriptRoot "driver"
         $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
         $HookDll = Join-Path $DriverDir "gmhook.dll"
+        $BuildScript = Join-Path $DriverDir "build.ps1"
+        $BuildLog = Join-Path $env:TEMP "GodMode_DriverBuild.log"
+
+        # --- Auto-build if binaries are missing ---
+        $NeedBuild = (-not (Test-Path $ProxyExe)) -or (-not (Test-Path $HookDll))
+        if ($NeedBuild) {
+            if (Test-Path $BuildScript) {
+                Write-Log -Message "C components missing (gmproxy.exe or gmhook.dll). Running auto-build: $BuildScript" -Type "INFO" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build starting: $BuildScript"
+                try {
+                    $BuildOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
+                    $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
+                    $BuildExit = $LASTEXITCODE
+                    if ($BuildExit -ne 0) {
+                        Write-Log -Message "Auto-build failed (exit $BuildExit). Full log: $BuildLog" -Type "ERROR" -Color Red
+                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build failed exit=$BuildExit"
+                        if (Test-Path $BuildLog) {
+                            $BuildErr = Get-Content -Raw $BuildLog -ErrorAction SilentlyContinue
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build output: $BuildErr"
+                        }
+                    } else {
+                        Write-Log -Message "Auto-build succeeded." -Type "INFO" -Color Green
+                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build succeeded"
+                    }
+                } catch {
+                    Write-Log -Message "Auto-build exception: $_" -Type "ERROR" -Color Red
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build exception: $_"
+                }
+            } else {
+                Write-Log -Message "Build script not found: $BuildScript. Cannot auto-build C components." -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Build script missing: $BuildScript"
+            }
+        }
 
         if (-not (Test-Path $ProxyExe)) {
-            Write-Log -Message "gmproxy.exe not found in $DriverDir. Run driver\build.ps1 first." -Type "WARN" -Color Yellow
+            Write-Log -Message "gmproxy.exe still missing after build attempt. Skipping IFEO proxy install." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe still missing after build"
         } else {
             $destProxy = Join-Path $GodModeInstallDir "gmproxy.exe"
             Copy-Item -Path $ProxyExe -Destination $destProxy -Force -ErrorAction SilentlyContinue
@@ -3678,7 +3747,8 @@ function Install-ProcessHook {
         }
 
         if (-not (Test-Path $HookDll)) {
-            Write-Log -Message "gmhook.dll not found in $DriverDir. Run driver\build.ps1 first." -Type "WARN" -Color Yellow
+            Write-Log -Message "gmhook.dll still missing after build attempt. Skipping DLL injection." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll still missing after build"
         } else {
             $destHook = Join-Path $GodModeInstallDir "gmhook.dll"
             Copy-Item -Path $HookDll -Destination $destHook -Force -ErrorAction SilentlyContinue

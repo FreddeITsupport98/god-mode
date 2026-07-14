@@ -146,7 +146,7 @@ Both scripts are designed for **testing, research, and full system control** sce
 ||- **In-Place Token Replacement** — `ReplaceProcessTokenForPid` in the `TokenOps` C# class uses `NtSetInformationProcess(ProcessAccessToken, 0x09)` to replace a running process's token with a stolen SYSTEM token without killing it. This is Phase 0 inside `Monitor-ElevateProcess`: when a new process is detected via the event watcher, the monitor tries to elevate the existing PID in-place first, eliminating flicker and restart delay.
 ||- **C IFEO Proxy Elevation** — `driver/gmproxy.c` compiles to a tiny Win32 executable that intercepts launches via IFEO `Debugger` registry keys. It steals a SYSTEM token and calls `CreateProcessWithTokenW`/`CreateProcessAsUserW` to launch the intercepted app as SYSTEM on `WinSta0\Default` without kill-relaunch. Hooked apps: `chrome.exe`, `firefox.exe`, `msedge.exe`, `notepad.exe`, `cmd.exe`, `powershell.exe`.
 ||- **C Shell Hook DLL** — `driver/gmhook.c` is a DLL that injects into `explorer.exe` and hooks `CreateProcessW` with a 5-byte inline JMP. New processes are created `CREATE_SUSPENDED`, their token is replaced in-place via `NtSetInformationProcess`, then resumed as SYSTEM. Critical OS processes are filtered out so only user-facing apps are elevated.
-||- **PowerShell Hook Installer** — `Install-ProcessHook` compiles the C components with `driver/build.ps1` (auto-detects MSVC or MinGW), copies binaries into the hardened install directory, registers IFEO `Debugger` keys, and injects `gmhook.dll` into `explorer.exe` via an inline C# `CreateRemoteThread` + `LoadLibraryW` injector. `Uninstall-ProcessHook` reverses all changes. Wired into `Enable-GodMode` / `Disable-GodMode` and `Show-GodModeStatus`.
+||- **PowerShell Hook Installer** — `Install-ProcessHook` compiles the C components with `driver/build.ps1` (auto-detects MSVC or MinGW), copies binaries into the hardened install directory, registers IFEO `Debugger` keys, and injects `gmhook.dll` into `explorer.exe` via an inline C# `CreateRemoteThread` + `LoadLibraryW` injector. `Uninstall-ProcessHook` reverses all changes. Wired into `Enable-GodMode` / `Disable-GodMode` and `Show-GodModeStatus`. **Auto-build**: If the binaries are missing when option 7 is pressed, `Install-ProcessHook` automatically runs `driver/build.ps1`, captures all output to `GodMode_DriverBuild.log`, and logs errors to both the main and debug logs before retrying.
 |- **Log Dump** — `Export-GodModeLogs` collects all accumulated logs and dumps them to the Desktop with a timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`); accessible via CLI `-DumpLogs` or interactive menu option [11]
 |- **Rotating Raw Debug Dump** — `Export-RawDebugDump` captures full system state (environment variables, loaded modules, running processes, `$Error` stack, and all log files) into timestamped dumps under `%TEMP%\GodMode_RawDumps`. Automatically rotates to keep only the 5 most recent dumps. Triggered automatically on installation start/end and on any uncaught terminating error via a global `trap` handler.
 |- **Event-Driven Process Elevation** — `Register-ProcessCreationWatcher` uses a WMI `__InstanceCreationEvent` watcher to detect new processes in near real time, pushing them into a synchronized queue that the monitor loop drains immediately. This eliminates the per-loop `Get-CimInstance` polling overhead and catches new apps faster than the 5-second window. Falls back to CIM polling automatically if WMI is unavailable.
@@ -282,7 +282,8 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 - Duplicate script-scoped variable declarations
 - Elevation loop detection (missing `UseShellExecute = $true`)
 - UTF-8 BOM encoding issues
-- Strict-mode null guard violations
+|- Strict-mode null guard violations
+|- C/C++ syntax validation (`*.c`, `*.h`) — brace/bracket/parenthesis balance, unterminated strings/char literals, block comments, and preprocessor directive (`#if`/`#endif`) matching
 
 ---
 
@@ -327,6 +328,9 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 | `syntax_check.ps1` | Enhanced multi-layer syntax checker, regression validator, and auto-chmod utility |
 | `tests/Test-Suite.ps1` | Regression test suite for syntax, installer logic, and menu integrity |
 | `changelog.md` | External project changelog |
+| `driver/build.ps1` | Auto-detecting C component build script (MSVC / MinGW) |
+| `driver/gmproxy.c` | IFEO proxy source — launches apps as SYSTEM via token theft |
+| `driver/gmhook.c` | Shell hook DLL source — inline `CreateProcessW` hook with token replacement |
 | `God mode.ps1.old` | Legacy archived payload (retained for reference) |
 
 ---
@@ -360,7 +364,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 15. **In-Place Token Replacement (`NtSetInformationProcess`)**: When the event watcher detects a new process, `Monitor-ElevateProcess` first attempts `ReplaceProcessTokenForPid` (Phase 0) to swap the running process's token with a stolen SYSTEM token via `NtSetInformationProcess(ProcessAccessToken, 0x09)`. If the target is not protected (e.g., not PPL), the process becomes SYSTEM instantly without being killed or restarted, eliminating visible flicker. If Phase 0 fails, the function falls back to Phase 1 (`CreateProcessAsSystem` kill-relaunch) and Phase 2 (scheduled-task fallback).
 16. **C IFEO Proxy (`gmproxy.exe`)**: A compiled Win32 executable registered under IFEO `Debugger` keys for common user apps (`chrome.exe`, `firefox.exe`, `msedge.exe`, `notepad.exe`, `cmd.exe`, `powershell.exe`). When the user launches one of these apps, `gmproxy.exe` intercepts the call, steals a SYSTEM token, and relaunches the original command line as SYSTEM on `WinSta0\Default`. This avoids the PowerShell kill-relaunch cycle entirely and works even before the monitor loop starts.
 17. **C Shell Hook DLL (`gmhook.dll`)**: Injected into `explorer.exe` via `CreateRemoteThread` + `LoadLibraryW`. The DLL hooks `CreateProcessW` with a 5-byte inline JMP. Every user app launch is created `CREATE_SUSPENDED`, its token is replaced in-place via `NtSetInformationProcess`, and the process is resumed as SYSTEM. Critical OS processes are hardcoded in a filter list so the hook never touches system services.
-18. **PowerShell Hook Installer (`Install-ProcessHook` / `Uninstall-ProcessHook`)**: `Install-ProcessHook` compiles both C components with `driver/build.ps1` (auto-detects MSVC or MinGW), copies them to the hardened install directory, registers IFEO keys, and injects the DLL into `explorer.exe`. `Uninstall-ProcessHook` removes the keys, deletes the binaries, and logs completion. Both are called automatically by `Enable-GodMode` and `Disable-GodMode`.
+18. **PowerShell Hook Installer (`Install-ProcessHook` / `Uninstall-ProcessHook`)**: `Install-ProcessHook` checks for `gmproxy.exe` and `gmhook.dll`; if either is missing, it auto-runs `driver/build.ps1` (auto-detects MSVC or MinGW), captures full build output to `%TEMP%\GodMode_DriverBuild.log`, and retries before proceeding. Once binaries exist, it copies them to the hardened install directory, registers IFEO `Debugger` keys, and injects the DLL into `explorer.exe`. `Uninstall-ProcessHook` removes the keys, deletes the binaries, and logs completion. Both are called automatically by `Enable-GodMode` and `Disable-GodMode`.
 
 ---
 
@@ -380,8 +384,8 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 | `-InstallGodMode` | God Mode | Install God Mode persistence, `godmode` CLI, and NTFS hardening |
 | `-UninstallGodMode` | God Mode | Remove God Mode tasks, registry keys, WMI, and install directory |
 | `-Verbose` | General | Enable verbose logging output |
-|| `-DumpLogs` | General | Collect and export all logs to Desktop with timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`) |
-|| `-ExportElevationDiagnostics` | General | Export a full elevation diagnostics dump (privilege table, per-process SYSTEM scan, root-cause analysis) to the Desktop |
+| `-DumpLogs` | General | Collect and export all logs to Desktop with timestamped filename (`GodMode_Dump_YYYY-MM-DD_HH-mm-ss.log`) |
+| `-ExportElevationDiagnostics` | General | Export a full elevation diagnostics dump (privilege table, per-process SYSTEM scan, root-cause analysis) to the Desktop |
 
 ---
 

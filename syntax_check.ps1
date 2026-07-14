@@ -683,6 +683,171 @@ foreach ($File in $Ps1Files) {
     }
 }
 
+# C/C++ Syntax Check Section
+$CFiles = Get-ChildItem -Path $ScanDir -Filter "*.c" -File -Recurse -ErrorAction SilentlyContinue
+$HFiles = Get-ChildItem -Path $ScanDir -Filter "*.h" -File -Recurse -ErrorAction SilentlyContinue
+$AllCFiles = @($CFiles) + @($HFiles) | Where-Object { $_ -ne $null }
+
+foreach ($CFile in $AllCFiles) {
+    $CFileName = $CFile.Name
+    $CFilePath = $CFile.FullName
+    $CLines = Get-Content -Path $CFilePath -ErrorAction SilentlyContinue
+    if (-not $CLines) { continue }
+
+    $BraceStack = [System.Collections.Generic.List[pscustomobject]]::new()
+    $InString = $false
+    $StringChar = ''
+    $InChar = $false
+    $InBlockComment = $false
+    $Escaping = $false
+    $LineInBlockComment = @()
+    $i = 1
+
+    foreach ($Line in $CLines) {
+        $LineInBlockComment += $InBlockComment
+        $CharArray = $Line.ToCharArray()
+        for ($j = 0; $j -lt $CharArray.Length; $j++) {
+            $ch = $CharArray[$j]
+            $nextCh = if ($j + 1 -lt $CharArray.Length) { $CharArray[$j + 1] } else { $null }
+
+            if ($Escaping) {
+                $Escaping = $false
+                continue
+            }
+
+            if ($InBlockComment) {
+                if ($ch -eq '*' -and $nextCh -eq '/') {
+                    $InBlockComment = $false
+                    $j++ # skip /
+                }
+                continue
+            }
+
+            if ($InString) {
+                if ($ch -eq '\') {
+                    $Escaping = $true
+                    continue
+                }
+                if ($ch -eq $StringChar) {
+                    $InString = $false
+                    $StringChar = ''
+                }
+                continue
+            }
+
+            if ($InChar) {
+                if ($ch -eq '\') {
+                    $Escaping = $true
+                    continue
+                }
+                if ($ch -eq "'") {
+                    $InChar = $false
+                }
+                continue
+            }
+
+            if ($ch -eq '/' -and $nextCh -eq '*') {
+                $InBlockComment = $true
+                $j++
+                continue
+            }
+
+            if ($ch -eq '/' -and $nextCh -eq '/') {
+                break
+            }
+
+            if ($ch -eq '"') {
+                $InString = $true
+                $StringChar = '"'
+                continue
+            }
+
+            if ($ch -eq "'") {
+                $InChar = $true
+                continue
+            }
+
+            if ($ch -eq '{') { $BraceStack.Add([pscustomobject]@{ Char = '{'; Line = $i; Col = $j }) }
+            if ($ch -eq '[') { $BraceStack.Add([pscustomobject]@{ Char = '['; Line = $i; Col = $j }) }
+            if ($ch -eq '(') { $BraceStack.Add([pscustomobject]@{ Char = '('; Line = $i; Col = $j }) }
+            if ($ch -eq '}') {
+                if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '{') {
+                    Write-Host "[C-BRACE-MISMATCH] $CFilePath L$i`: Unmatched closing brace }." -ForegroundColor Red
+                    Add-Failure -FileName $CFileName -Message "L$i`: Unmatched closing brace }" -Severity "ERROR"
+                } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
+            }
+            if ($ch -eq ']') {
+                if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '[') {
+                    Write-Host "[C-BRACE-MISMATCH] $CFilePath L$i`: Unmatched closing bracket ]." -ForegroundColor Red
+                    Add-Failure -FileName $CFileName -Message "L$i`: Unmatched closing bracket ]" -Severity "ERROR"
+                } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
+            }
+            if ($ch -eq ')') {
+                if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '(') {
+                    Write-Host "[C-BRACE-MISMATCH] $CFilePath L$i`: Unmatched closing parenthesis )." -ForegroundColor Red
+                    Add-Failure -FileName $CFileName -Message "L$i`: Unmatched closing parenthesis )" -Severity "ERROR"
+                } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
+            }
+        }
+        $i++
+    }
+
+    if ($InString) {
+        Write-Host "[C-STRING] ${CFilePath}: Unterminated string literal." -ForegroundColor Red
+        Add-Failure -FileName $CFileName -Message "Unterminated string literal" -Severity "ERROR"
+    }
+    if ($InChar) {
+        Write-Host "[C-CHAR] ${CFilePath}: Unterminated character literal." -ForegroundColor Red
+        Add-Failure -FileName $CFileName -Message "Unterminated character literal" -Severity "ERROR"
+    }
+    if ($InBlockComment) {
+        Write-Host "[C-COMMENT] ${CFilePath}: Unterminated block comment /* ... */." -ForegroundColor Red
+        Add-Failure -FileName $CFileName -Message "Unterminated block comment /* */" -Severity "ERROR"
+    }
+
+    foreach ($Open in $BraceStack) {
+        $charName = if ($Open.Char -eq '{') { 'brace' } elseif ($Open.Char -eq '[') { 'bracket' } else { 'parenthesis' }
+        Write-Host "[C-BRACE-MISMATCH] $CFilePath L$($Open.Line)`: Unmatched opening $charName $Open.Char." -ForegroundColor Red
+        Add-Failure -FileName $CFileName -Message "L$($Open.Line)`: Unmatched opening $charName $Open.Char" -Severity "ERROR"
+    }
+
+    $IfStack = [System.Collections.Generic.List[pscustomobject]]::new()
+    $i = 1
+    foreach ($Line in $CLines) {
+        if ($LineInBlockComment[$i - 1]) { $i++; continue }
+        $Trimmed = $Line.Trim()
+        if ($Trimmed -match '^#if\b' -or $Trimmed -match '^#ifdef\b' -or $Trimmed -match '^#ifndef\b') {
+            $IfStack.Add([pscustomobject]@{ Line = $i; Type = 'if' })
+        } elseif ($Trimmed -match '^#elif\b') {
+            if ($IfStack.Count -eq 0 -or $IfStack[$IfStack.Count - 1].Type -ne 'if') {
+                Write-Host "[C-PREPROCESSOR] $CFilePath L$i`: Unmatched #elif without #if." -ForegroundColor Red
+                Add-Failure -FileName $CFileName -Message "L$i`: Unmatched #elif without #if" -Severity "ERROR"
+            }
+        } elseif ($Trimmed -match '^#else\b') {
+            if ($IfStack.Count -eq 0 -or $IfStack[$IfStack.Count - 1].Type -ne 'if') {
+                Write-Host "[C-PREPROCESSOR] $CFilePath L$i`: Unmatched #else without #if." -ForegroundColor Red
+                Add-Failure -FileName $CFileName -Message "L$i`: Unmatched #else without #if" -Severity "ERROR"
+            }
+        } elseif ($Trimmed -match '^#endif\b') {
+            if ($IfStack.Count -eq 0) {
+                Write-Host "[C-PREPROCESSOR] $CFilePath L$i`: Unmatched #endif without #if." -ForegroundColor Red
+                Add-Failure -FileName $CFileName -Message "L$i`: Unmatched #endif without #if" -Severity "ERROR"
+            } else {
+                $IfStack.RemoveAt($IfStack.Count - 1)
+            }
+        }
+        $i++
+    }
+    foreach ($Open in $IfStack) {
+        Write-Host "[C-PREPROCESSOR] $CFilePath L$($Open.Line)`: Unmatched #if / #ifdef / #ifndef without #endif." -ForegroundColor Red
+        Add-Failure -FileName $CFileName -Message "L$($Open.Line)`: Unmatched #if / #ifdef / #ifndef without #endif" -Severity "ERROR"
+    }
+
+    if (-not $FileFailures.ContainsKey($CFileName)) {
+        Write-Host "[C-OK] $CFileName" -ForegroundColor Green
+    }
+}
+
 # 26. Auto-chmod: ensure all .ps1 scripts are executable (not blocked by execution policy or ACL issues)
 foreach ($File in $Ps1Files) {
     try {
@@ -700,10 +865,11 @@ foreach ($File in $Ps1Files) {
 Write-Host "`n=====================================================" -ForegroundColor DarkGray
 Write-Host " SYNTAX CHECK SUMMARY " -ForegroundColor White
 Write-Host "=====================================================" -ForegroundColor DarkGray
+$TotalChecked = $Ps1Files.Count + $AllCFiles.Count
 $ErrorCount = $ErrorFiles.Count
 $WarnCount = $Warnings.Count
-$PassCount = $Ps1Files.Count - $ErrorCount
-Write-Host "Total checked: $($Ps1Files.Count)" -ForegroundColor Gray
+$PassCount = $TotalChecked - $ErrorCount
+Write-Host "Total checked: $TotalChecked (PS: $($Ps1Files.Count), C: $($AllCFiles.Count))" -ForegroundColor Gray
 Write-Host "Passed:        $PassCount" -ForegroundColor Green
 Write-Host "Warnings:      $WarnCount" -ForegroundColor Yellow
 Write-Host "Failed:        $ErrorCount" -ForegroundColor Red
