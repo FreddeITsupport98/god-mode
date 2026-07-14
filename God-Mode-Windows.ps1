@@ -3703,19 +3703,27 @@ function Install-ProcessHook {
                 Write-Log -Message "C components missing (gmproxy.exe or gmhook.dll). Running auto-build: $BuildScript" -Type "INFO" -Color Yellow
                 Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build starting: $BuildScript"
                 try {
-                    $BuildOutput = & pwsh -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
-                    $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
-                    $BuildExit = $LASTEXITCODE
-                    if ($BuildExit -ne 0) {
-                        Write-Log -Message "Auto-build failed (exit $BuildExit). Full log: $BuildLog" -Type "ERROR" -Color Red
-                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build failed exit=$BuildExit"
-                        if (Test-Path $BuildLog) {
-                            $BuildErr = Get-Content -Raw $BuildLog -ErrorAction SilentlyContinue
-                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build output: $BuildErr"
-                        }
+                    $PwshPath = Get-Command "pwsh" -ErrorAction SilentlyContinue
+                    $PsPath = Get-Command "powershell" -ErrorAction SilentlyContinue
+                    $ShellExe = if ($PwshPath) { $PwshPath.Source } elseif ($PsPath) { $PsPath.Source } else { $null }
+                    if (-not $ShellExe) {
+                        Write-Log -Message "Neither pwsh nor powershell found in PATH. Cannot auto-build C components." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "No PowerShell interpreter found for auto-build"
                     } else {
-                        Write-Log -Message "Auto-build succeeded." -Type "INFO" -Color Green
-                        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build succeeded"
+                        $BuildOutput = & $ShellExe -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
+                        $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
+                        $BuildExit = $LASTEXITCODE
+                        if ($BuildExit -ne 0) {
+                            Write-Log -Message "Auto-build failed (exit $BuildExit). Full log: $BuildLog" -Type "ERROR" -Color Red
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build failed exit=$BuildExit"
+                            if (Test-Path $BuildLog) {
+                                $BuildErr = Get-Content -Raw $BuildLog -ErrorAction SilentlyContinue
+                                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Build output: $BuildErr"
+                            }
+                        } else {
+                            Write-Log -Message "Auto-build succeeded." -Type "INFO" -Color Green
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build succeeded"
+                        }
                     }
                 } catch {
                     Write-Log -Message "Auto-build exception: $_" -Type "ERROR" -Color Red

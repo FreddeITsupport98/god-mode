@@ -5,7 +5,7 @@
 #   - MinGW-w64 cross-compiler (x86_64-w64-mingw32-gcc) on Linux, or
 #   - mingw-w64 on Windows (gcc)
 #
-# Usage: pwsh -File driver\build.ps1
+# Usage: pwsh -File driver\build.ps1  (or powershell -File driver\build.ps1 on older systems)
 
 $DriverDir = Join-Path $PSScriptRoot "driver"
 $ErrorActionPreference = "Stop"
