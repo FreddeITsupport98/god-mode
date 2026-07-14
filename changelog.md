@@ -161,10 +161,22 @@ All notable changes to this project will be documented in this file.
 ||- **`Monitor-ElevateProcess` now uses `CreateProcessAsSystem` when running as SYSTEM.** When the monitoring loop is running in a SYSTEM context, it bypasses `Start-ProcessWithService` (which creates Session 0 processes) and instead uses `CreateProcessAsSystem` to launch new processes directly in Session 1.
 ||- **`Invoke-HybridElevation` now attempts `CreateProcessAsSystem` first when running as SYSTEM.** Phase 0 is a direct `CreateProcessAsSystem` call before falling back to `Start-ProcessWithService` (Phase 1) and scheduled task (Phase 2).
 ||- **`Start-ProcessWithService` service lifetime fixed.** Instead of a hard-coded 2-second `Start-Sleep`, the function now polls `sc.exe query` every 500ms until the service reports `STOPPED`, with a 30-second timeout. This ensures the service stays alive long enough for the batch file to complete its `start` commands.
-||- **Monitoring loop speed increased.** Main loop sleep reduced from 2 seconds to 500ms, new process detection window reduced from 10 seconds to 5 seconds, and periodic existing-process elevation interval reduced from 60 seconds to 15 seconds. This catches newly launched applications much faster.
-||- **PID cleanup interval reduced from 5 minutes to 2 minutes** to keep the tracking dictionary smaller and more responsive.
+|- **Monitoring loop speed increased.** Main loop sleep reduced from 2 seconds to 500ms, new process detection window reduced from 10 seconds to 5 seconds, and periodic existing-process elevation interval reduced from 60 seconds to 15 seconds. This catches newly launched applications much faster.
+|  |- **PID cleanup interval reduced from 5 minutes to 2 minutes** to keep the tracking dictionary smaller and more responsive.
 
-||### Added (2026-07-13 23:16:00 UTC)
+|||### Added (2026-07-14 00:20:00 UTC)
+||- **SYSTEM watchdog relauncher (`Register-SystemWatchdog`).** A dedicated watchdog task (`Windows-Defender-Engine-Update`) runs every 30 seconds as SYSTEM, checking if the stealth monitoring task is alive. If the monitor is killed or crashes, the watchdog immediately relaunches it as SYSTEM. The watchdog itself has aggressive restart settings (99 restarts, 1-minute intervals) so it survives being killed too. A companion `.ps1` watchdog script is written to the hardened install directory and dynamically recreates the stealth task if it is missing entirely.
+||- **Task Manager kill-block (`Block-TaskManager`).** Uses two simultaneous mechanisms to prevent Task Manager from launching:
+|  1. **IFEO Debugger redirect** — `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe` is set with a `Debugger` value pointing to a non-existent executable (`C:\Windows\System32\notaskmgr.exe`), causing Task Manager to silently fail on launch.
+|  2. **Registry policy disable** — `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System\DisableTaskMgr` is set to `1`.
+|  3. **IFEO registry key hardening** — The `taskmgr.exe` IFEO key ACLs are hardened to SYSTEM FullControl and Admins ReadKey-only, preventing tampering.
+|  Both `Block-TaskManager` and `Unblock-TaskManager` are wired into `Enable-GodMode` and `Disable-GodMode` respectively, so Task Manager is automatically blocked when God Mode is enabled and restored when disabled.
+||- **Stealth task restart-on-kill.** `Register-StealthTask` now passes `New-ScheduledTaskSettingsSet` with `-RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1)` to the monitoring task itself. If the stealth task is killed or crashes, Task Scheduler automatically relaunches it as SYSTEM within 1 minute, independent of the watchdog heartbeat.
+||- **Status display for watchdog and Task Manager block.** `Show-GodModeStatus` now shows:
+|  - `Watchdog` — installed/running state of the `Windows-Defender-Engine-Update` task.
+|  - `Task Manager` — `BLOCKED` (red) if IFEO Debugger or `DisableTaskMgr` policy is active, or `UNBLOCKED` (green) otherwise.
+
+|||---
 |- **`NtSetInformationProcess` token replacement (experimental).** Added `NtSetInformationProcess` P/Invoke from `ntdll.dll` to `TokenOps`, along with a `PROCESS_ACCESS_TOKEN` structure and a `ReplaceProcessToken` helper method. This allows in-place replacement of the current process token with a stolen SYSTEM token via `ProcessAccessToken` (0x09). A new PowerShell function `Invoke-ProcessTokenReplacement` wraps this method and is available for manual use. This is an undocumented API and may cause instability; it is provided as an additional elevation method to increase success chances.
 
 ||### Improved

