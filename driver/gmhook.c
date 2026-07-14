@@ -63,6 +63,8 @@ typedef BOOL (WINAPI *CreateProcessW_t)(
 
 static NtSetInformationProcess_t pNtSetInfo = NULL;
 static CreateProcessW_t pOrigCreateProcessW = NULL;
+static CreateProcessW_t pRealCreateProcessW = NULL;
+static LPVOID pTrampoline = NULL;
 static BYTE origBytes[5] = {0};
 static BOOL hookInstalled = FALSE;
 static DWORD gSystemPid = 0;
@@ -246,37 +248,63 @@ static BOOL WINAPI HookCreateProcessW(
     return TRUE;
 }
 
-/* Inline hook: overwrite first 5 bytes of CreateProcessW with a JMP to our hook */
+/* Inline hook: overwrite first 5 bytes of CreateProcessW with a JMP to our hook.
+   A proper trampoline is required so calling pOrigCreateProcessW does not
+   re-enter the hook (which would cause infinite recursion / stack overflow). */
 static BOOL InstallInlineHook(void) {
     HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel) return FALSE;
-    pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hKernel, "CreateProcessW");
-    if (!pOrigCreateProcessW) return FALSE;
+    pRealCreateProcessW = (CreateProcessW_t)GetProcAddress(hKernel, "CreateProcessW");
+    if (!pRealCreateProcessW) return FALSE;
 
-    memcpy(origBytes, pOrigCreateProcessW, 5);
+    /* Save original bytes */
+    memcpy(origBytes, pRealCreateProcessW, 5);
+
+    /* Allocate trampoline (16 bytes: 5 original + 5 JMP + padding) */
+    pTrampoline = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!pTrampoline) return FALSE;
+
+    /* Copy original 5 bytes to trampoline */
+    memcpy(pTrampoline, origBytes, 5);
+
+    /* Add JMP from trampoline+5 to original+5 */
+    BYTE* pTrampJmp = (BYTE*)pTrampoline + 5;
+    pTrampJmp[0] = 0xE9;
+    DWORD trampOffset = (DWORD)pRealCreateProcessW + 5 - ((DWORD)pTrampoline + 5) - 5;
+    memcpy(&pTrampJmp[1], &trampOffset, 4);
 
     DWORD oldProtect;
-    if (!VirtualProtect(pOrigCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) return FALSE;
+    if (!VirtualProtect(pRealCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) return FALSE;
 
+    /* Write JMP rel32 to our hook */
     BYTE jmp[5];
     jmp[0] = 0xE9;
-    DWORD offset = (DWORD)HookCreateProcessW - (DWORD)pOrigCreateProcessW - 5;
+    DWORD offset = (DWORD)HookCreateProcessW - (DWORD)pRealCreateProcessW - 5;
     memcpy(&jmp[1], &offset, 4);
-    memcpy(pOrigCreateProcessW, jmp, 5);
+    memcpy(pRealCreateProcessW, jmp, 5);
 
-    VirtualProtect(pOrigCreateProcessW, 5, oldProtect, &oldProtect);
-    FlushInstructionCache(GetCurrentProcess(), pOrigCreateProcessW, 5);
+    VirtualProtect(pRealCreateProcessW, 5, oldProtect, &oldProtect);
+    FlushInstructionCache(GetCurrentProcess(), pRealCreateProcessW, 5);
+
+    /* pOrigCreateProcessW now points to the trampoline, not the hooked function */
+    pOrigCreateProcessW = (CreateProcessW_t)pTrampoline;
     return TRUE;
 }
 
 static void RemoveInlineHook(void) {
-    if (!pOrigCreateProcessW) return;
+    if (!pRealCreateProcessW) return;
     DWORD oldProtect;
-    if (VirtualProtect(pOrigCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        memcpy(pOrigCreateProcessW, origBytes, 5);
-        VirtualProtect(pOrigCreateProcessW, 5, oldProtect, &oldProtect);
-        FlushInstructionCache(GetCurrentProcess(), pOrigCreateProcessW, 5);
+    if (VirtualProtect(pRealCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        memcpy(pRealCreateProcessW, origBytes, 5);
+        VirtualProtect(pRealCreateProcessW, 5, oldProtect, &oldProtect);
+        FlushInstructionCache(GetCurrentProcess(), pRealCreateProcessW, 5);
     }
+    if (pTrampoline) {
+        VirtualFree(pTrampoline, 0, MEM_RELEASE);
+        pTrampoline = NULL;
+    }
+    pOrigCreateProcessW = NULL;
+    pRealCreateProcessW = NULL;
 }
 
 /* GetMsgProc for SetWindowsHookEx global injection */
