@@ -4713,11 +4713,13 @@ function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
 
 
-    # Ensure the installed script exists before registering tasks that depend on it
-    if (-not (Test-Path $GodModeInstallScript)) {
-        Write-Log -Message "God Mode install script not found. Copying payload to $GodModeInstallScript..." -Type "INFO" -Color Yellow
-        if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
-        Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force
+    # Ensure the installed script is up-to-date before registering tasks that depend on it
+    if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
+    try {
+        Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force -ErrorAction SilentlyContinue
+        Write-Log -Message "Updated installed script at $GodModeInstallScript" -Type "INFO" -Color Gray
+    } catch {
+        Write-DebugLog -FunctionName "Enable-GodMode" -Action "WARN" -Message "Could not update installed script: $_"
     }
 
     # --- Idempotency: if God Mode is already enabled and the monitoring loop is
