@@ -3485,7 +3485,15 @@ if (-not $task) {
 '@
     $WatchdogContent = $WatchdogContent.Replace('__PREFIX__', $GodModeTaskPrefix)
     $WatchdogContent = $WatchdogContent.Replace('__SCRIPT__', $GodModeInstallScript)
-    Set-Content -Path $WatchdogScriptPath -Value $WatchdogContent -Encoding ASCII -Force
+
+    # Write to temp first, then copy via SYSTEM into hardened install dir
+    $TempWatchdog = Join-Path $env:TEMP "gm_watchdog_$(Get-Random).ps1"
+    Set-Content -Path $TempWatchdog -Value $WatchdogContent -Encoding UTF8 -Force
+    $copyResult = Invoke-AsSystem -Command "cmd /c copy /y `"$TempWatchdog`" `"$WatchdogScriptPath`""
+    if (-not $copyResult.Success) {
+        Write-Log -Message "Watchdog script copy to install dir failed: $($copyResult.Output)" -Type "WARN" -Color Yellow
+    }
+    Remove-Item -Path $TempWatchdog -Force -ErrorAction SilentlyContinue
 
     # Create the watchdog scheduled task (30-second heartbeat, runs as SYSTEM, auto-restarts if killed)
     $WatchdogAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$WatchdogScriptPath`""
@@ -3504,7 +3512,12 @@ function Unregister-SystemWatchdog {
         Unregister-ScheduledTask -TaskName $GodModeWatchdogName -Confirm:$false -ErrorAction SilentlyContinue
     }
     $WatchdogScriptPath = Join-Path $GodModeInstallDir "watchdog.ps1"
-    if (Test-Path $WatchdogScriptPath) { Remove-Item -Path $WatchdogScriptPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $WatchdogScriptPath) {
+        $delResult = Invoke-AsSystem -Command "cmd /c del /f /q `"$WatchdogScriptPath`""
+        if (-not $delResult.Success) {
+            Write-Log -Message "Failed to remove watchdog script from hardened dir: $($delResult.Output)" -Type "WARN" -Color Yellow
+        }
+    }
     Write-Log -Message "SYSTEM watchdog removed." -Type "INFO" -Color Gray
     Write-DebugLog -FunctionName "Unregister-SystemWatchdog" -Action "EXIT" -Message "Success"
 }
@@ -3525,7 +3538,17 @@ function Block-TaskManager {
         # Create proxy launcher script and copy of taskmgr for admin SYSTEM launch
         $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
         $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
-        Copy-Item -Path "C:\Windows\System32\taskmgr.exe" -Destination $TaskMgrCopy -Force -ErrorAction SilentlyContinue
+
+        # Copy taskmgr to temp, then push into hardened dir via SYSTEM
+        $TempTaskMgr = Join-Path $env:TEMP "gm_taskmgr_$(Get-Random).exe"
+        Copy-Item -Path "C:\Windows\System32\taskmgr.exe" -Destination $TempTaskMgr -Force -ErrorAction SilentlyContinue
+        if (Test-Path $TempTaskMgr) {
+            $copyResult = Invoke-AsSystem -Command "cmd /c copy /y `"$TempTaskMgr`" `"$TaskMgrCopy`""
+            if (-not $copyResult.Success) {
+                Write-Log -Message "Taskmgr copy to install dir failed: $($copyResult.Output)" -Type "WARN" -Color Yellow
+            }
+            Remove-Item -Path $TempTaskMgr -Force -ErrorAction SilentlyContinue
+        }
 
         $ProxyScript = @'
 # Task Manager SYSTEM Proxy -- admin-only, launches as SYSTEM
@@ -3535,7 +3558,14 @@ if (-not $isAdmin) { exit }
 $main = "C:\ProgramData\GodMode\GodMode.ps1"
 if (Test-Path $main) { & $main -LaunchTaskMgrAsSystem } else { Start-Process "C:\ProgramData\GodMode\taskmgr_real.exe" }
 '@
-        Set-Content -Path $ProxyPath -Value $ProxyScript -Encoding UTF8 -Force
+        # Write proxy to temp, then push into hardened dir via SYSTEM
+        $TempProxy = Join-Path $env:TEMP "gm_proxy_$(Get-Random).ps1"
+        Set-Content -Path $TempProxy -Value $ProxyScript -Encoding UTF8 -Force
+        $proxyResult = Invoke-AsSystem -Command "cmd /c copy /y `"$TempProxy`" `"$ProxyPath`""
+        if (-not $proxyResult.Success) {
+            Write-Log -Message "Taskmgr proxy copy to install dir failed: $($proxyResult.Output)" -Type "WARN" -Color Yellow
+        }
+        Remove-Item -Path $TempProxy -Force -ErrorAction SilentlyContinue
 
         # Set IFEO Debugger to PowerShell proxy (hidden window)
         Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ProxyPath`"" -Force -ErrorAction SilentlyContinue
@@ -3578,11 +3608,21 @@ function Unblock-TaskManager {
             Remove-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
         }
 
-        # Remove proxy launcher and taskmgr copy
+        # Remove proxy launcher and taskmgr copy from hardened dir via SYSTEM
         $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
         $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
-        if (Test-Path $ProxyPath) { Remove-Item -Path $ProxyPath -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $TaskMgrCopy) { Remove-Item -Path $TaskMgrCopy -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $ProxyPath) {
+            $delResult = Invoke-AsSystem -Command "cmd /c del /f /q `"$ProxyPath`""
+            if (-not $delResult.Success) {
+                Write-Log -Message "Failed to remove taskmgr proxy from hardened dir: $($delResult.Output)" -Type "WARN" -Color Yellow
+            }
+        }
+        if (Test-Path $TaskMgrCopy) {
+            $delResult = Invoke-AsSystem -Command "cmd /c del /f /q `"$TaskMgrCopy`""
+            if (-not $delResult.Success) {
+                Write-Log -Message "Failed to remove taskmgr copy from hardened dir: $($delResult.Output)" -Type "WARN" -Color Yellow
+            }
+        }
 
         Write-Log -Message "Task Manager unblocked." -Type "INFO" -Color Gray
     } catch {
