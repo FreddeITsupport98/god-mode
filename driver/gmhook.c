@@ -200,24 +200,48 @@ static BOOL WINAPI HookCreateProcessW(
     LPSTARTUPINFOW lpStartupInfo,
     LPPROCESS_INFORMATION lpProcessInformation)
 {
-    char buf[1024];
-    sprintf(buf, "[GMHOOK] CreateProcessW hook: app=%S cmd=%S\n",
-            lpApplicationName ? lpApplicationName : L"(null)",
-            lpCommandLine ? lpCommandLine : L"(null)");
-    OutputDebugStringA(buf);
+    /* Recursion guard: if the hook is called recursively (e.g., pOrigCreateProcessW points back here),
+       fall through immediately to avoid stack overflow / crash. */
+    static volatile LONG inHook = 0;
+    if (InterlockedExchange(&inHook, 1) == 1) {
+        /* Already inside the hook — call the real function directly to break recursion. */
+        if (!pOrigCreateProcessW) {
+            HMODULE hKb = GetModuleHandleW(L"kernelbase.dll");
+            if (hKb) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hKb, "CreateProcessW");
+            if (!pOrigCreateProcessW) {
+                HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+                if (hK32) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hK32, "CreateProcessW");
+            }
+        }
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
 
-    if (!pOrigCreateProcessW) {
+    BOOL result = FALSE;
+
+    /* Ensure we have the real original function pointer. */
+    if (!pOrigCreateProcessW || pOrigCreateProcessW == HookCreateProcessW) {
         HMODULE hKb = GetModuleHandleW(L"kernelbase.dll");
-        HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
         if (hKb) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hKb, "CreateProcessW");
-        if (!pOrigCreateProcessW && hK32) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hK32, "CreateProcessW");
+        if (!pOrigCreateProcessW) {
+            HMODULE hK32 = GetModuleHandleW(L"kernel32.dll");
+            if (hK32) pOrigCreateProcessW = (CreateProcessW_t)GetProcAddress(hK32, "CreateProcessW");
+        }
     }
 
     if (!lpApplicationName && !lpCommandLine) {
-        OutputDebugStringA("[GMHOOK] Both app and cmd are NULL, passing through.\n");
-        return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-            lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-            lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        InterlockedExchange(&inHook, 0);
+        return result;
     }
 
     const wchar_t* exePath = lpApplicationName;
@@ -245,34 +269,35 @@ static BOOL WINAPI HookCreateProcessW(
         if (slash) baseName = slash + 1;
     }
 
-    sprintf(buf, "[GMHOOK] baseName=%S\n", baseName ? baseName : L"(null)");
-    OutputDebugStringA(buf);
-
     /* Pass through critical OS processes untouched */
     if (IsCriticalProcess(baseName)) {
-        OutputDebugStringA("[GMHOOK] Critical process, passing through.\n");
-        return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-            lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-            lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        InterlockedExchange(&inHook, 0);
+        return result;
     }
 
     /* Ensure token is ready */
     if (!gSystemToken) {
-        OutputDebugStringA("[GMHOOK] gSystemToken missing, preparing...\n");
         EnablePrivilege(L"SeDebugPrivilege");
         EnablePrivilege(L"SeImpersonatePrivilege");
         if (!PrepareSystemToken()) {
-            OutputDebugStringA("[GMHOOK] PrepareSystemToken failed, falling back.\n");
-            return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+            if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+                result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                    lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                    lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+            }
+            InterlockedExchange(&inHook, 0);
+            return result;
         }
-        OutputDebugStringA("[GMHOOK] gSystemToken prepared OK.\n");
     }
 
     /* Ensure CreateProcessWithTokenW is resolved (advapi32 may not be loaded at DllMain time). */
     CreateProcessWithTokenW_t pCpwt = ResolveCreateProcessWithTokenW();
-    if (pCpwt) {
+    if (pCpwt && pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
         /* CreateProcessWithTokenW requires lpDesktop to be specified for cross-session
            tokens. If the caller passed NULL, we must copy STARTUPINFO and set it. */
         STARTUPINFOW siCopy = {0};
@@ -294,27 +319,26 @@ static BOOL WINAPI HookCreateProcessW(
         /* CreateProcessWithTokenW does not support EXTENDED_STARTUPINFO_PRESENT.
            If the caller used it, fall back to the original path. */
         if (!(dwCreationFlags & 0x00080000)) { /* EXTENDED_STARTUPINFO_PRESENT = 0x00080000 */
-            OutputDebugStringA("[GMHOOK] Calling CreateProcessWithTokenW...\n");
             BOOL ret = pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
                 dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi,
                 lpProcessInformation);
             if (ret) {
-                OutputDebugStringA("[GMHOOK] CreateProcessWithTokenW SUCCEEDED.\n");
+                InterlockedExchange(&inHook, 0);
                 return TRUE;
             }
-            sprintf(buf, "[GMHOOK] CreateProcessWithTokenW FAILED: GLE=%lu\n", GetLastError());
-            OutputDebugStringA(buf);
-        } else {
-            OutputDebugStringA("[GMHOOK] EXTENDED_STARTUPINFO_PRESENT set, falling back.\n");
+            /* If CreateProcessWithTokenW fails, fall back so the app still launches
+               unelevated instead of vanishing — no flashing, no silent close. */
         }
-    } else {
-        OutputDebugStringA("[GMHOOK] CreateProcessWithTokenW not resolved, falling back.\n");
     }
 
-    OutputDebugStringA("[GMHOOK] Falling back to original CreateProcessW.\n");
-    return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
-        lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
-        lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+    if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+        result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+            lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+            lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+    }
+
+    InterlockedExchange(&inHook, 0);
+    return result;
 }
 
 /* IAT hook helper: patch a single module's IAT for CreateProcessW. */
@@ -474,9 +498,6 @@ __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPAR
                 EnablePrivilege(L"SeImpersonatePrivilege");
                 if (!gSystemToken) PrepareSystemToken();
                 hookInstalled = InstallIATHook();
-                char buf[512];
-                sprintf(buf, "[GMHOOK] GetMsgProc installed hook in %S: %d\n", modName, hookInstalled);
-                OutputDebugStringA(buf);
             }
         }
         LeaveCriticalSection(&gHookLock);
