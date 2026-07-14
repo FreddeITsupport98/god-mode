@@ -4790,7 +4790,6 @@ function Start-Monitoring {
 function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
 
-
     # Ensure the installed script is up-to-date before registering tasks that depend on it
     if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
     try {
@@ -4800,11 +4799,38 @@ function Enable-GodMode {
         Write-DebugLog -FunctionName "Enable-GodMode" -Action "WARN" -Message "Could not update installed script: $_"
     }
 
+    # --- Install C process hook FIRST before any dangerous system changes or idempotency skip.
+    #     The WH_GETMESSAGE hook and DLL injection do NOT survive reboot. Every startup
+    #     (manual or via scheduled task -ToggleOn) must rebuild/re-install gmhook.dll and
+    #     re-inject into running processes. This is the critical gate: if build fails,
+    #     the rest of the script must NOT proceed. ---
+    $HookOk = Install-ProcessHook
+    if (-not $HookOk) {
+        $DesktopPath = [Environment]::GetFolderPath("Desktop")
+        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
+        @"
+[ERROR] God Mode activation aborted - C component build/install failed.
+
+Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
+
+To fix:
+1. Check that MSYS2 is installed correctly and gcc is available
+2. Or install Visual Studio Build Tools
+3. Then press [7] again
+
+No system modifications were applied (Defender, registry, etc. remain untouched).
+"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
+        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
+        return
+    }
+
     # --- Idempotency: if God Mode is already enabled and the monitoring loop is
     #     running, skip re-registration. This prevents the many -ToggleOn
     #     persistence layers (startup tasks, guardian, WMI) from killing the
     #     Start-Monitoring loop via Register-StealthTask -> Unregister-StealthTask.
-    #     Without this, the loop flaps constantly after reboot and never elevates. ---
+    #     Without this, the loop flaps constantly after reboot and never elevates.
+    #     NOTE: Install-ProcessHook already ran above (hooks don't survive reboot). ---
     $FlagAlreadySet = $false
     try {
         $ExistingFlag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
@@ -4837,29 +4863,8 @@ function Enable-GodMode {
         Write-Log -Message "God Mode guardian auto-registered." -Type "INFO" -Color Gray
     }
 
-    # --- Install C process hook (IFEO proxy + explorer DLL) FIRST before any dangerous system changes ---
-    # This is a critical gate: if build or install fails, the rest of the script
-    # must NOT proceed to avoid enabling dangerous mode without C hooks.
-    $HookOk = Install-ProcessHook -Force
-    if (-not $HookOk) {
-        $DesktopPath = [Environment]::GetFolderPath("Desktop")
-        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
-        @"
-[ERROR] God Mode activation aborted - C component build/install failed.
-
-Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
-
-To fix:
-1. Check that MSYS2 is installed correctly and gcc is available
-2. Or install Visual Studio Build Tools
-3. Then press [7] again
-
-No system modifications were applied (Defender, registry, etc. remain untouched).
-"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
-        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
-        Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
-        return
-    }
+    # --- If we reach here, this is a fresh activation (not an idempotent skip). ---
+    #     Dangerous mode changes only happen once; hooks are already re-installed above.
 
     if (-not (Test-Path $GodModeFlagRegPath)) { New-Item -Path $GodModeFlagRegPath -Force | Out-Null }
     Set-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -Value 1 -Force -ErrorAction SilentlyContinue
