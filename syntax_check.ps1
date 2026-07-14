@@ -582,6 +582,74 @@ foreach ($File in $Ps1Files) {
         $i++
     }
 
+    # 25.5. Try/Catch/Finally stack mismatch
+    # PowerShell requires that every `try` block be paired with at least one `catch` or `finally` block.
+    # This catches the common parser error: "The Try statement is missing its Catch or Finally block."
+    $i = 1
+    $TryStack = [System.Collections.Generic.List[pscustomobject]]::new()
+    foreach ($Line in $Lines) {
+        $Trimmed = $Line.Trim()
+        if ($Trimmed -match '^\s*#') { $i++; continue }
+        # Skip single-quoted strings (literal content)
+        if ($Trimmed -match "^'") { $i++; continue }
+        # Skip here-strings (simplified)
+        if ($Trimmed.StartsWith('@') -and ($Trimmed.Length -gt 1) -and ($Trimmed[1] -eq "'" -or $Trimmed[1] -eq '"')) { $i++; continue }
+        $InString = $false
+        $StringChar = ''
+        $Escaping = $false
+        $CharArray = $Line.ToCharArray()
+        for ($j = 0; $j -lt $CharArray.Length; $j++) {
+            $ch = $CharArray[$j]
+            if ($Escaping) { $Escaping = $false; continue }
+            if ($ch -eq '`') { $Escaping = $true; continue }
+            if ($InString -eq $false) {
+                if ($ch -eq '"') { $InString = $true; $StringChar = $ch; continue }
+                if ($ch -eq "'") { $InString = $true; $StringChar = $ch; continue }
+                # Detect try / catch / finally keywords (whole-word only)
+                if ($j -eq 0 -or -not [char]::IsLetterOrDigit($CharArray[$j-1]) -and $CharArray[$j-1] -ne '_') {
+                    $rest = $Line.Substring($j)
+                    if ($rest -match '^try\b') {
+                        $TryStack.Add([pscustomobject]@{ Keyword = 'try'; Line = $i; Col = $j })
+                        $j += 2
+                        continue
+                    }
+                    if ($rest -match '^catch\b') {
+                        if ($TryStack.Count -eq 0 -or $TryStack[$TryStack.Count - 1].Keyword -ne 'try') {
+                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'catch' found without a matching 'try' block." -ForegroundColor Red
+                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'catch' without a matching 'try' block" -Severity "ERROR"
+                        } else {
+                            # Replace the top try with a catch marker so we can detect duplicate catches without finally
+                            $TryStack[$TryStack.Count - 1] = [pscustomobject]@{ Keyword = 'catch'; Line = $i; Col = $j }
+                        }
+                        $j += 4
+                        continue
+                    }
+                    if ($rest -match '^finally\b') {
+                        if ($TryStack.Count -eq 0 -or ($TryStack[$TryStack.Count - 1].Keyword -ne 'try' -and $TryStack[$TryStack.Count - 1].Keyword -ne 'catch')) {
+                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'finally' found without a matching 'try' block." -ForegroundColor Red
+                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'finally' without a matching 'try' block" -Severity "ERROR"
+                        } else {
+                            # Mark as closed (finally satisfies the try requirement)
+                            $TryStack.RemoveAt($TryStack.Count - 1)
+                        }
+                        $j += 6
+                        continue
+                    }
+                }
+            }
+            else {
+                if ($ch -eq $StringChar) { $InString = $false; $StringChar = '' }
+            }
+        }
+        $i++
+    }
+    foreach ($Open in $TryStack) {
+        if ($Open.Keyword -eq 'try') {
+            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$($Open.Line)': 'try' block at L$($Open.Line) is missing its 'catch' or 'finally' block." -ForegroundColor Red
+            Add-Failure -FileName $FileName -Message "L$($Open.Line)': 'try' block missing 'catch' or 'finally' block" -Severity "ERROR"
+        }
+    }
+
     # 25. OrderedDictionary ContainsKey method trap
     # [ordered]@{} creates a System.Collections.Specialized.OrderedDictionary, which does NOT have a ContainsKey method.
     # Calling .ContainsKey() on such variables causes: "Method invocation failed because [System.Collections.Specialized.OrderedDictionary] does not contain a method named 'ContainsKey'."
@@ -592,15 +660,15 @@ foreach ($File in $Ps1Files) {
         $Trimmed = $Line.Trim()
         if ($Trimmed -match '^\s*#') { $i++; continue }
         # Detect variable assignments to [ordered]@{} or [ordered]@(...)
-        # Match $VarName = [ordered]@... (with optional scope prefixes like $global:, $script:)
+        # Match VarName = [ordered]@... (with optional scope prefixes like dollar-global-colon, dollar-script-colon)
         $OrderedMatch = [regex]::Match($Trimmed, '(?i)\$(?:global:|script:)?(\w+)\s*=\s*\[ordered\]@')
         if ($OrderedMatch.Success) {
             $OrderedVars += $OrderedMatch.Groups[1].Value
         }
         # Detect .ContainsKey() calls on those variables
         foreach ($VarName in $OrderedVars) {
-            # Match $VarName.ContainsKey( or $global:VarName.ContainsKey( etc.
-            if ($Trimmed -match "(?i)\`$(?:global:|script:)?$VarName\.ContainsKey\(") {
+            # Match VarName.ContainsKey( or global:VarName.ContainsKey( etc.
+            if ($Trimmed -match ('(?i)\$(?:global:|script:)?' + $VarName + '\.ContainsKey\(')) {
                 Write-Host "[ORDERED-CONTAINSKEY] $FilePath L$i`: Variable `$$VarName is assigned to [ordered]@{} (OrderedDictionary) but later uses .ContainsKey(), which does NOT exist on OrderedDictionary. Use `if (`$$VarName[`"Key`"] -ne `$null)` or `if (`$$VarName[`"Key`"] -eq `$true)` instead." -ForegroundColor Red
                 Add-Failure -FileName $FileName -Message "L$i`: .ContainsKey() used on [ordered]@{} variable `$$VarName - OrderedDictionary does not have this method" -Severity "ERROR"
             }

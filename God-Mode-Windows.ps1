@@ -4033,7 +4033,6 @@ function Start-Monitoring {
                     }
                 }
             }
-        }
 
         # --- New Process Elevation ---
         # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
