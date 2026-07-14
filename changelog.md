@@ -171,19 +171,24 @@ All notable changes to this project will be documented in this file.
 ||- Project structure reorganized with `tests/` folder for regression scripts.
 
 |||### Added (2026-07-13 23:51:00 UTC)
-||- **Parallel hyperthreaded elevation (`Invoke-ParallelElevation`).** Added a new `Invoke-ParallelElevation` helper that distributes process elevation across up to 8 concurrent `Start-ThreadJob` threads (PowerShell 7). This replaces the old sequential `foreach` loop in `Invoke-ExistingProcessElevation` (menu option 7) and dramatically reduces the time needed to elevate all running user processes to SYSTEM.
+||||- **Parallel hyperthreaded elevation (`Invoke-ParallelElevation`).** Added a new `Invoke-ParallelElevation` helper that distributes process elevation across dynamically-detected concurrent `Start-ThreadJob` threads (PowerShell 7). The thread count is determined at runtime by the actual CPU logical processor count, not a hardcoded value. This replaces the old sequential `foreach` loop in `Invoke-ExistingProcessElevation` (menu option 7) and dramatically reduces the time needed to elevate all running user processes to SYSTEM.
 ||  - Each worker thread performs the full "detect first, then set" cycle per process: checks if a SYSTEM instance already exists via WMI `GetOwner`, skips if already SYSTEM, kills all non-SYSTEM instances of the same process name, extracts the original command-line arguments, and calls `TokenOps::CreateProcessAsSystem` to launch the process directly into Session 1 (`WinSta0\Default`).
 ||  - Automatic fallback to sequential execution when `Start-ThreadJob` is unavailable (PowerShell 5.1), so the script remains compatible with older environments.
-||  - **Monitoring loop periodic scan also parallelized.** The 15-second periodic re-elevation block inside `Start-Monitoring` now builds a "due list" of processes that need elevation, then delegates the elevation work to `Invoke-ParallelElevation` with 4 threads instead of looping sequentially. This prevents the monitor loop from spending seconds per process and missing newly launched applications.
+|||  - **Monitoring loop periodic scan also parallelized.** The 15-second periodic re-elevation block inside `Start-Monitoring` now builds a "due list" of processes that need elevation, then delegates the elevation work to `Invoke-ParallelElevation` with dynamically-detected threads instead of looping sequentially. This prevents the monitor loop from spending seconds per process and missing newly launched applications.
 ||- **Deduplication before parallel elevation.** `Invoke-ExistingProcessElevation` now deduplicates the target process list by executable name before spawning threads, so only one elevation attempt per unique process is launched. This avoids race conditions where multiple threads might try to elevate the same app simultaneously.
 ||- **Removed per-process `Start-Sleep -Milliseconds 300` bottleneck.** The old sequential loop paused 300ms between each process; the parallel path removes all sleeps, with threads running concurrently.
 ||- **Parallel process ownership scan (`Get-NonSystemProcessesParallel`).** The ownership scan inside `Invoke-ExistingProcessElevation` was the last sequential bottleneck. The new `Get-NonSystemProcessesParallel` helper:
 ||  - Fast-filters by PID, path, and critical name (no WMI calls).
 ||  - Splits remaining candidates into PID chunks of 25.
-||  - Launches up to 8 `Start-ThreadJob` threads, each querying its batch via `Get-CimInstance -Filter "ProcessId=... OR ProcessId=..."` and checking `GetOwner` per process.
+|||  - Launches dynamically-detected `Start-ThreadJob` threads (one per CPU logical processor), each querying its batch via `Get-CimInstance -Filter "ProcessId=... OR ProcessId=..."` and checking `GetOwner` per process.
 ||  - Collects all non-SYSTEM PIDs, maps them back to the original CIM instances, and returns the deduplicated target list.
 ||  - Sequential fallback with CIM/WMI compatibility for environments without `ThreadJob`.
-||  - This eliminates the 200+ sequential `GetOwner` WMI calls that were the slowest part of menu option 7.
+|||  - This eliminates the 200+ sequential `GetOwner` WMI calls that were the slowest part of menu option 7.
+||||- **Dynamic CPU thread detection (`Get-OptimalThreadCount`).** All hardcoded thread counts (8, 4) removed. New `Get-OptimalThreadCount` helper detects the actual logical processor count at runtime via `[System.Environment]::ProcessorCount` (cross-platform, works in PS 7 and PS 5.1 on .NET 4.6+), with fallback to `$env:NUMBER_OF_PROCESSORS` and ultimate fallback to 4.
+|||||  - `Invoke-ParallelElevation` default `MaxThreads` now uses `Get-OptimalThreadCount`.
+|||||  - `Get-NonSystemProcessesParallel` default `MaxThreads` now uses `Get-OptimalThreadCount`; `ChunkSize` is dynamically calculated as `max(10, ceil(50 / CPU count))` so smaller machines get larger batches and larger machines get smaller batches for better parallelism.
+|||||  - `Invoke-ExistingProcessElevation` log message now reports the actual detected CPU count and the number of threads being spawned.
+|||||  - Monitoring loop periodic elevation also inherits the dynamic thread count instead of the hardcoded 4.
 
 ||---
 |---

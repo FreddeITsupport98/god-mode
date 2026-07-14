@@ -3500,11 +3500,23 @@ function Stop-NonSystemInstances {
     } catch { }
 }
 
+function Get-OptimalThreadCount {
+    try {
+        $count = [System.Environment]::ProcessorCount
+        if ($count -gt 0) { return $count }
+    } catch {}
+    try {
+        $count = [int]$env:NUMBER_OF_PROCESSORS
+        if ($count -gt 0) { return $count }
+    } catch {}
+    return 4
+}
+
 function Invoke-ParallelElevation {
     param(
         [array]$Targets,
         [int]$systemPid,
-        [int]$MaxThreads = 8,
+        [int]$MaxThreads = (Get-OptimalThreadCount),
         [switch]$HideWindow
     )
     $total = $Targets.Count
@@ -3655,8 +3667,8 @@ function Get-NonSystemProcessesParallel {
         [array]$allProcs,
         [string[]]$CriticalProcs,
         [string[]]$systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0"),
-        [int]$MaxThreads = 8,
-        [int]$ChunkSize = 25
+        [int]$MaxThreads = (Get-OptimalThreadCount),
+        [int]$ChunkSize = ([math]::Max(10, [math]::Ceiling(50 / (Get-OptimalThreadCount))))
     )
     # Fast filter: exclude by PID, path, and critical name (no owner check)
     $candidates = $allProcs | Where-Object {
@@ -3820,7 +3832,7 @@ function Invoke-ExistingProcessElevation {
         $allProcs = Get-WmiObject Win32_Process -ErrorAction SilentlyContinue
     }
     # Parallel ownership scan: check all processes in threaded batches to find non-SYSTEM targets
-    $targetProcs = Get-NonSystemProcessesParallel -allProcs $allProcs -CriticalProcs $CriticalProcs -systemAccounts $systemAccounts -MaxThreads 8 -ChunkSize 25
+    $targetProcs = Get-NonSystemProcessesParallel -allProcs $allProcs -CriticalProcs $CriticalProcs -systemAccounts $systemAccounts
     $total = $targetProcs.Count
     $count = 0
     $skipped = 0
@@ -3839,9 +3851,10 @@ function Invoke-ExistingProcessElevation {
     }
 
     $uniqueTotal = $uniqueTargets.Count
-    Write-Log -Message "Parallel elevation: $uniqueTotal unique process names after deduplication. Spawning $([math]::Min(8, $uniqueTotal)) threads..." -Type "INFO" -Color Yellow
+    $threadCount = Get-OptimalThreadCount
+    Write-Log -Message "Parallel elevation: $uniqueTotal unique process names after deduplication. Spawning $([math]::Min($threadCount, $uniqueTotal)) threads (CPU count: $threadCount)..." -Type "INFO" -Color Yellow
 
-    $results = Invoke-ParallelElevation -Targets $uniqueTargets -systemPid $systemPid -MaxThreads 8
+    $results = Invoke-ParallelElevation -Targets $uniqueTargets -systemPid $systemPid
 
     $successCount = ($results | Where-Object { $_.Result -eq "SUCCESS" }).Count
     $failCount = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
@@ -3989,7 +4002,7 @@ function Start-Monitoring {
                     [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
                     $systemPid = Find-SystemProcessCandidate
                     if ($systemPid -ne 0) {
-                        $results = Invoke-ParallelElevation -Targets $dueProcesses -systemPid $systemPid -MaxThreads 4 -HideWindow
+                        $results = Invoke-ParallelElevation -Targets $dueProcesses -systemPid $systemPid -HideWindow
                         $successCount = ($results | Where-Object { $_.Result -eq "SUCCESS" }).Count
                         $failCount = ($results | Where-Object { $_.Result -eq "FAIL" }).Count
                         $skipCount = ($results | Where-Object { $_.Result -eq "SKIP" }).Count
