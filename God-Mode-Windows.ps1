@@ -4860,6 +4860,14 @@ function Show-GodModeStatus {
         Write-Host "  Task Manager            : UNBLOCKED" -ForegroundColor Green
     }
 
+    # Compiler / build-tool availability
+    $CompilerStatus = Get-CompilerStatus
+    if ($CompilerStatus) {
+        Write-Host "  C Compiler              : AVAILABLE ($CompilerStatus)" -ForegroundColor Green
+    } else {
+        Write-Host "  C Compiler              : NOT FOUND (Option 7 auto-build will fail)" -ForegroundColor Yellow
+    }
+
     # Process hook (IFEO proxy + explorer DLL) status
     $HookIfeo = $false
     $HookDll = $false
@@ -5259,6 +5267,15 @@ function Show-GodModeStatus {
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 }
 
+function Get-CompilerStatus {
+    $compilers = @()
+    if (Get-Command "cl" -ErrorAction SilentlyContinue) { $compilers += "MSVC" }
+    if (Get-Command "x86_64-w64-mingw32-gcc" -ErrorAction SilentlyContinue) { $compilers += "MinGW-cross" }
+    if (Get-Command "gcc" -ErrorAction SilentlyContinue) { $compilers += "MinGW/MSYS2" }
+    if ($compilers.Count -eq 0) { return $null }
+    return ($compilers -join ", ")
+}
+
 function Get-QuickDNSLockStatus {
     $Adapters = Get-NetAdapter -IncludeHidden:$false -ErrorAction SilentlyContinue
     if (-not $Adapters) { $Adapters = Get-NetAdapter -ErrorAction SilentlyContinue }
@@ -5471,6 +5488,9 @@ do {
     if ($QuickIntegrity -eq $false) { $QuickIntColor = "Red"; $QuickIntText = "TAMPERED" }
     $QuickAdmin = if (Test-BuiltInAdmin) { "YES" } else { "NO" }
     $QuickAdminColor = if (Test-BuiltInAdmin) { "Green" } else { "Yellow" }
+    $QuickCompiler = Get-CompilerStatus
+    $QuickCompilerText = if ($QuickCompiler) { "READY ($QuickCompiler)" } else { "NOT FOUND" }
+    $QuickCompilerColor = if ($QuickCompiler) { "Green" } else { "Yellow" }
     Write-Host "  God Mode: " -NoNewline -ForegroundColor DarkGray
     Write-Host $QuickGodMode -NoNewline -ForegroundColor $QuickGodModeColor
     Write-Host "  |  DNS Lock: " -NoNewline -ForegroundColor DarkGray
@@ -5478,7 +5498,9 @@ do {
     Write-Host "  |  Integrity: " -NoNewline -ForegroundColor DarkGray
     Write-Host $QuickIntText -NoNewline -ForegroundColor $QuickIntColor
     Write-Host "  |  Built-in Admin: " -NoNewline -ForegroundColor DarkGray
-    Write-Host $QuickAdmin -ForegroundColor $QuickAdminColor
+    Write-Host $QuickAdmin -NoNewline -ForegroundColor $QuickAdminColor
+    Write-Host "  |  C Compiler: " -NoNewline -ForegroundColor DarkGray
+    Write-Host $QuickCompilerText -ForegroundColor $QuickCompilerColor
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
     Write-Host "`n-----------------------------------------------------" -ForegroundColor DarkGray
