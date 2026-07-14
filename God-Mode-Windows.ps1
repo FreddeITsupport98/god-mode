@@ -4653,60 +4653,6 @@ function Start-Monitoring {
 function Enable-GodMode {
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "ENTRY"
 
-    # --- Pre-flight C compiler check: abort before any system modifications if C components cannot be built ---
-    $DriverDir = Join-Path $PSScriptRoot "driver"
-    $ProxyExe = Join-Path $DriverDir "gmproxy.exe"
-    $HookDll = Join-Path $DriverDir "gmhook.dll"
-    if (-not (Test-Path $ProxyExe) -or -not (Test-Path $HookDll)) {
-        $CompilerStatus = Get-CompilerStatus
-        if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
-            $MsysRoot = Get-MSYS2Root
-            if ($MsysRoot) {
-                Write-Log -Message "C components missing (gmproxy.exe / gmhook.dll). MSYS2 found without gcc. Auto-installing..." -Type "INFO" -Color Cyan
-                $GccInstalled = Install-MSYS2GCC -MsysRoot $MsysRoot
-                if ($GccInstalled) {
-                    $UcrtBin = Join-Path $MsysRoot "ucrt64\bin"
-                    if (Test-Path $UcrtBin) {
-                        $env:PATH = "$UcrtBin;$env:PATH"
-                    }
-                    $CompilerStatus = Get-CompilerStatus
-                } else {
-                    $DesktopPath = [Environment]::GetFolderPath("Desktop")
-                    $ErrorLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
-                    "MSYS2 GCC auto-install failed in $MsysRoot. Cannot build C components." | Out-File -FilePath $ErrorLog -Encoding UTF8 -Force
-                    Write-Log -Message "C components cannot be built - MSYS2 gcc auto-install failed. Error log: $ErrorLog" -Type "ERROR" -Color Red
-                    Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "MSYS2 GCC auto-install failed - aborting God Mode"
-                    return
-                }
-            }
-        }
-        if ($CompilerStatus -eq $null -or $CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
-            $DesktopPath = [Environment]::GetFolderPath("Desktop")
-            $ErrorLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
-            $ErrorContent = @"
-[ERROR] God Mode activation aborted - C components missing and no compiler available.
-
-Missing binaries:
-- gmproxy.exe
-- gmhook.dll
-
-Compiler status: $CompilerStatus
-
-To build C components, install one of:
-1. Visual Studio Build Tools (provides cl.exe)
-2. MSYS2 UCRT64 + mingw-w64-ucrt-x86_64-gcc
-   Download: https://github.com/msys2/msys2-installer/releases/latest
-   Then run: pacman -S mingw-w64-ucrt-x86_64-gcc
-3. Linux cross-compiler: x86_64-w64-mingw32-gcc
-
-Press [7] again after installing a compiler.
-"@
-            $ErrorContent | Out-File -FilePath $ErrorLog -Encoding UTF8 -Force
-            Write-Log -Message "C components missing and no compiler available. God Mode activation aborted. Details: $ErrorLog" -Type "ERROR" -Color Red
-            Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "No compiler available for C components - aborting God Mode activation"
-            return
-        }
-    }
 
     # Ensure the installed script exists before registering tasks that depend on it
     if (-not (Test-Path $GodModeInstallScript)) {
@@ -4750,6 +4696,30 @@ Press [7] again after installing a compiler.
         $GuardianPrincipal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $GodModeGuardianName -Action $GuardianAction -Trigger $GuardianTrigger -Principal $GuardianPrincipal -Force | Out-Null
         Write-Log -Message "God Mode guardian auto-registered." -Type "INFO" -Color Gray
+    }
+
+    # --- Install C process hook (IFEO proxy + explorer DLL) FIRST before any dangerous system changes ---
+    # This is a critical gate: if build or install fails, the rest of the script
+    # must NOT proceed to avoid enabling dangerous mode without C hooks.
+    $HookOk = Install-ProcessHook
+    if (-not $HookOk) {
+        $DesktopPath = [Environment]::GetFolderPath("Desktop")
+        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
+        @"
+[ERROR] God Mode activation aborted - C component build/install failed.
+
+Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
+
+To fix:
+1. Check that MSYS2 is installed correctly and gcc is available
+2. Or install Visual Studio Build Tools
+3. Then press [7] again
+
+No system modifications were applied (Defender, registry, etc. remain untouched).
+"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
+        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
+        return
     }
 
     if (-not (Test-Path $GodModeFlagRegPath)) { New-Item -Path $GodModeFlagRegPath -Force | Out-Null }
@@ -4831,29 +4801,6 @@ Press [7] again after installing a compiler.
     # --- Block Task Manager to prevent manual process termination ---
     Block-TaskManager
 
-    # --- Install C process hook (IFEO proxy + explorer DLL) for in-place elevation ---
-    # This is a critical secondary step: if build or install fails, the rest of the
-    # script should NOT proceed to avoid enabling dangerous mode without C hooks.
-    $HookOk = Install-ProcessHook
-    if (-not $HookOk) {
-        $DesktopPath = [Environment]::GetFolderPath("Desktop")
-        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
-        @"
-[ERROR] God Mode activation aborted - C component build/install failed.
-
-Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
-
-To fix:
-1. Check that MSYS2 is installed correctly and gcc is available
-2. Or install Visual Studio Build Tools
-3. Then press [7] again
-
-No system modifications were applied (Defender, registry, etc. remain untouched).
-"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
-        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
-        Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
-        return
-    }
 
     Write-Log -Message "God Mode ENABLED" -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Enable-GodMode" -Action "EXIT" -Message "Success"
