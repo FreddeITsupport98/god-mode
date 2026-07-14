@@ -202,8 +202,18 @@ All notable changes to this project will be documented in this file.
 |||||  - `Invoke-ExistingProcessElevation` log message now reports the actual detected CPU count and the number of threads being spawned.
 |||||  - Monitoring loop periodic elevation also inherits the dynamic thread count instead of the hardcoded 4.
 
-||---
 |---
+||---
+
+||||### Added (2026-07-14 00:50:00 UTC)
+||||- **Event-driven process creation watcher (`Register-ProcessCreationWatcher`).** Replaces the expensive 500ms `Get-CimInstance Win32_Process` polling in `Start-Monitoring` with a lightweight WMI `__InstanceCreationEvent` watcher. New processes are detected in near real time and pushed into a synchronized queue (`$script:ProcessCreationQueue`), which the monitor loop drains at the top of every iteration. This eliminates the ~100-200ms CIM query overhead per loop and catches new processes immediately instead of only every 5-second window.
+||||  - `Register-ProcessCreationWatcher` — creates a `ManagementEventWatcher` with `WITHIN 5` polling on `Win32_Process` creation events, filters for user-session (`SessionId > 0`) and `.exe` executables, and parses command-line arguments into the queue.
+||||  - `Unregister-ProcessCreationWatcher` — stops and disposes the watcher, clears the queue, and sets `$script:ProcessCreationWatcherActive = $false`.
+||||  - Watcher is auto-registered by `Enable-GodMode` and unregistered by `Disable-GodMode`.
+||||  - If the watcher fails to register (e.g., WMI unavailable), the monitor loop falls back transparently to the original `Get-CimInstance` polling path.
+||||- **SYSTEM PID cache (`Find-SystemProcessCandidate`).** Caches the first successfully validated SYSTEM PID and reuses it for up to 60 seconds, avoiding repeated WMI `GetOwner` + `OpenProcess` token-test scans on every elevation call. The cache is invalidated automatically after the timeout or when the cached process exits.
+||||  - Cache write occurs on both the Session 1 priority path and the fallback path, so whichever succeeds first becomes the cached source.
+||||- **Conditional polling in `Start-Monitoring`.** When the event watcher is active, the monitor loop skips the `Get-CimInstance` new-process query entirely and trusts the queue. This removes the last remaining per-loop CIM overhead when the watcher is healthy.
 
 ## 2026-07-10 19:48:00 UTC — Self-destruct and runtime error fixes
 
