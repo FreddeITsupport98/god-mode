@@ -1423,6 +1423,18 @@ function Install-GodModePersistence {
     Copy-Item -Path $PSCommandPath -Destination $GodModeInstallScript -Force
     Write-Log -Message "Payload copied to $GodModeInstallScript." -Type "INFO" -Color Gray
 
+    # 1a. Copy driver folder (C sources) so scheduled tasks can build from the installed location
+    $DriverSource = Join-Path $PSScriptRoot "driver"
+    $DriverDest = Join-Path $GodModeInstallDir "driver"
+    if (Test-Path $DriverSource) {
+        try {
+            Copy-Item -Path $DriverSource -Destination $DriverDest -Recurse -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "Driver folder copied to $DriverDest." -Type "INFO" -Color Gray
+        } catch {
+            Write-DebugLog -FunctionName "Install-GodModePersistence" -Action "WARN" -Message "Driver folder copy failed: $_"
+        }
+    }
+
     # 2. Build wrapper
     $WrapperContent = "@echo off`r`nC:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" %*"
     $WrapperLocal = Join-Path $GodModeInstallDir "godmode.cmd"
@@ -3824,8 +3836,19 @@ function Install-ProcessHook {
             if ($copyOk) {
                 Write-Log -Message "gmproxy.exe installed to $destProxy" -Type "INFO" -Color Gray
             } else {
-                Write-Log -Message "gmproxy.exe copy failed (all methods). Skipping IFEO proxy install." -Type "WARN" -Color Yellow
-                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe not present at destination after copy attempts"
+                # SYSTEM fallback: hardened directory denies admin write, but SYSTEM has FullControl
+                try {
+                    $sysResult = Invoke-AsSystem -Command "cmd /c copy `"$ProxyExe`" `"$destProxy`" /Y"
+                    Start-Sleep -Milliseconds 100
+                    if ($sysResult.Success -and (Test-Path $destProxy)) { $copyOk = $true }
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Invoke-AsSystem copy gmproxy.exe result: $($sysResult.Success)"
+                } catch {
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Invoke-AsSystem copy gmproxy.exe failed: $_"
+                }
+                if (-not $copyOk) {
+                    Write-Log -Message "gmproxy.exe copy failed (all methods). Skipping IFEO proxy install." -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe not present at destination after all copy attempts"
+                }
             }
 
             # Register IFEO Debugger only if proxy actually exists at destination
@@ -3868,8 +3891,19 @@ function Install-ProcessHook {
             if ($copyOk) {
                 Write-Log -Message "gmhook.dll installed to $destHook" -Type "INFO" -Color Gray
             } else {
-                Write-Log -Message "gmhook.dll copy failed (all methods). Skipping DLL injection." -Type "WARN" -Color Yellow
-                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll not present at destination after copy attempts"
+                # SYSTEM fallback for hardened directory
+                try {
+                    $sysResult = Invoke-AsSystem -Command "cmd /c copy `"$HookDll`" `"$destHook`" /Y"
+                    Start-Sleep -Milliseconds 100
+                    if ($sysResult.Success -and (Test-Path $destHook)) { $copyOk = $true }
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Invoke-AsSystem copy gmhook.dll result: $($sysResult.Success)"
+                } catch {
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Invoke-AsSystem copy gmhook.dll failed: $_"
+                }
+                if (-not $copyOk) {
+                    Write-Log -Message "gmhook.dll copy failed (all methods). Skipping DLL injection." -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll not present at destination after all copy attempts"
+                }
             }
         }
 
