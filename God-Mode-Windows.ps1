@@ -32,7 +32,8 @@ param (
     [switch]$SystemDesktop,
     [switch]$InstallSystemDesktop,
     [switch]$UninstallSystemDesktop,
-    [switch]$DebugMode
+    [switch]$DebugMode,
+    [switch]$LaunchTaskMgrAsSystem
 )
 
 # ============================================================================
@@ -3516,10 +3517,28 @@ function Block-TaskManager {
         # Redirect taskmgr to a non-existent executable so it silently fails to launch
         Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\notaskmgr.exe" -Force -ErrorAction SilentlyContinue
 
-        # Also set the classic DisableTaskMgr policy
+    # Also set the classic DisableTaskMgr policy (for non-admin fallback block)
         $PolicyPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
         if (-not (Test-Path $PolicyPath)) { New-Item -Path $PolicyPath -Force | Out-Null }
         Set-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -Value 1 -Force -ErrorAction SilentlyContinue
+
+        # Create proxy launcher script and copy of taskmgr for admin SYSTEM launch
+        $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
+        $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
+        Copy-Item -Path "C:\Windows\System32\taskmgr.exe" -Destination $TaskMgrCopy -Force -ErrorAction SilentlyContinue
+
+        $ProxyScript = @'
+# Task Manager SYSTEM Proxy -- admin-only, launches as SYSTEM
+param([string]$OriginalPath = "")
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+if (-not $isAdmin) { exit }
+$main = "C:\ProgramData\GodMode\GodMode.ps1"
+if (Test-Path $main) { & $main -LaunchTaskMgrAsSystem } else { Start-Process "C:\ProgramData\GodMode\taskmgr_real.exe" }
+'@
+        Set-Content -Path $ProxyPath -Value $ProxyScript -Encoding UTF8 -Force
+
+        # Set IFEO Debugger to PowerShell proxy (hidden window)
+        Set-ItemProperty -Path $IfeoPath -Name "Debugger" -Value "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$ProxyPath`"" -Force -ErrorAction SilentlyContinue
 
         # Harden the IFEO registry key against tampering
         $RegKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey("SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe", [Microsoft.Win32.RegistryKeyPermissionCheck]::ReadWriteSubTree, [System.Security.AccessControl.RegistryRights]::ChangePermissions)
@@ -3532,7 +3551,7 @@ function Block-TaskManager {
             $RegKey.SetAccessControl($Acl)
             $RegKey.Close()
         }
-        Write-Log -Message "Task Manager blocked via IFEO and policy." -Type "INFO" -Color Gray
+        Write-Log -Message "Task Manager blocked for non-admins; admin launch redirects to SYSTEM proxy." -Type "INFO" -Color Gray
     } catch {
         Write-Log -Message "Task Manager block failed: $_" -Type "WARN" -Color Yellow
     }
@@ -3558,6 +3577,13 @@ function Unblock-TaskManager {
         if (Test-Path $PolicyPath) {
             Remove-ItemProperty -Path $PolicyPath -Name "DisableTaskMgr" -ErrorAction SilentlyContinue
         }
+
+        # Remove proxy launcher and taskmgr copy
+        $ProxyPath = Join-Path $GodModeInstallDir "taskmgr_proxy.ps1"
+        $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
+        if (Test-Path $ProxyPath) { Remove-Item -Path $ProxyPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $TaskMgrCopy) { Remove-Item -Path $TaskMgrCopy -Force -ErrorAction SilentlyContinue }
+
         Write-Log -Message "Task Manager unblocked." -Type "INFO" -Color Gray
     } catch {
         Write-Log -Message "Task Manager unblock failed: $_" -Type "WARN" -Color Yellow
@@ -4989,6 +5015,26 @@ if ($ExportElevationDiagnostics) {
 }
 if ($ElevateAllProcesses) {
     Invoke-ExistingProcessElevation
+    Exit
+}
+if ($LaunchTaskMgrAsSystem) {
+    Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "ENTRY"
+    Enable-ElevationPrivileges
+    $systemPid = Find-SystemProcessCandidate
+    $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
+    if ($systemPid -ne 0 -and (Test-Path $TaskMgrCopy)) {
+        $result = [TokenOps]::CreateProcessAsSystem($systemPid, $TaskMgrCopy, $TaskMgrCopy, $false)
+        if ($result -eq 0) {
+            Write-Log -Message "Task Manager launched as SYSTEM." -Type "INFO" -Color Green
+        } else {
+            Write-Log -Message "Task Manager SYSTEM launch failed (error $result). Falling back to normal launch." -Type "WARN" -Color Yellow
+            Start-Process $TaskMgrCopy
+        }
+    } else {
+        Write-Log -Message "No SYSTEM token or taskmgr copy available for SYSTEM launch." -Type "WARN" -Color Yellow
+        if (Test-Path $TaskMgrCopy) { Start-Process $TaskMgrCopy }
+    }
+    Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "EXIT"
     Exit
 }
 if ($SystemDesktop) {
