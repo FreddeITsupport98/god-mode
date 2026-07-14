@@ -3877,11 +3877,11 @@ function Install-ProcessHook {
         $success = (Test-Path $destProxy)
         Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "destProxy exists=$success, destHook exists=$(Test-Path $destHook)"
 
-            # Inject into explorer.exe using a simple PowerShell injector
-            $explorer = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($explorer) {
-                # Use reflective injection via Add-Type compiled inline
-                $InjectorType = @"
+        # Inject into explorer.exe using a simple PowerShell injector
+        $explorer = Get-Process -Name "explorer" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($explorer) {
+            # Use reflective injection via Add-Type compiled inline
+            $InjectorType = @"
 using System;
 using System.Runtime.InteropServices;
 public class GmInjector {
@@ -3931,23 +3931,22 @@ public class GmInjector {
     }
 }
 "@
-                try {
-                    if (-not ([System.Management.Automation.PSTypeName]'GmInjector').Type) {
-                        Add-Type -TypeDefinition $InjectorType -ErrorAction SilentlyContinue | Out-Null
-                    }
-                    $rc = [GmInjector]::Inject($explorer.Id, $destHook)
-                    if ($rc) {
-                        Write-Log -Message "gmhook.dll injected into explorer PID=$($explorer.Id)" -Type "INFO" -Color Green
-                    } else {
-                        Write-Log -Message "gmhook.dll injection into explorer failed (insufficient privileges or access denied)." -Type "WARN" -Color Yellow
-                    }
-                } catch {
-                    Write-Log -Message "GmInjector compilation/injection failed: $_" -Type "WARN" -Color Yellow
-                    Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "GmInjector failed: $_"
+            try {
+                if (-not ([System.Management.Automation.PSTypeName]'GmInjector').Type) {
+                    Add-Type -TypeDefinition $InjectorType -ErrorAction SilentlyContinue | Out-Null
                 }
-            } else {
-                Write-Log -Message "explorer.exe not found; skipping DLL injection." -Type "WARN" -Color Yellow
+                $rc = [GmInjector]::Inject($explorer.Id, $destHook)
+                if ($rc) {
+                    Write-Log -Message "gmhook.dll injected into explorer PID=$($explorer.Id)" -Type "INFO" -Color Green
+                } else {
+                    Write-Log -Message "gmhook.dll injection into explorer failed (insufficient privileges or access denied)." -Type "WARN" -Color Yellow
+                }
+            } catch {
+                Write-Log -Message "GmInjector compilation/injection failed: $_" -Type "WARN" -Color Yellow
+                Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "GmInjector failed: $_"
             }
+        } else {
+            Write-Log -Message "explorer.exe not found; skipping DLL injection." -Type "WARN" -Color Yellow
         }
     } catch {
         Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
