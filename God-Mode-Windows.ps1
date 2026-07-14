@@ -3696,9 +3696,25 @@ function Install-ProcessHook {
         $BuildScript = Join-Path $DriverDir "build.ps1"
         $BuildLog = Join-Path $env:TEMP "GodMode_DriverBuild.log"
 
-        # --- Auto-build if binaries are missing ---
+    # --- Auto-build if binaries are missing ---
         $NeedBuild = (-not (Test-Path $ProxyExe)) -or (-not (Test-Path $HookDll))
         if ($NeedBuild) {
+            # Auto-install MSYS2 GCC if MSYS2 is present but gcc is missing
+            $CompilerStatus = Get-CompilerStatus
+            if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+                $MsysRoot = Get-MSYS2Root
+                if ($MsysRoot) {
+                    $GccInstalled = Install-MSYS2GCC -MsysRoot $MsysRoot
+                    if ($GccInstalled) {
+                        # Refresh PATH to include newly installed gcc
+                        $UcrtBin = Join-Path $MsysRoot "ucrt64\bin"
+                        if (Test-Path $UcrtBin) {
+                            $env:PATH = "$UcrtBin;$env:PATH"
+                            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Added $UcrtBin to PATH after auto-install"
+                        }
+                    }
+                }
+            }
             if (Test-Path $BuildScript) {
                 Write-Log -Message "C components missing (gmproxy.exe or gmhook.dll). Running auto-build: $BuildScript" -Type "INFO" -Color Yellow
                 Write-DebugLog -FunctionName "Install-ProcessHook" -Action "INFO" -Message "Auto-build starting: $BuildScript"
@@ -4868,7 +4884,9 @@ function Show-GodModeStatus {
 
     # Compiler / build-tool availability
     $CompilerStatus = Get-CompilerStatus
-    if ($CompilerStatus) {
+    if ($CompilerStatus -eq "MSYS2-FOUND-NO-GCC") {
+        Write-Host "  C Compiler              : MSYS2 FOUND (auto-install available via option 7)" -ForegroundColor Yellow
+    } elseif ($CompilerStatus) {
         Write-Host "  C Compiler              : AVAILABLE ($CompilerStatus)" -ForegroundColor Green
     } else {
         Write-Host "  C Compiler              : NOT FOUND (Option 7 auto-build will fail)" -ForegroundColor Yellow
@@ -5273,7 +5291,16 @@ function Show-GodModeStatus {
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 }
 
+function Get-MSYS2Root {
+    try {
+        $msysDir = Get-ChildItem -Path "C:\" -Directory -Recurse -Depth 1 -ErrorAction SilentlyContinue | Where-Object { $_.Name -eq "msys64" } | Select-Object -First 1
+        if ($msysDir) { return $msysDir.FullName }
+    } catch {}
+    return $null
+}
+
 function Get-MSYS2Path {
+    # Hardcoded common paths (fast check)
     $MsysCandidates = @(
         "C:\msys64\ucrt64\bin",
         "C:\msys64\mingw64\bin",
@@ -5281,6 +5308,14 @@ function Get-MSYS2Path {
     )
     foreach ($p in $MsysCandidates) {
         if (Test-Path (Join-Path $p "gcc.exe")) { return $p }
+    }
+    # Fallback: scan inside discovered MSYS2 root
+    $root = Get-MSYS2Root
+    if ($root) {
+        try {
+            $gcc = Get-ChildItem -Path $root -Filter "gcc.exe" -Recurse -Depth 3 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($gcc) { return $gcc.DirectoryName }
+        } catch {}
     }
     return $null
 }
@@ -5294,8 +5329,52 @@ function Get-CompilerStatus {
         $msysPath = Get-MSYS2Path
         if ($msysPath) { $compilers += "MSYS2 ($msysPath)" }
     }
-    if ($compilers.Count -eq 0) { return $null }
+    if ($compilers.Count -eq 0) {
+        # Check if MSYS2 is installed but gcc is missing
+        if (Get-MSYS2Root) {
+            return "MSYS2-FOUND-NO-GCC"
+        }
+        return $null
+    }
     return ($compilers -join ", ")
+}
+
+function Install-MSYS2GCC {
+    param([string]$MsysRoot)
+    $bashPaths = @(
+        (Join-Path $MsysRoot "usr\bin\bash.exe"),
+        (Join-Path $MsysRoot "msys2.exe")
+    )
+    $bash = $null
+    foreach ($p in $bashPaths) {
+        if (Test-Path $p) { $bash = $p; break }
+    }
+    if (-not $bash) {
+        Write-Log -Message "MSYS2 bash not found in $MsysRoot. Cannot auto-install gcc." -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Install-MSYS2GCC" -Action "ERROR" -Message "bash.exe not found in $MsysRoot"
+        return $false
+    }
+    
+    Write-Log -Message "Auto-installing MinGW-w64 GCC via MSYS2 ($MsysRoot). This may take 2-5 minutes..." -Type "INFO" -Color Cyan
+    Write-DebugLog -FunctionName "Install-MSYS2GCC" -Action "INFO" -Message "Starting pacman install in $MsysRoot"
+    try {
+        $env:MSYSTEM = "UCRT64"
+        $env:MSYS2_PATH_TYPE = "inherit"
+        $process = Start-Process -FilePath $bash -ArgumentList "-lc", "pacman -S mingw-w64-ucrt-x86_64-gcc --noconfirm" -WorkingDirectory $MsysRoot -Wait -PassThru -NoNewWindow
+        if ($process.ExitCode -eq 0) {
+            Write-Log -Message "GCC auto-install completed successfully." -Type "SUCCESS" -Color Green
+            Write-DebugLog -FunctionName "Install-MSYS2GCC" -Action "SUCCESS" -Message "pacman install completed"
+            return $true
+        } else {
+            Write-Log -Message "GCC auto-install failed with exit code $($process.ExitCode)." -Type "ERROR" -Color Red
+            Write-DebugLog -FunctionName "Install-MSYS2GCC" -Action "ERROR" -Message "pacman exit code $($process.ExitCode)"
+            return $false
+        }
+    } catch {
+        Write-Log -Message "GCC auto-install exception: $_" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Install-MSYS2GCC" -Action "ERROR" -Message "Exception: $_"
+        return $false
+    }
 }
 
 function Get-QuickDNSLockStatus {
@@ -5511,8 +5590,16 @@ do {
     $QuickAdmin = if (Test-BuiltInAdmin) { "YES" } else { "NO" }
     $QuickAdminColor = if (Test-BuiltInAdmin) { "Green" } else { "Yellow" }
     $QuickCompiler = Get-CompilerStatus
-    $QuickCompilerText = if ($QuickCompiler) { "READY ($QuickCompiler)" } else { "NOT FOUND" }
-    $QuickCompilerColor = if ($QuickCompiler) { "Green" } else { "Yellow" }
+    if ($QuickCompiler -eq "MSYS2-FOUND-NO-GCC") {
+        $QuickCompilerText = "MSYS2 FOUND (gcc missing)"
+        $QuickCompilerColor = "Yellow"
+    } elseif ($QuickCompiler) {
+        $QuickCompilerText = "READY ($QuickCompiler)"
+        $QuickCompilerColor = "Green"
+    } else {
+        $QuickCompilerText = "NOT FOUND"
+        $QuickCompilerColor = "Yellow"
+    }
     Write-Host "  God Mode: " -NoNewline -ForegroundColor DarkGray
     Write-Host $QuickGodMode -NoNewline -ForegroundColor $QuickGodModeColor
     Write-Host "  |  DNS Lock: " -NoNewline -ForegroundColor DarkGray
@@ -5523,6 +5610,9 @@ do {
     Write-Host $QuickAdmin -NoNewline -ForegroundColor $QuickAdminColor
     Write-Host "  |  C Compiler: " -NoNewline -ForegroundColor DarkGray
     Write-Host $QuickCompilerText -ForegroundColor $QuickCompilerColor
+    if ($QuickCompiler -eq "MSYS2-FOUND-NO-GCC") {
+        Write-Host "  [MSYS2 detected. Auto-install gcc will run when option 7 is pressed.]" -ForegroundColor Yellow
+    }
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
     Write-Host "`n-----------------------------------------------------" -ForegroundColor DarkGray
