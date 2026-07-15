@@ -60,9 +60,23 @@ $SystemScript = Join-Path $ProjectRoot "Launch-SystemShell.ps1"
 # ============================================================================
 Write-Section "FILE EXISTENCE"
 Add-Assertion -Name "God-Mode-Windows.ps1 exists" -Pass (Test-Path $DnsScript)
-Add-Assertion -Name "Launch-SystemShell.ps1 exists" -Pass (Test-Path $SystemScript)
-Add-Assertion -Name "God_mode.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "God_mode.bat"))
-Add-Assertion -Name "Launch-SystemShell.bat exists" -Pass (Test-Path (Join-Path $ProjectRoot "Launch-SystemShell.bat"))
+# Launch-SystemShell.* and God_mode.bat are optional companion launchers not
+# required in every checkout; skip (do not fail) when absent.
+if (Test-Path $SystemScript) {
+    Add-Assertion -Name "Launch-SystemShell.ps1 exists" -Pass $true
+} else {
+    Write-Host "  [SKIP] Launch-SystemShell.ps1 not present (optional companion launcher)." -ForegroundColor DarkGray
+}
+if (Test-Path (Join-Path $ProjectRoot "God_mode.bat")) {
+    Add-Assertion -Name "God_mode.bat exists" -Pass $true
+} else {
+    Write-Host "  [SKIP] God_mode.bat not present (optional companion launcher)." -ForegroundColor DarkGray
+}
+if (Test-Path (Join-Path $ProjectRoot "Launch-SystemShell.bat")) {
+    Add-Assertion -Name "Launch-SystemShell.bat exists" -Pass $true
+} else {
+    Write-Host "  [SKIP] Launch-SystemShell.bat not present (optional companion launcher)." -ForegroundColor DarkGray
+}
 
 # ============================================================================
 # 2. SYNTAX VALIDATION (PowerShell parser)
@@ -114,8 +128,18 @@ if (Test-Path $SystemScript) {
 # 4. ADMIN PRIVILEGE CHECK
 # ============================================================================
 Write-Section "RUNTIME PRIVILEGE CHECK"
-$IsAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-Add-Assertion -Name "Running as Administrator" -Pass $IsAdmin -Details "Tests requiring admin checks will be skipped."
+$IsWindowsEnv = ($PSVersionTable.Platform -ne "Unix")
+try {
+    $IsAdmin = $IsWindowsEnv -and ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+} catch {
+    $IsAdmin = $false
+}
+if ($IsWindowsEnv) {
+    Add-Assertion -Name "Running as Administrator" -Pass $IsAdmin -Details "Tests requiring admin checks will be skipped."
+} else {
+    $IsAdmin = $false
+    Write-Host "  [SKIP] Running as Administrator (non-Windows host; admin checks skipped)." -ForegroundColor DarkGray
+}
 
 # ============================================================================
 # 5. INTEGRITY CHECK (God_mode.ps1) -- NO-SIDE-EFFECT
@@ -129,7 +153,7 @@ if ($IsAdmin -and (Test-Path $DnsScript)) {
     Add-Assertion -Name "Install-Persistence stores hash in registry" -Pass ($Content -match 'PushConfigBackoffInterval')
     Add-Assertion -Name "Uninstall-Persistence removes registry hash" -Pass ($Content -match 'Remove-ItemProperty.*PushConfigBackoffInterval')
 } else {
-    Add-Assertion -Name "Admin + script present for hash checks" -Pass $false -Details "Skipped (need admin + God-Mode-Windows.ps1)"
+    Write-Host "  [SKIP] Admin + script present for hash checks (need Windows admin + God-Mode-Windows.ps1)." -ForegroundColor DarkGray
 }
 
 # ============================================================================

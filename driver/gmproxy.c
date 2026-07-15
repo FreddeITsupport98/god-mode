@@ -144,6 +144,13 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
+    /* Reject over-long target paths up front: several stack buffers below are
+       MAX_PATH wide and wcscpy/swprintf would otherwise overflow them. */
+    if (wcslen(argv[1]) >= MAX_PATH) {
+        fwprintf(stderr, L"[GM-PROXY] ERROR: target path too long (>= MAX_PATH).\n");
+        return 1;
+    }
+
     EnablePrivilege(L"SeDebugPrivilege");
     EnablePrivilege(L"SeImpersonatePrivilege");
     EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
@@ -252,14 +259,21 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     BOOL ok = FALSE;
-    if (cpwt) {
-        ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+#ifdef _MSC_VER
+    __try {
+#endif
+        if (cpwt) {
+            ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        }
+        /* Fallback: CreateProcessAsUserW */
+        if (!ok) {
+            ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        }
+#ifdef _MSC_VER
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        ok = FALSE;
     }
-
-    // Fallback: CreateProcessAsUser
-    if (!ok) {
-        ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
-    }
+#endif
 
     // Best-effort cleanup of the hardlink/copy (may fail if process is still starting)
     DeleteFileW(hardlinkPath);

@@ -2880,9 +2880,33 @@ function Disable-ELAM {
 # --- Helper: Disable Security Auditing / Clear Logs ---
 function Disable-SecurityAuditing {
     try {
-        # Boot-critical services (EventLog, CryptSvc) are NOT stopped to avoid boot hangs
-        $Channels = wevtutil el 2>$null
-        if ($Channels) { $Channels | ForEach-Object { wevtutil cl "$_" 2>$null | Out-Null } }
+        # Boot-critical services (EventLog, CryptSvc) are NOT stopped to avoid boot hangs.
+        # NOTE: a CLR-level access violation inside CreateProcess (e.g. from the gmhook
+        # CreateProcessWithTokenW reroute) is NOT catchable here -- that is fixed in
+        # gmhook.c. This try/catch only keeps wevtutil / log-clearing failures from
+        # aborting the rest of Enable-DangerousMode.
+        $Channels = $null
+        try {
+            $Channels = wevtutil el 2>$null
+        } catch {
+            Write-Log -Message "wevtutil el failed (event log enumeration unavailable): $_" -Type "WARN" -Color Yellow
+        }
+        if ($Channels) {
+            # Normalize to a line array, skip empties, and clear per-channel so one bad
+            # channel cannot abort the whole sequence (each wevtutil cl is its own process).
+            $ChannelList = @($Channels | Where-Object { $_ -and $_.Trim().Length -gt 0 })
+            $Cleared = 0
+            $Failed = 0
+            foreach ($ch in $ChannelList) {
+                try {
+                    & wevtutil cl "$ch" 2>$null | Out-Null
+                    $Cleared++
+                } catch {
+                    $Failed++
+                }
+            }
+            Write-Log -Message "Event logs cleared: $Cleared channel(s) cleared, $Failed failed." -Type "INFO" -Color Gray
+        }
         Get-ChildItem "HKLM:\SYSTEM\CurrentControlSet\Control\WMI\AutoLogger" -ErrorAction SilentlyContinue | ForEach-Object {
             Set-ItemProperty -Path $_.PSPath -Name "Start" -Value 0 -Force -ErrorAction SilentlyContinue
         }

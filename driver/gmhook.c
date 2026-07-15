@@ -188,6 +188,55 @@ static BOOL IsCriticalProcess(const wchar_t* baseName) {
     return FALSE;
 }
 
+/* Attempt to launch the child directly as SYSTEM via CreateProcessWithTokenW.
+   Returns TRUE on success, FALSE on failure (caller falls back to the real
+   CreateProcessW). Isolated into its own function so an MSVC __try/__except
+   guard around the call can convert any fault into a plain FALSE instead of
+   crashing the host process (the 0xC0000005 seen after "Defender processes
+   terminated."). The deterministic checks below are the actual fix and work on
+   every toolchain; the SEH guard is defense-in-depth on MSVC builds. */
+static BOOL TryCreateProcessWithSystemToken(
+    CreateProcessWithTokenW_t pCpwt,
+    LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
+    DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
+    LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
+{
+    /* CreateProcessWithTokenW cannot consume an EXTENDED_STARTUPINFO (it has no
+       attribute-list support), needs a non-NULL PROCESS_INFORMATION, and needs
+       the stolen SYSTEM token. */
+    if (!pCpwt || !gSystemToken || !lpProcessInformation) return FALSE;
+    if (dwCreationFlags & 0x00080000) return FALSE; /* EXTENDED_STARTUPINFO_PRESENT */
+
+    /* Build a PLAIN STARTUPINFOW copy. If the caller passed a larger STARTUPINFOEX
+       (cb > sizeof(STARTUPINFOW)) we must NOT hand our truncated local to
+       CreateProcessWithTokenW: the kernel would read the lpAttributeList pointer
+       at offset sizeof(STARTUPINFOW) -- past this stack variable -- and
+       dereference garbage, causing STATUS_ACCESS_VIOLATION (0xC0000005).
+       Fall back to the real CreateProcessW instead, which handles STARTUPINFOEX. */
+    STARTUPINFOW siCopy = {0};
+    LPSTARTUPINFOW pSi;
+    if (lpStartupInfo) {
+        if (lpStartupInfo->cb > sizeof(STARTUPINFOW)) return FALSE; /* extended SI */
+        if (lpStartupInfo->cb == sizeof(STARTUPINFOW)) {
+            siCopy = *lpStartupInfo;
+        } else if (lpStartupInfo->cb > 0) {
+            memcpy(&siCopy, lpStartupInfo, lpStartupInfo->cb);
+        }
+        /* Clamp cb to the real size of our local STARTUPINFOW so the kernel
+           never reads past it as a STARTUPINFOEX. */
+        siCopy.cb = sizeof(siCopy);
+        if (!siCopy.lpDesktop) siCopy.lpDesktop = L"Winsta0\\Default";
+        pSi = &siCopy;
+    } else {
+        siCopy.cb = sizeof(siCopy);
+        siCopy.lpDesktop = L"Winsta0\\Default";
+        pSi = &siCopy;
+    }
+
+    return pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
+        dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi, lpProcessInformation);
+}
+
 static BOOL WINAPI HookCreateProcessW(
     LPCWSTR lpApplicationName,
     LPWSTR lpCommandLine,
@@ -295,40 +344,34 @@ static BOOL WINAPI HookCreateProcessW(
         }
     }
 
-    /* Ensure CreateProcessWithTokenW is resolved (advapi32 may not be loaded at DllMain time). */
+    /* Try to launch the child "born as SYSTEM" via CreateProcessWithTokenW. The
+       helper validates the STARTUPINFO shape so we never pass a truncated /
+       extended structure that would make CreateProcessWithTokenW read past our
+       stack — the exact cause of the 0xC0000005 after "Defender processes
+       terminated.". */
     CreateProcessWithTokenW_t pCpwt = ResolveCreateProcessWithTokenW();
     if (pCpwt && pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
-        /* CreateProcessWithTokenW requires lpDesktop to be specified for cross-session
-           tokens. If the caller passed NULL, we must copy STARTUPINFO and set it. */
-        STARTUPINFOW siCopy = {0};
-        LPSTARTUPINFOW pSi;
-        if (lpStartupInfo) {
-            if (lpStartupInfo->cb >= sizeof(STARTUPINFOW)) {
-                siCopy = *lpStartupInfo;
-            } else {
-                memcpy(&siCopy, lpStartupInfo, lpStartupInfo->cb);
-            }
-            if (!siCopy.lpDesktop) siCopy.lpDesktop = L"Winsta0\\Default";
-            pSi = &siCopy;
-        } else {
-            siCopy.cb = sizeof(siCopy);
-            siCopy.lpDesktop = L"Winsta0\\Default";
-            pSi = &siCopy;
-        }
-
-        /* CreateProcessWithTokenW does not support EXTENDED_STARTUPINFO_PRESENT.
-           If the caller used it, fall back to the original path. */
-        if (!(dwCreationFlags & 0x00080000)) { /* EXTENDED_STARTUPINFO_PRESENT = 0x00080000 */
-            BOOL ret = pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
-                dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi,
+        BOOL tokOk = FALSE;
+#ifdef _MSC_VER
+        __try {
+            tokOk = TryCreateProcessWithSystemToken(pCpwt, lpApplicationName, lpCommandLine,
+                dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
                 lpProcessInformation);
-            if (ret) {
-                InterlockedExchange(&inHook, 0);
-                return TRUE;
-            }
-            /* If CreateProcessWithTokenW fails, fall back so the app still launches
-               unelevated instead of vanishing — no flashing, no silent close. */
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            tokOk = FALSE;
         }
+#else
+        tokOk = TryCreateProcessWithSystemToken(pCpwt, lpApplicationName, lpCommandLine,
+            dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
+            lpProcessInformation);
+#endif
+        if (tokOk) {
+            InterlockedExchange(&inHook, 0);
+            return TRUE;
+        }
+        /* On failure (or a guarded fault) fall through to the real CreateProcessW
+           so the app still launches unelevated instead of vanishing — no flashing,
+           no silent close, and never a host crash. */
     }
 
     if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
@@ -347,6 +390,9 @@ static BOOL HookModuleIAT(HMODULE hMod) {
 
     PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hMod;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE) return FALSE;
+    /* Sanity-check e_lfanew so a stale / partially-unloaded module does not make
+       us dereference a bogus NT header (which would fault the install thread). */
+    if (dos->e_lfanew <= 0 || (DWORD)dos->e_lfanew < (DWORD)sizeof(IMAGE_DOS_HEADER)) return FALSE;
     PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((BYTE*)hMod + dos->e_lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE) return FALSE;
 
