@@ -61,7 +61,86 @@ static BOOL EnablePrivilege(LPCWSTR privName) {
     return ok && GetLastError() == 0;
 }
 
-static DWORD FindSystemProcessForToken(void) {
+/* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
+   lives in wtsapi32.dll; load it dynamically so no extra link dependency is added
+   and the build stays identical across MSVC/MinGW. Returns 1 (the typical
+   interactive session) if the API is missing or no console session is attached. */
+static DWORD GetActiveConsoleSessionId(void) {
+    HMODULE hWts = LoadLibraryW(L"wtsapi32.dll");
+    if (!hWts) return 1;
+    typedef DWORD (WINAPI *WTSGetActiveConsoleSessionId_t)(void);
+    WTSGetActiveConsoleSessionId_t pfn =
+        (WTSGetActiveConsoleSessionId_t)GetProcAddress(hWts, "WTSGetActiveConsoleSessionId");
+    if (!pfn) return 1;
+    DWORD sid = pfn();
+    return (sid == 0xFFFFFFFF) ? 1 : sid;
+}
+
+/* TRUE if pid runs in wantSid. ProcessIdToSessionId is exported by kernel32
+   (already linked), so no extra dependency is needed. */
+static BOOL IsProcessSessionId(DWORD pid, DWORD wantSid) {
+    DWORD sid = 0;
+    if (!ProcessIdToSessionId(pid, &sid)) return FALSE;
+    return sid == wantSid;
+}
+
+/* TRUE if pid can be opened with PROCESS_QUERY_LIMITED_INFORMATION AND its token
+   owner is Local System (S-1-5-18). PPL-protected SYSTEM processes (winlogon /
+   lsass on modern builds) fail the OpenProcess and return FALSE -- which is the
+   exact reason the old code silently fell back to a Session 0 SYSTEM token. */
+static BOOL IsOpenableSystemProcess(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return FALSE;
+    HANDLE hTok = NULL;
+    BOOL isSys = FALSE;
+    if (OpenProcessToken(hProcess, TOKEN_QUERY, &hTok)) {
+        BYTE userBuf[256]; DWORD len = 0;
+        if (GetTokenInformation(hTok, TokenUser, userBuf, sizeof(userBuf), &len)) {
+            TOKEN_USER* tu = (TOKEN_USER*)userBuf;
+            isSys = IsSystemSid(tu->User.Sid);
+        }
+        CloseHandle(hTok);
+    }
+    CloseHandle(hProcess);
+    return isSys;
+}
+
+/* Open pid, duplicate a primary SYSTEM token (TOKEN_ALL_ACCESS), and return it
+   (caller closes) or NULL. The source process + source token handles are closed
+   here, so the caller only owns the returned primary token. */
+static HANDLE StealSystemToken(DWORD pid) {
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hProcess) return NULL;
+    HANDLE hTok = NULL;
+    if (!OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hTok)) {
+        CloseHandle(hProcess);
+        return NULL;
+    }
+    BYTE userBuf[256]; DWORD len = 0;
+    BOOL isSys = FALSE;
+    if (GetTokenInformation(hTok, TokenUser, userBuf, sizeof(userBuf), &len)) {
+        TOKEN_USER* tu = (TOKEN_USER*)userBuf;
+        isSys = IsSystemSid(tu->User.Sid);
+    }
+    if (!isSys) { CloseHandle(hTok); CloseHandle(hProcess); return NULL; }
+    HANDLE hPrimary = NULL;
+    if (!DuplicateTokenEx(hTok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hPrimary)) {
+        CloseHandle(hTok);
+        CloseHandle(hProcess);
+        return NULL;
+    }
+    CloseHandle(hTok);
+    CloseHandle(hProcess);
+    return hPrimary;
+}
+
+/* Find a SYSTEM process whose token ALREADY lives in the active interactive
+   session (wantSession). Named interactive SYSTEM processes (winlogon / dwm /
+   fontdrvhost) are preferred and returned immediately; if none is openable
+   (PPL), the first openable SYSTEM process in wantSession is returned. This
+   guarantees the stolen token carries the right session so the child is born on
+   the interactive desktop instead of ownerless in Session 0. Returns a PID or 0. */
+static DWORD FindSystemProcessForToken(DWORD wantSession) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
 
@@ -69,67 +148,50 @@ static DWORD FindSystemProcessForToken(void) {
     pe.dwSize = sizeof(pe);
 
     const wchar_t* priorityNames[] = { L"winlogon.exe", L"dwm.exe", L"fontdrvhost.exe", NULL };
+    const DWORD selfPid = GetCurrentProcessId();
+    DWORD anyHit = 0;
 
-    // First pass: Session 1 interactive desktop SYSTEM processes
-    for (int i = 0; priorityNames[i] != NULL; i++) {
-        if (Process32FirstW(hSnap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, priorityNames[i]) == 0) {
-                    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-                    if (hProcess) {
-                        HANDLE hToken;
-                        if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-                            TOKEN_STATISTICS stats;
-                            DWORD len;
-                            if (GetTokenInformation(hToken, TokenStatistics, &stats, sizeof(stats), &len)) {
-                                // Check if SYSTEM SID (S-1-5-18) by checking authentication ID
-                                // S-1-5-18 has a well-known LUID; for simplicity we just check if token opened
-                                // and is a primary token type. Better: check TokenUser.
-                                BYTE userBuf[256];
-                                if (GetTokenInformation(hToken, TokenUser, userBuf, sizeof(userBuf), &len)) {
-                                    TOKEN_USER* tu = (TOKEN_USER*)userBuf;
-                                    if (IsSystemSid(tu->User.Sid)) {
-                                        CloseHandle(hToken);
-                                        CloseHandle(hProcess);
-                                        CloseHandle(hSnap);
-                                        return pe.th32ProcessID;
-                                    }
-                                }
-                            }
-                            CloseHandle(hToken);
-                        }
-                        CloseHandle(hProcess);
-                    }
-                }
-            } while (Process32NextW(hSnap, &pe));
-        }
-        // Reset snapshot for next iteration
-        CloseHandle(hSnap);
-        hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnap == INVALID_HANDLE_VALUE) return 0;
-    }
-
-    // Second pass: any accessible SYSTEM process
     if (Process32FirstW(hSnap, &pe)) {
         do {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-            if (hProcess) {
-                HANDLE hToken;
-                if (OpenProcessToken(hProcess, TOKEN_DUPLICATE | TOKEN_QUERY, &hToken)) {
-                    BYTE userBuf[256];
-                    DWORD len;
-                    if (GetTokenInformation(hToken, TokenUser, userBuf, sizeof(userBuf), &len)) {
-                        TOKEN_USER* tu = (TOKEN_USER*)userBuf;
-                        if (IsSystemSid(tu->User.Sid)) {
-                            CloseHandle(hToken);
-                            CloseHandle(hProcess);
-                            CloseHandle(hSnap);
-                            return pe.th32ProcessID;
-                        }
-                    }
-                    CloseHandle(hToken);
+            if (pe.th32ProcessID == selfPid) continue;
+            if (!IsProcessSessionId(pe.th32ProcessID, wantSession)) continue;
+            if (!IsOpenableSystemProcess(pe.th32ProcessID)) continue;
+            /* Named interactive SYSTEM process -> best candidate, return now. */
+            for (int i = 0; priorityNames[i] != NULL; i++) {
+                if (_wcsicmp(pe.szExeFile, priorityNames[i]) == 0) {
+                    CloseHandle(hSnap);
+                    return pe.th32ProcessID;
                 }
-                CloseHandle(hProcess);
+            }
+            /* Otherwise remember the first session-correct SYSTEM pid as a
+               fallback (covers the case where winlogon/dwm/fontdrvhost are all
+               PPL-protected but another session-1 SYSTEM process is openable). */
+            if (anyHit == 0) anyHit = pe.th32ProcessID;
+        } while (Process32NextW(hSnap, &pe));
+    }
+
+    CloseHandle(hSnap);
+    return anyHit; /* 0 if no session-correct SYSTEM process was openable */
+}
+
+/* Find ANY openable SYSTEM process regardless of session. Used to try
+   relocating a Session 0 SYSTEM token into the active session via
+   SetTokenInformation(TokenSessionId), which requires SeTcbPrivilege (only held
+   when gmproxy itself runs as SYSTEM). Returns a PID or 0. */
+static DWORD FindAnySystemProcessPid(void) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return 0;
+
+    PROCESSENTRY32W pe;
+    pe.dwSize = sizeof(pe);
+
+    const DWORD selfPid = GetCurrentProcessId();
+    if (Process32FirstW(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID == selfPid) continue;
+            if (IsOpenableSystemProcess(pe.th32ProcessID)) {
+                CloseHandle(hSnap);
+                return pe.th32ProcessID;
             }
         } while (Process32NextW(hSnap, &pe));
     }
@@ -154,37 +216,60 @@ int wmain(int argc, wchar_t* argv[]) {
     EnablePrivilege(L"SeDebugPrivilege");
     EnablePrivilege(L"SeImpersonatePrivilege");
     EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
+    /* SeTcbPrivilege ("Act as part of the operating system") is required to
+       relocate a token to a different session via SetTokenInformation(
+       TokenSessionId). IFEO launches gmproxy as the invoking (admin) user,
+       which does NOT hold SeTcb, so enabling it is a no-op there -- but it lets
+       the relocate path below succeed if gmproxy ever runs as SYSTEM. */
+    EnablePrivilege(L"SeTcbPrivilege");
 
-    DWORD srcPid = FindSystemProcessForToken();
-    if (srcPid == 0) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: No accessible SYSTEM process found.\n");
-        return 1;
+    DWORD activeSession = GetActiveConsoleSessionId();
+
+    /* Prefer a SYSTEM token that ALREADY lives in the active interactive
+       session (winlogon/dwm/fontdrvhost, or any session-correct SYSTEM process).
+       A token sourced from Session 0 (services/lsass) produces an ownerless
+       child with no interactive desktop -- the reported "blank user id /
+       unusable / instant-kill" symptom. */
+    DWORD srcPid = FindSystemProcessForToken(activeSession);
+    HANDLE hPrimary = NULL;
+    if (srcPid != 0) {
+        hPrimary = StealSystemToken(srcPid);
+        if (hPrimary) {
+            /* Belt-and-suspenders: the source already carries activeSession, but
+               reassert it in case the duplicate's session drifted. Best-effort. */
+            DWORD sid = activeSession;
+            if (!SetTokenInformation(hPrimary, TokenSessionId, &sid, sizeof(sid))) {
+                fwprintf(stderr, L"[GM-PROXY] INFO: SetTokenInformation(session=%lu) not applied (source already in session).\n", activeSession);
+            }
+            fwprintf(stderr, L"[GM-PROXY] Acquired active-session SYSTEM token from PID %lu (session %lu).\n", srcPid, activeSession);
+        }
     }
 
-    HANDLE hSrc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, srcPid);
-    if (!hSrc) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: OpenProcess failed on SYSTEM PID %lu.\n", srcPid);
-        return 1;
+    /* If no active-session SYSTEM token is openable (e.g. all PPL-protected),
+       try to steal ANY SYSTEM token and relocate it to the active session. This
+       only succeeds when SeTcb is held (gmproxy running as SYSTEM); otherwise it
+       fails and we degrade gracefully (launch as the current user) below. */
+    if (!hPrimary) {
+        DWORD anyPid = FindAnySystemProcessPid();
+        if (anyPid != 0) {
+            HANDLE hTmp = StealSystemToken(anyPid);
+            if (hTmp) {
+                DWORD sid = activeSession;
+                if (SetTokenInformation(hTmp, TokenSessionId, &sid, sizeof(sid))) {
+                    hPrimary = hTmp;
+                    fwprintf(stderr, L"[GM-PROXY] Relocated SYSTEM token from PID %lu to session %lu.\n", anyPid, activeSession);
+                } else {
+                    CloseHandle(hTmp);
+                    fwprintf(stderr, L"[GM-PROXY] WARN: cannot relocate SYSTEM token to session %lu (no SeTcb). Will degrade to normal launch.\n", activeSession);
+                }
+            }
+        }
     }
 
-    HANDLE hSrcToken;
-    if (!OpenProcessToken(hSrc, TOKEN_DUPLICATE | TOKEN_QUERY, &hSrcToken)) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: OpenProcessToken failed.\n");
-        CloseHandle(hSrc);
-        return 1;
+    const BOOL haveToken = (hPrimary != NULL);
+    if (!haveToken) {
+        fwprintf(stderr, L"[GM-PROXY] WARN: no usable SYSTEM token in session %lu; will launch target as current user (not SYSTEM).\n", activeSession);
     }
-
-    HANDLE hPrimary;
-    if (!DuplicateTokenEx(hSrcToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &hPrimary)) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: DuplicateTokenEx failed.\n");
-        CloseHandle(hSrcToken);
-        CloseHandle(hSrc);
-        return 1;
-    }
-
-    // Set Session ID to 1 for interactive desktop
-    DWORD sessionId = 1;
-    SetTokenInformation(hPrimary, TokenSessionId, &sessionId, sizeof(sessionId));
 
     // Build command line from argv
     size_t cmdLen = 0;
@@ -193,9 +278,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     wchar_t* cmdLine = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (cmdLen + 1) * sizeof(wchar_t));
     if (!cmdLine) {
-        CloseHandle(hPrimary);
-        CloseHandle(hSrcToken);
-        CloseHandle(hSrc);
+        if (hPrimary) CloseHandle(hPrimary);
         return 1;
     }
 
@@ -245,9 +328,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!usedHardlink) {
         fwprintf(stderr, L"[GM-PROXY] ERROR: Failed to create hardlink/copy for IFEO bypass. GLE=%lu\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, cmdLine);
-        CloseHandle(hPrimary);
-        CloseHandle(hSrcToken);
-        CloseHandle(hSrc);
+        if (hPrimary) CloseHandle(hPrimary);
         return 1;
     }
 
@@ -262,11 +343,11 @@ int wmain(int argc, wchar_t* argv[]) {
 #ifdef _MSC_VER
     __try {
 #endif
-        if (cpwt) {
+        if (haveToken && cpwt) {
             ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
         }
-        /* Fallback: CreateProcessAsUserW */
-        if (!ok) {
+        /* Fallback with the same (session-correct) SYSTEM token. */
+        if (!ok && haveToken) {
             ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
         }
 #ifdef _MSC_VER
@@ -275,25 +356,37 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 #endif
 
+    /* Graceful degradation: if we never had a session-correct SYSTEM token (all
+       SYSTEM processes PPL-protected and gmproxy lacks SeTcb to relocate one),
+       OR the token launch failed, launch the target as the CURRENT user via the
+       IFEO-bypass hardlink. The app then runs normally (not SYSTEM) instead of
+       being born ownerless in Session 0 with no interactive desktop. The God
+       Mode monitor will still elevate it to SYSTEM via its normal kill+relaunch
+       path, so this is strictly better than a broken ownerless launch. */
+    if (!ok) {
+        ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        if (ok) {
+            fwprintf(stderr, L"[GM-PROXY] Launched %s as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+        }
+    }
+
     // Best-effort cleanup of the hardlink/copy (may fail if process is still starting)
     DeleteFileW(hardlinkPath);
 
     if (!ok) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: CreateProcessAsUser/WithToken failed. GLE=%lu\n", GetLastError());
+        fwprintf(stderr, L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, cmdLine);
-        CloseHandle(hPrimary);
-        CloseHandle(hSrcToken);
-        CloseHandle(hSrc);
+        if (hPrimary) CloseHandle(hPrimary);
         return 1;
     }
 
-    fwprintf(stderr, L"[GM-PROXY] SUCCESS: Launched %s as SYSTEM (PID=%lu).\n", argv[1], pi.dwProcessId);
+    if (haveToken) {
+        fwprintf(stderr, L"[GM-PROXY] SUCCESS: Launched %s as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+    }
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     HeapFree(GetProcessHeap(), 0, cmdLine);
-    CloseHandle(hPrimary);
-    CloseHandle(hSrcToken);
-    CloseHandle(hSrc);
+    if (hPrimary) CloseHandle(hPrimary);
     return 0;
 }

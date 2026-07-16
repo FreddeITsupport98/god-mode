@@ -8,10 +8,16 @@
 #        - Test-GodModeCrashFix.ps1  (the 0xC0000005 crash-fix regression)
 #        - Test-IfeoElevation.ps1    (IFEO + gmproxy normal-program elevation regression)
 #        - Test-Suite.ps1            (DNSGuard / God-Mode structure suite)
+#        - Test-GmProxySession.ps1   (gmproxy session-correct SYSTEM-token launch +
+#                                    monitor blank-owner kill guard regression)
 #   4. wine smoke test: loads the built gmhook.dll into pwsh.exe + chrome.exe
 #      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
 #      hosts (tests/test-shell-host-exclusion.sh) -- binary-level check that
 #      catches IsShellLauncherProcess regressions BEFORE deploying to the VM.
+#   5. gmproxy session-fix build + invariant test (tests/test-gmproxy-session.sh):
+#      MinGW cross-compile of gmproxy.c proves the session-correctness + graceful-
+#      fallback code BUILDS and yields a PE binary (catches undeclared symbols /
+#      wrong typedefs before deploying to the VM).
 #
 # Prints a FAIL SUMMARY (N) block and exits 1 on any failure, 0 if all pass.
 # Usage: bash tests/run-regressions.sh
@@ -82,7 +88,7 @@ fi
 if ! command -v pwsh >/dev/null 2>&1; then
     record "pwsh available" 0 "pwsh not installed"
 else
-    for suite in Test-GodModeCrashFix.ps1 Test-IfeoElevation.ps1 Test-Suite.ps1; do
+    for suite in Test-GodModeCrashFix.ps1 Test-IfeoElevation.ps1 Test-Suite.ps1 Test-GmProxySession.ps1; do
         f="$SCRIPT_DIR/$suite"
         if [ ! -f "$f" ]; then
             record "pwsh $suite" 0 "missing"
@@ -111,6 +117,21 @@ else
     else
         rc=$?
         record "wine smoke: gmhook.dll not hooked in pwsh.exe (chrome.exe control hooked)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
+# 5. gmproxy session-fix build + invariant test (MinGW cross-compile proof).
+gmsess="$SCRIPT_DIR/test-gmproxy-session.sh"
+if [ ! -f "$gmsess" ]; then
+    record "test-gmproxy-session.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$gmsess" >"$log" 2>&1; then
+        record "gmproxy session-fix: compiles + invariants (MinGW)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "gmproxy session-fix: compiles + invariants (MinGW)" 0 "exit=$rc (log: $log)"
     fi
 fi
 

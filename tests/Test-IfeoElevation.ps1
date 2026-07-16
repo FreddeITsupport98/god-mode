@@ -184,6 +184,10 @@ if (Test-Path $GmProxy) {
     $proxySrc = Get-Content -Raw $GmProxy
     Add-Assertion "gmproxy.c: IFEO recursion bypass (CreateHardLinkW) present" ($proxySrc -match 'CreateHardLinkW') "hardlink bypass missing -- IFEO would launch gmproxy recursively"
     Add-Assertion "gmproxy.c: launches target with stolen SYSTEM token (CreateProcessWithTokenW)" ($proxySrc -match 'CreateProcessWithTokenW') "token launch missing"
+    # Session-correctness fix (born-as-SYSTEM must land in the active interactive session,
+    # else the child is ownerless with a blank User column / unusable / instant-killed).
+    Add-Assertion "gmproxy.c: session-aware token source (GetActiveConsoleSessionId + ProcessIdToSessionId)" ($proxySrc -match 'GetActiveConsoleSessionId' -and $proxySrc -match 'ProcessIdToSessionId') "session-aware token selection missing -- child could be born ownerless in Session 0"
+    Add-Assertion "gmproxy.c: graceful fallback launch as current user (CreateProcessW hardlink)" ($proxySrc -match 'CreateProcessW\s*\(\s*hardlinkPath') "graceful fallback missing -- broken ownerless launch when no session-correct SYSTEM token"
 } else {
     Add-Assertion "gmproxy.c exists" $false "file not found: $GmProxy"
 }

@@ -4416,7 +4416,11 @@ function Stop-NonSystemInstances {
             foreach ($p in $procs) {
                 try {
                     $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
-                    if ($owner.User -ne "SYSTEM") {
+                    # Blank/unresolvable owner (common in the brief window right after an IFEO/gmproxy
+                    # launch, before WMI can resolve the new logon session) must NOT be treated as
+                    # non-SYSTEM -- otherwise the monitor kills freshly-born SYSTEM apps (Chrome
+                    # instant-kill / Firefox ownerless). Only kill when the owner is KNOWN and non-SYSTEM.
+                    if ($owner -and $owner.User -and $owner.User -ne "SYSTEM") {
                         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
                         Write-Log -Message "Killed non-SYSTEM $ProcessName PID=$($p.ProcessId) to force SYSTEM-only" -Type "INFO" -Color Gray
                     }
@@ -4482,7 +4486,8 @@ function Invoke-ParallelElevation {
                 foreach ($wp in $wmiProcs) {
                     try {
                         $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
-                        if ($owner.User -ne "SYSTEM") {
+                        # Blank owner = unresolvable (IFEO/gmproxy launch window); do NOT kill.
+                        if ($owner -and $owner.User -and $owner.User -ne "SYSTEM") {
                             Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
                         }
                     } catch {}
@@ -4545,7 +4550,8 @@ function Invoke-ParallelElevation {
                     foreach ($wp in $wmiProcs) {
                         try {
                             $owner = Invoke-CimMethod -InputObject $wp -MethodName GetOwner -ErrorAction SilentlyContinue
-                            if ($owner.User -ne "SYSTEM") {
+                            # Blank owner = unresolvable (IFEO/gmproxy launch window); do NOT kill.
+                            if ($owner -and $owner.User -and $owner.User -ne "SYSTEM") {
                                 Stop-Process -Id $wp.ProcessId -Force -ErrorAction SilentlyContinue
                             }
                         } catch {}
