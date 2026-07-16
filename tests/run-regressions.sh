@@ -6,6 +6,7 @@
 #   2. MinGW compile + wine run of the C guard-logic test (Test-GmHookFix.c)
 #   3. PowerShell regression suites via pwsh:
 #        - Test-GodModeCrashFix.ps1  (the 0xC0000005 crash-fix regression)
+#        - Test-IfeoElevation.ps1    (IFEO + gmproxy normal-program elevation regression)
 #        - Test-Suite.ps1            (DNSGuard / God-Mode structure suite)
 #   4. wine smoke test: loads the built gmhook.dll into pwsh.exe + chrome.exe
 #      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
@@ -81,7 +82,7 @@ fi
 if ! command -v pwsh >/dev/null 2>&1; then
     record "pwsh available" 0 "pwsh not installed"
 else
-    for suite in Test-GodModeCrashFix.ps1 Test-Suite.ps1; do
+    for suite in Test-GodModeCrashFix.ps1 Test-IfeoElevation.ps1 Test-Suite.ps1; do
         f="$SCRIPT_DIR/$suite"
         if [ ! -f "$f" ]; then
             record "pwsh $suite" 0 "missing"

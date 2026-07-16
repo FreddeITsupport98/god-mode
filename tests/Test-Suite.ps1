@@ -228,6 +228,22 @@ if (Test-Path $DnsScript) {
 }
 
 # ============================================================================
-# 10. FINAL SUMMARY
+# 10. IFEO ELEVATION LAYER (normal programs -> SYSTEM via gmproxy)
+# ============================================================================
+Write-Section "IFEO ELEVATION LAYER (NO-SIDE-EFFECT)"
+if (Test-Path $DnsScript) {
+    if (-not $Content) { $Content = Get-Content -Path $DnsScript -Raw }
+    Add-Assertion -Name "Install-IfeoElevation defined" -Pass ($Content -match 'function Install-IfeoElevation')
+    Add-Assertion -Name "Uninstall-IfeoElevation defined" -Pass ($Content -match 'function Uninstall-IfeoElevation')
+    Add-Assertion -Name "Enable-GodMode calls Install-IfeoElevation" -Pass ($Content -match '(?m)^\s+Install-IfeoElevation\s*\r?\n')
+    Add-Assertion -Name "Disable-GodMode calls Uninstall-IfeoElevation" -Pass ($Content -match '(?m)^\s+Uninstall-IfeoElevation\s*\r?\n')
+    Add-Assertion -Name "IFEO Debugger targets gmproxy.exe" -Pass ($Content -match 'Set-ItemProperty.*Debugger.*gmproxy')
+    Add-Assertion -Name "IFEO keys hardened (Harden-RegistryKey)" -Pass ($Content -match 'Harden-RegistryKey.*IfeoBaseSubKey')
+} else {
+    Add-Assertion -Name "Script present for IFEO checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
+}
+
+# ============================================================================
+# 11. FINAL SUMMARY
 # ============================================================================
 Write-Summary
