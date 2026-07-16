@@ -69,7 +69,22 @@ if (Test-Path $GmHook) {
     Add-Assertion "gmhook.c: EXTENDED_STARTUPINFO_PRESENT bypass" `
         ($hookSrc -match '0x00080000') "EXTENDED flag bypass missing"
     Add-Assertion "gmhook.c: e_lfanew sanity in HookModuleIAT" `
-        ($hookSrc -match 'e_lfanew\s*<=\s*0') "PE header sanity missing"
+        ($hookSrc -match 'e_lfanew\s*<=\s*0') "e_lfanew sanity missing"
+    # --- Shell/launcher host exclusion (the actual 0xC0000005 fix) ---
+    Add-Assertion "gmhook.c: IsShellLauncherProcess helper present" `
+        ($hookSrc -match 'IsShellLauncherProcess') "IsShellLauncherProcess helper missing"
+    Add-Assertion "gmhook.c: pwsh.exe excluded from hooking" `
+        ($hookSrc -match 'L"pwsh\.exe"') "pwsh.exe not in shell exclusion list"
+    Add-Assertion "gmhook.c: powershell.exe excluded from hooking" `
+        ($hookSrc -match 'L"powershell\.exe"') "powershell.exe not in shell exclusion list"
+    Add-Assertion "gmhook.c: cmd.exe excluded from hooking" `
+        ($hookSrc -match 'L"cmd\.exe"') "cmd.exe not in shell exclusion list"
+    Add-Assertion "gmhook.c: HookCreateProcessW uses shell exclusion" `
+        ($hookSrc -match 'IsCriticalProcess\(baseName\)\s*\|\|\s*IsShellLauncherProcess\(baseName\)') "HookCreateProcessW does not OR IsShellLauncherProcess"
+    Add-Assertion "gmhook.c: auto-install sites use shell exclusion (GetMsgProc/DllMain)" `
+        ($hookSrc -match '!IsCriticalProcess\(baseName\)\s*&&\s*!IsShellLauncherProcess\(baseName\)') "GetMsgProc/DllMain do not AND IsShellLauncherProcess"
+    Add-Assertion "gmhook.c: recursion guard resets on re-entry return" `
+        ($hookSrc -match 'InterlockedExchange\(&inHook,\s*0\);\s*\r?\n\s*return pOrigCreateProcessW') "recursion guard leak (inHook not reset before return)"
 } else {
     Add-Assertion "gmhook.c exists" $false "file not found: $GmHook"
 }
@@ -101,6 +116,17 @@ if (Test-Path $GodMode) {
         ($funcBody -match 'Trim\(\)\.Length\s*-gt\s*0') "empty-channel skip missing"
 } else {
     Add-Assertion "God-Mode-Windows.ps1 exists" $false "file not found: $GodMode"
+}
+
+# --- 1b. Install-ProcessHook injection skip-list must exclude shell hosts ---
+if (Test-Path $GodMode) {
+    if (-not $gm) { $gm = Get-Content -Raw $GodMode }
+    Add-Assertion "God-Mode-Windows.ps1: CriticalProcs skips pwsh/powershell/cmd injection" `
+        ($gm -match '"pwsh",\s*"powershell",\s*"cmd"') "shell hosts not in Install-ProcessHook CriticalProcs"
+    Add-Assertion "God-Mode-Windows.ps1: CriticalProcs skips terminal host injection" `
+        ($gm -match '"OpenConsole",\s*"WindowsTerminal"') "terminal hosts not in Install-ProcessHook CriticalProcs"
+} else {
+    Add-Assertion "God-Mode-Windows.ps1 exists (skip-list check)" $false "file not found: $GodMode"
 }
 
 # --- 2. C guard-logic regression: compile with MinGW, run via wine ---

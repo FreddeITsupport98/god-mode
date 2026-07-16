@@ -3981,7 +3981,17 @@ public class GmInjector {
                 if (-not ([System.Management.Automation.PSTypeName]'GmInjector').Type) {
                     Add-Type -TypeDefinition $InjectorType -ErrorAction SilentlyContinue | Out-Null
                 }
-                $CriticalProcs = @("csrss", "lsass", "services", "smss", "winlogon", "wininit", "svchost", "dwm", "fontdrvhost", "System", "Registry", "Memory Compression", "Secure System", "Idle", "SystemSettingsBroker", "ShellExperienceHost", "SearchUI", "SearchIndexer", "MsMpEng", "SecurityHealthService", "TiWorker", "CompatTelRunner")
+                # Shell/launcher hosts are NEVER injected with gmhook.dll. PowerShell
+                # (pwsh/powershell) and cmd launch native commands via CreateProcessW as
+                # their core job; in-process IAT hooking of those calls destabilizes the
+                # host and faults with 0xC0000005 inside Kernel32.CreateProcess (a native
+                # AV PowerShell try/catch cannot recover from -- it kills pwsh.exe).
+                # Terminals (wt/conhost/OpenConsole/WindowsTerminal) host those shells.
+                # These hosts are still elevated to SYSTEM via Invoke-HybridElevation /
+                # CreateProcessAsSystem; they are simply not DLL-injected. NOTE: Get-Process
+                # .Name returns names WITHOUT the .exe extension, so entries are bare names.
+                $CriticalProcs = @("csrss", "lsass", "services", "smss", "winlogon", "wininit", "svchost", "dwm", "fontdrvhost", "System", "Registry", "Memory Compression", "Secure System", "Idle", "SystemSettingsBroker", "ShellExperienceHost", "SearchUI", "SearchIndexer", "MsMpEng", "SecurityHealthService", "TiWorker", "CompatTelRunner",
+                    "pwsh", "powershell", "cmd", "wt", "conhost", "OpenConsole", "WindowsTerminal")
                 $AllProcs = Get-Process -ErrorAction SilentlyContinue
                 $Injected = 0
                 $Skipped = 0

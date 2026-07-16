@@ -58,6 +58,28 @@ static int shouldTakeTokenPath(const STARTUPINFOW* si, const void* pi,
     return 1;
 }
 
+/* Mirror of gmhook.c's IsCriticalProcess() || IsShellLauncherProcess() decision.
+   Returns 1 if the host SHOULD be IAT-hooked (neither critical nor a shell/
+   launcher host), 0 if it must be skipped. Shell/launcher hosts (pwsh,
+   powershell, cmd, terminals) are excluded because they launch native commands
+   via CreateProcessW as their core job and in-process IAT hooking destabilizes
+   them with 0xC0000005 inside Kernel32.CreateProcess. */
+static int shouldHookHost(const char* baseName) {
+    if (!baseName) return 0; /* NULL -> unhookable (mirrors IsCriticalProcess TRUE on NULL) */
+    static const char* critical[] = {
+        "csrss.exe","lsass.exe","services.exe","smss.exe","winlogon.exe","wininit.exe",
+        "svchost.exe","dwm.exe","fontdrvhost.exe","System","Registry","Memory Compression",
+        "Secure System","Idle", NULL
+    };
+    static const char* shells[] = {
+        "pwsh.exe","powershell.exe","cmd.exe","wt.exe","conhost.exe","OpenConsole.exe",
+        "WindowsTerminal.exe", NULL
+    };
+    for (int i = 0; critical[i]; i++) if (_stricmp(baseName, critical[i]) == 0) return 0;
+    for (int i = 0; shells[i]; i++) if (_stricmp(baseName, shells[i]) == 0) return 0;
+    return 1;
+}
+
 int main(void) {
     printf("===== gmhook 0xC0000005 fix regression =====\n");
 
@@ -106,6 +128,30 @@ int main(void) {
           shouldTakeTokenPath(NULL, pi, 0, 1, &clamped) == 1);
     check("NULL SI cb clamped to sizeof(STARTUPINFOW)",
           clamped == (DWORD)sizeof(STARTUPINFOW));
+
+    /* --- Host exclusion regression: shell/launcher hosts must NOT be hooked
+           (the actual cause of the 0xC0000005 was hooking these in-process) --- */
+    printf("  -- shell/launcher host exclusion --\n");
+    check("pwsh.exe NOT hooked (shell launcher)",
+          shouldHookHost("pwsh.exe") == 0);
+    check("powershell.exe NOT hooked (shell launcher)",
+          shouldHookHost("powershell.exe") == 0);
+    check("cmd.exe NOT hooked (shell launcher)",
+          shouldHookHost("cmd.exe") == 0);
+    check("wt.exe NOT hooked (terminal host)",
+          shouldHookHost("wt.exe") == 0);
+    check("conhost.exe NOT hooked (terminal host)",
+          shouldHookHost("conhost.exe") == 0);
+    check("WindowsTerminal.exe NOT hooked (terminal host)",
+          shouldHookHost("WindowsTerminal.exe") == 0);
+    check("csrss.exe NOT hooked (critical OS)",
+          shouldHookHost("csrss.exe") == 0);
+    check("explorer.exe IS hooked (user app, not shell/critical)",
+          shouldHookHost("explorer.exe") == 1);
+    check("chrome.exe IS hooked (user app, not shell/critical)",
+          shouldHookHost("chrome.exe") == 1);
+    check("NULL base name NOT hooked (safe default)",
+          shouldHookHost(NULL) == 0);
 
     printf("\n===== FAIL SUMMARY (%d) =====\n", g_failCount);
     for (int i = 0; i < g_failCount; i++) {

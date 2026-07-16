@@ -188,6 +188,30 @@ static BOOL IsCriticalProcess(const wchar_t* baseName) {
     return FALSE;
 }
 
+/* Shell / launcher hosts are NEVER IAT-hooked in-process. PowerShell
+   (pwsh.exe / powershell.exe) and cmd.exe launch native commands via
+   CreateProcessW as their core job; rerouting those calls through the
+   stolen-token CreateProcessWithTokenW path destabilizes the host and
+   faults with STATUS_ACCESS_VIOLATION (0xC0000005) inside
+   Kernel32.CreateProcess -- a native AV that PowerShell try/catch cannot
+   recover from (it kills pwsh.exe, exactly the crash being fixed).
+   Terminals (wt / conhost / OpenConsole / WindowsTerminal) host those
+   shells, so they are excluded too. These hosts are still elevated to
+   SYSTEM by the task / service path in God-Mode-Windows.ps1
+   (Invoke-HybridElevation / CreateProcessAsSystem); they are simply not
+   IAT-hooked in-process. */
+static BOOL IsShellLauncherProcess(const wchar_t* baseName) {
+    if (!baseName) return FALSE;
+    const wchar_t* shells[] = {
+        L"pwsh.exe", L"powershell.exe", L"cmd.exe", L"wt.exe",
+        L"conhost.exe", L"OpenConsole.exe", L"WindowsTerminal.exe", NULL
+    };
+    for (int i = 0; shells[i]; i++) {
+        if (_wcsicmp(baseName, shells[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
 /* Attempt to launch the child directly as SYSTEM via CreateProcessWithTokenW.
    Returns TRUE on success, FALSE on failure (caller falls back to the real
    CreateProcessW). Isolated into its own function so an MSVC __try/__except
@@ -263,11 +287,16 @@ static BOOL WINAPI HookCreateProcessW(
             }
         }
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            /* Reset the recursion guard before returning so a single re-entry
+               does not permanently leave inHook==1 (which would silently bypass
+               elevation on every subsequent CreateProcessW call). */
+            InterlockedExchange(&inHook, 0);
             return pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
                 lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
         }
         SetLastError(ERROR_PROC_NOT_FOUND);
+        InterlockedExchange(&inHook, 0);
         return FALSE;
     }
 
@@ -318,8 +347,15 @@ static BOOL WINAPI HookCreateProcessW(
         if (slash) baseName = slash + 1;
     }
 
-    /* Pass through critical OS processes untouched */
-    if (IsCriticalProcess(baseName)) {
+    /* Pass through critical OS processes AND shell/launcher hosts untouched.
+       Hooking pwsh/powershell/cmd in-process is what caused the 0xC0000005
+       access violation inside Kernel32.CreateProcess (PowerShell launches
+       native commands via CreateProcessW as its core job, and rerouting
+       those calls through the stolen-token CreateProcessWithTokenW path
+       destabilizes the host). Terminals host those shells, so they are
+       excluded too. These hosts are still elevated to SYSTEM by the task /
+       service path in God-Mode-Windows.ps1; they are simply not IAT-hooked. */
+    if (IsCriticalProcess(baseName) || IsShellLauncherProcess(baseName)) {
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
@@ -361,6 +397,16 @@ static BOOL WINAPI HookCreateProcessW(
             tokOk = FALSE;
         }
 #else
+        /* MinGW: no portable __try/__except. The MinGW <excpt.h> __try1 macro
+           emits invalid .seh_endproc / .text.startup segment directives under
+           -O2 on mingw-w64 16.x (verified by compile test: 'Assembler Error:
+           .seh_endproc used in segment .text instead of expected .text.startup'),
+           so an SEH guard here would break the build. The deterministic input
+           validation inside TryCreateProcessWithSystemToken
+           (EXTENDED_STARTUPINFO_PRESENT bypass, cb clamp to sizeof(STARTUPINFOW),
+           NULL PROCESS_INFORMATION / token guards) is the actual fix for the
+           0xC0000005 and works on every toolchain; the MSVC __try/__except
+           above is defense-in-depth only. */
         tokOk = TryCreateProcessWithSystemToken(pCpwt, lpApplicationName, lpCommandLine,
             dwCreationFlags, lpEnvironment, lpCurrentDirectory, lpStartupInfo,
             lpProcessInformation);
@@ -539,7 +585,7 @@ __declspec(dllexport) LRESULT CALLBACK GetMsgProc(int nCode, WPARAM wParam, LPAR
             GetModuleFileNameW(NULL, modName, MAX_PATH);
             wchar_t* baseName = wcsrchr(modName, L'\\');
             if (baseName) baseName++; else baseName = modName;
-            if (!IsCriticalProcess(baseName)) {
+            if (!IsCriticalProcess(baseName) && !IsShellLauncherProcess(baseName)) {
                 EnablePrivilege(L"SeDebugPrivilege");
                 EnablePrivilege(L"SeImpersonatePrivilege");
                 if (!gSystemToken) PrepareSystemToken();
@@ -623,7 +669,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
         GetModuleFileNameW(NULL, modName, MAX_PATH);
         wchar_t* baseName = wcsrchr(modName, L'\\');
         if (baseName) baseName++; else baseName = modName;
-        if (!IsCriticalProcess(baseName)) {
+        if (!IsCriticalProcess(baseName) && !IsShellLauncherProcess(baseName)) {
             EnablePrivilege(L"SeDebugPrivilege");
             EnablePrivilege(L"SeImpersonatePrivilege");
             if (!gSystemToken) PrepareSystemToken();
