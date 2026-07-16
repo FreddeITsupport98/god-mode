@@ -107,9 +107,30 @@ else
     fi
 
     # 4. Run under wine. pwsh.exe -> expect NOT hooked (0); chrome.exe -> expect
-    #    hooked (1). The stub exits 0 when the expectation is met.
+    #    hooked (1). The stub exits 0 when the expectation is met. The wine CWD
+    #    is forced to the clean WORK dir (subshell) so a wide-format regression
+    #    that truncates the %TEMP%\gmhook.log path to a relative "Cgmhook.log"
+    #    drops a deterministic CWD artifact we assert on below -- independent of
+    #    where this script was invoked from. (Loading gmhook.dll is unaffected:
+    #    the stub loads it via an absolute beside-the-exe path, not via CWD.)
     if [ "$build_stub" = "1" ]; then
-        out_pwsh="$("$WINE" "$WORK/pwsh.exe" 0 2>&1)"; rc_pwsh=$?
+        # Locate wine's %TEMP% (where a correct %ls build writes gmhook.log) and
+        # clear any stale gmhook.log so the post-run content guard only sees
+        # lines written by THIS run's freshly built gmhook.dll. gmhook.log is
+        # this project's own log artifact (not user data), so removing it here
+        # is safe and keeps the guard deterministic.
+        WINEPREFIX_DIR="${WINEPREFIX:-$HOME/.wine}"
+        WINE_USER="${USER:-${LOGNAME:-}}"
+        WINE_TEMP="$WINEPREFIX_DIR/drive_c/users/$WINE_USER/AppData/Local/Temp"
+        if [ ! -d "$WINE_TEMP" ]; then
+            WINE_TEMP="$(find "$WINEPREFIX_DIR/drive_c/users" -maxdepth 4 -type d -path '*/AppData/Local/Temp' 2>/dev/null | head -n1)"
+        fi
+        GMHOOK_LOG="$WINE_TEMP/gmhook.log"
+        if [ -n "$WINE_TEMP" ] && [ -d "$WINE_TEMP" ]; then
+            rm -f "$GMHOOK_LOG"
+        fi
+
+        out_pwsh="$(cd "$WORK" && "$WINE" "$WORK/pwsh.exe" 0 2>&1)"; rc_pwsh=$?
         printf '  [wine] pwsh.exe (expect NOT hooked):\n%s\n' "$out_pwsh" | sed 's/^/    /'
         if [ "$rc_pwsh" -eq 0 ]; then
             record "pwsh.exe NOT hooked (shell-host exclusion works)" 1
@@ -117,12 +138,43 @@ else
             record "pwsh.exe NOT hooked (shell-host exclusion works)" 0 "wine exit=$rc_pwsh (expected IsHookInstalled=0)"
         fi
 
-        out_chr="$("$WINE" "$WORK/chrome.exe" 1 2>&1)"; rc_chr=$?
+        out_chr="$(cd "$WORK" && "$WINE" "$WORK/chrome.exe" 1 2>&1)"; rc_chr=$?
         printf '  [wine] chrome.exe (expect IS hooked, control):\n%s\n' "$out_chr" | sed 's/^/    /'
         if [ "$rc_chr" -eq 0 ]; then
             record "chrome.exe IS hooked (negative control)" 1
         else
             record "chrome.exe IS hooked (negative control)" 0 "wine exit=$rc_chr (expected IsHookInstalled=1)"
+        fi
+
+        # 5. Runtime wide-format regression guard (catches %s-vs-%ls at runtime,
+        #    not just in source). A correct %ls build writes a FULL
+        #    "[GM-HOOK] BUILD <date> <time> loaded in <host> (attach ...)" line
+        #    to %TEMP%\gmhook.log and leaves NO Cgmhook.log in the wine CWD. A
+        #    %s regression (MinGW wide swprintf truncating wchar_t* args to the
+        #    first char) instead truncates the path to "Cgmhook.log" in the CWD
+        #    and writes only "[" per attach -- so the temp log is absent and a
+        #    CWD artifact appears.
+        if [ -z "$WINE_TEMP" ] || [ ! -d "$WINE_TEMP" ]; then
+            record "locate wine %TEMP% for content guard" 0 "no <wineprefix>/drive_c/users/*/AppData/Local/Temp found"
+        else
+            # (a) No CWD artifact: a correct %ls path does not drop Cgmhook.log
+            #     into the wine CWD (the WORK dir).
+            if [ -e "$WORK/Cgmhook.log" ]; then
+                record "no Cgmhook.log CWD artifact (wide-format path OK)" 0 "Cgmhook.log in wine CWD -> %s path-truncation regression"
+            else
+                record "no Cgmhook.log CWD artifact (wide-format path OK)" 1
+            fi
+
+            # (b) %TEMP%\gmhook.log holds a FULL BUILD stamp. The fixed strings
+            #     '[GM-HOOK] BUILD ' and 'loaded in' only co-occur on a full,
+            #     non-truncated stamp line (a %s regression writes only "[" per
+            #     attach, so neither substring appears). grep -qF (fixed-string)
+            #     avoids regex-mangling the brackets.
+            if [ -f "$GMHOOK_LOG" ] && grep -qF '[GM-HOOK] BUILD ' "$GMHOOK_LOG" && grep -qF 'loaded in' "$GMHOOK_LOG"; then
+                record "wine %TEMP% gmhook.log has full BUILD ... loaded in stamp" 1
+            else
+                record "wine %TEMP% gmhook.log has full BUILD ... loaded in stamp" 0 "gmhook.log missing/truncated -> %s wide-format regression"
+            fi
         fi
     fi
 fi
