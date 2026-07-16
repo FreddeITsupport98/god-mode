@@ -15,20 +15,38 @@
 # Prints a FAIL SUMMARY (N) block and exits 1 on any failure, 0 if all pass.
 # Usage: bash tests/test-shell-host-exclusion.sh
 #        bash tests/test-shell-host-exclusion.sh --regression-mode
-#          --regression-mode: NEGATIVE direction. Builds a BROKEN copy of
-#          gmhook.c with only the %TEMP%\gmhook.log path swprintf reverted
-#          %ls->%s (the exact wide-format regression the runtime guard catches)
-#          -- the real source is never modified -- then asserts the two build-
-#          stamp guards FAIL (Cgmhook.log CWD artifact appears + %TEMP% gmhook.log
-#          has no full BUILD stamp). Proves the guard catches a broken build, not
-#          just that a correct build passes.
+#        bash tests/test-shell-host-exclusion.sh --regression-mode=line
+#          --regression-mode:      NEGATIVE direction (PATH). Builds a BROKEN
+#          copy of gmhook.c with only the %TEMP%\gmhook.log path swprintf
+#          reverted %ls->%s (the exact wide-format regression the runtime guard
+#          catches) -- the real source is never modified -- then asserts the
+#          two build-stamp guards FAIL (Cgmhook.log CWD artifact appears +
+#          %TEMP% gmhook.log has no full BUILD stamp). Proves the guard catches
+#          a broken build, not just that a correct build passes.
+#          --regression-mode=line: NEGATIVE direction (LINE / CONTENT). Builds a
+#          BROKEN copy of gmhook.c with only the stamp-LINE swprintf reverted
+#          %ls->%s (the wdate/wtime/baseName wide args) while the PATH %ls is
+#          left INTACT -- the real source is never modified. MinGW wide swprintf
+#          %s reads a wchar_t* as narrow and stops at the first 0x00 high byte,
+#          so each arg collapses to its first char (baseName "chrome.exe" ->
+#          "c"): the path is still correct (log at %TEMP%, NO CWD Cgmhook.log)
+#          but the stamp CONTENT is truncated. Asserts the full host
+#          "loaded in chrome.exe" is MISSING from %TEMP% gmhook.log while the
+#          [GM-HOOK] BUILD / loaded in LITERALS still appear -- proving the
+#          path-mode guard (b) substring check ALONE false-passes on a content-
+#          truncation regression, so a dedicated full-host content guard (the
+#          positive (f-pos) below) is needed for the LINE half.
 set -uo pipefail
 
-# --regression-mode: negative direction (see Usage above). Builds a known-broken
-#    gmhook.dll and asserts the runtime wide-format guards FAIL on it.
-REGRESSION_MODE=0
+# --regression-mode[=line]: negative direction (see Usage above). Builds a
+#    known-broken gmhook.dll and asserts the runtime wide-format guards FAIL on
+#    it. "path" reverts the %TEMP%\gmhook.log path swprintf; "line" reverts only
+#    the stamp-LINE swprintf (content truncation, path left intact).
+REGRESSION_MODE=""   # "" = positive; "path" = %ls->%s path revert; "line" = %ls->%s line revert
 if [ "${1:-}" = "--regression-mode" ]; then
-    REGRESSION_MODE=1
+    REGRESSION_MODE="path"
+elif [ "${1:-}" = "--regression-mode=line" ]; then
+    REGRESSION_MODE="line"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,11 +76,11 @@ record() {  # record <name> <0|1> [detail]
 printf '=====================================================\n'
 printf '  gmhook.dll shell-host exclusion (wine smoke test)\n'
 printf '=====================================================\n'
-if [ "$REGRESSION_MODE" = "1" ]; then
-    printf '  mode: REGRESSION (negative direction -- broken %%ls->%%s build; guards must FAIL)\n'
-else
-    printf '  mode: POSITIVE (correct %%ls build; guards must PASS)\n'
-fi
+case "$REGRESSION_MODE" in
+    path) printf '  mode: REGRESSION-PATH (negative direction -- broken %%ls->%%s PATH build; path guards must FAIL)\n' ;;
+    line) printf '  mode: REGRESSION-LINE (negative direction -- broken %%ls->%%s LINE build; content guards must FAIL)\n' ;;
+    *)    printf '  mode: POSITIVE (correct %%ls build; guards must PASS)\n' ;;
+esac
 
 # --- Tool checks (hard-fail if the toolchain that the VM build also needs
 #     is missing, so this never silently passes by skipping). ---
@@ -89,17 +107,27 @@ else
     # shellcheck disable=SC2064
     trap "rm -rf '$WORK'" EXIT
 
-    # 1. Build gmhook.dll (same flags as driver/build.ps1 MinGW path). In
-    #    --regression-mode, build from a BROKEN copy of gmhook.c with only the
-    #    %TEMP%\gmhook.log path swprintf reverted %ls->%s (the exact wide-format
-    #    regression the runtime guard below catches). The REAL source is never
-    #    modified -- the broken copy lives in $WORK and is rm -rf'd on exit. We
-    #    assert the reversion happened (source still has %ls, broken copy has %s
-    #    and no %ls) so a future source change cannot make this silently build an
-    #    unbroken DLL and false-pass the negative direction.
+    # 1. Build gmhook.dll (same flags as driver/build.ps1 MinGW path). In a
+    #    regression mode, build from a BROKEN copy of gmhook.c with one wide-
+    #    format swprintf reverted %ls->%s (the exact regression the runtime guard
+    #    below catches). The REAL source is never modified -- the broken copy
+    #    lives in $WORK and is rm -rf'd on exit. We assert the reversion happened
+    #    so a future source change cannot make this silently build an unbroken
+    #    DLL and false-pass the negative direction.
+    #      path: revert the %TEMP%\gmhook.log PATH swprintf (%lsgmhook.log ->
+    #            %sgmhook.log). Truncates the path to "C"+"gmhook.log" -> a
+    #            relative CWD artifact + no %TEMP% stamp (a LOCATION redirect).
+    #      line: revert ONLY the stamp-LINE swprintf (the three wdate/wtime/
+    #            baseName wide args) via a targeted sed 's/%ls /%s /g'. The PATH
+    #            %lsgmhook.log has NO trailing space after %ls, so it is NOT
+    #            matched and stays %ls (log still opens at %TEMP%\gmhook.log).
+    #            MinGW %s reads each wchar_t* arg as narrow and stops at the
+    #            first 0x00 high byte -> each arg collapses to its first char
+    #            (baseName "chrome.exe" -> "c"), so the stamp CONTENT is
+    #            truncated while the path/location stays correct.
     HOOK_BUILD_SRC="$HOOK_SRC"
     build_name="build gmhook.dll (MinGW)"
-    if [ "$REGRESSION_MODE" = "1" ]; then
+    if [ "$REGRESSION_MODE" = "path" ]; then
         src_occ=$(grep -cF -- '%lsgmhook.log' "$HOOK_SRC" 2>/dev/null || true)
         [ -z "$src_occ" ] && src_occ=0
         sed 's/%lsgmhook\.log/%sgmhook.log/' "$HOOK_SRC" > "$WORK/gmhook_broken.c"
@@ -113,6 +141,30 @@ else
         else
             record "build broken gmhook.c variant (%ls->%s path)" 0 \
                 "could not construct broken variant (src=$src_occ brok=$brok_occ kept=$kept_occ)"
+            HOOK_BUILD_SRC=""
+        fi
+    elif [ "$REGRESSION_MODE" = "line" ]; then
+        # Targeted revert of ONLY the stamp-LINE %ls (the three wide args). The
+        # distinctive substring 'BUILD %ls %ls loaded in %ls' pins the line
+        # format; '%lsgmhook.log' pins the path (must stay intact). sed matches
+        # '%ls ' (trailing space) so the path '%lsgmhook.log' (%ls + 'g', no
+        # space) is untouched.
+        if grep -qF 'BUILD %ls %ls loaded in %ls' "$HOOK_SRC" 2>/dev/null \
+           && grep -qF '%lsgmhook.log' "$HOOK_SRC" 2>/dev/null; then
+            sed 's/%ls /%s /g' "$HOOK_SRC" > "$WORK/gmhook_broken_line.c"
+            if grep -qF 'BUILD %s %s loaded in %s' "$WORK/gmhook_broken_line.c" 2>/dev/null \
+               && grep -qF '%lsgmhook.log' "$WORK/gmhook_broken_line.c" 2>/dev/null \
+               && ! grep -qF 'BUILD %ls %ls loaded in %ls' "$WORK/gmhook_broken_line.c" 2>/dev/null; then
+                HOOK_BUILD_SRC="$WORK/gmhook_broken_line.c"
+                build_name="build broken gmhook.dll (line %ls->%s, MinGW)"
+            else
+                record "build broken gmhook.c variant (line %ls->%s)" 0 \
+                    "could not construct broken line variant (path or line format not as expected)"
+                HOOK_BUILD_SRC=""
+            fi
+        else
+            record "build broken gmhook.c variant (line %ls->%s)" 0 \
+                "source line format not found (BUILD %ls %ls loaded in %ls or %lsgmhook.log missing)"
             HOOK_BUILD_SRC=""
         fi
     fi
@@ -198,27 +250,36 @@ else
         #    not just in source). A correct %ls build writes a FULL
         #    "[GM-HOOK] BUILD <date> <time> loaded in <host> (attach ...)" line
         #    to %TEMP%\gmhook.log and leaves NO Cgmhook.log in the wine CWD. A
-        #    %s regression (MinGW wide swprintf truncating wchar_t* args to the
-        #    first char) instead truncates the path to "Cgmhook.log" in the CWD
-        #    and writes only "[" per attach -- so the temp log is absent and a
-        #    CWD artifact appears. In --regression-mode the expectations are
-        #    INVERTED: a known-broken build MUST drop the CWD artifact and MUST
-        #    NOT write a full temp stamp, proving the guard catches a broken
-        #    build (not just that a correct build passes).
+        #    %s PATH regression (MinGW wide swprintf truncating the wchar_t* path
+        #    arg to its first char) instead truncates the path to "Cgmhook.log"
+        #    in the CWD and writes the full stamp there (LOCATION redirect). A
+        #    %s LINE regression leaves the path correct (log at %TEMP%, NO CWD
+        #    artifact) but truncates each stamp-LINE wide arg to its first char
+        #    (CONTENT truncation): "loaded in chrome.exe" -> "loaded in c". The
+        #    [GM-HOOK] BUILD / loaded in LITERALS are format-string constants,
+        #    so they survive a LINE regression -- the substring-only guard (b)
+        #    ALONE would false-pass on it, which is why a dedicated full-host
+        #    content guard ((f-pos) positive / (e) line) is needed for the LINE
+        #    half. In a regression mode the expectations are INVERTED for the
+        #    half being tested, proving the guard catches a broken build (not
+        #    just that a correct build passes).
         if [ -z "$WINE_TEMP" ] || [ ! -d "$WINE_TEMP" ]; then
             record "locate wine %TEMP% for content guard" 0 "no <wineprefix>/drive_c/users/*/AppData/Local/Temp found"
         else
             # (a) CWD artifact. POSITIVE: a correct %ls path drops NO Cgmhook.log
-            #     into the wine CWD (the WORK dir). REGRESSION: a broken %s path
-            #     MUST drop Cgmhook.log (the truncated path is "C" + "gmhook.log").
-            if [ "$REGRESSION_MODE" = "1" ]; then
+            #     into the wine CWD (the WORK dir). REGRESSION-PATH: a broken %s
+            #     path MUST drop Cgmhook.log (the truncated path is "C" +
+            #     "gmhook.log"). REGRESSION-LINE: the path is still %ls so NO
+            #     CWD artifact must appear (the line revert isolates content, not
+            #     location) -- handled by guard (d) below.
+            if [ "$REGRESSION_MODE" = "path" ]; then
                 if [ -e "$WORK/Cgmhook.log" ]; then
                     record "broken build DROPS Cgmhook.log CWD artifact (guard catches %s)" 1
                 else
                     record "broken build DROPS Cgmhook.log CWD artifact (guard catches %s)" 0 \
                         "no Cgmhook.log -> broken build did not reproduce the %s path-truncation regression"
                 fi
-            else
+            elif [ -z "$REGRESSION_MODE" ]; then
                 if [ -e "$WORK/Cgmhook.log" ]; then
                     record "no Cgmhook.log CWD artifact (wide-format path OK)" 0 "Cgmhook.log in wine CWD -> %s path-truncation regression"
                 else
@@ -226,26 +287,30 @@ else
                 fi
             fi
 
-            # (b) %TEMP%\gmhook.log stamp. The fixed strings '[GM-HOOK] BUILD '
-            #     and 'loaded in' only co-occur on a full, non-truncated stamp
-            #     line (a %s regression writes only "[" per attach, so neither
-            #     substring appears). grep -qF (fixed-string) avoids regex-
-            #     mangling the brackets. POSITIVE: full stamp MUST be present.
-            #     REGRESSION: full stamp MUST be absent (the broken %s PATH
+            # (b) %TEMP%\gmhook.log stamp LITERALS. The fixed strings
+            #     '[GM-HOOK] BUILD ' and 'loaded in' only co-occur on a stamp
+            #     line that swprintf actually formatted (they are format-string
+            #     constants, so they survive a LINE %s regression too). grep -qF
+            #     (fixed-string) avoids regex-mangling the brackets. POSITIVE:
+            #     literals MUST be present. REGRESSION-PATH: the broken %s PATH
             #     redirects the full stamp to the CWD Cgmhook.log, so %TEMP%
-            #     gmhook.log is never written -- see guard (c)).
+            #     gmhook.log is never written -> literals MUST be absent (see
+            #     guard (c)). REGRESSION-LINE: the path is correct so %TEMP%
+            #     gmhook.log IS written and the literals ARE present -- guard (b)
+            #     alone false-passes here, which is exactly the gap guard (e)
+            #     closes (full host missing).
             full_stamp=0
             if [ -f "$GMHOOK_LOG" ] && grep -qF '[GM-HOOK] BUILD ' "$GMHOOK_LOG" && grep -qF 'loaded in' "$GMHOOK_LOG"; then
                 full_stamp=1
             fi
-            if [ "$REGRESSION_MODE" = "1" ]; then
+            if [ "$REGRESSION_MODE" = "path" ]; then
                 if [ "$full_stamp" = "1" ]; then
                     record "broken build leaves %TEMP% gmhook.log without a full BUILD stamp (guard catches %s)" 0 \
                         "full stamp present in %TEMP% gmhook.log -> broken build did not redirect the stamp away from %TEMP%"
                 else
                     record "broken build leaves %TEMP% gmhook.log without a full BUILD stamp (guard catches %s)" 1
                 fi
-            else
+            elif [ -z "$REGRESSION_MODE" ]; then
                 if [ "$full_stamp" = "1" ]; then
                     record "wine %TEMP% gmhook.log has full BUILD ... loaded in stamp" 1
                 else
@@ -253,8 +318,8 @@ else
                 fi
             fi
 
-            # (c) REGRESSION-only characterization: the broken build redirects the
-            #     FULL stamp to the CWD -- the path swprintf is %s so the log
+            # (c) REGRESSION-PATH-only characterization: the broken build redirects
+            #     the FULL stamp to the CWD -- the path swprintf is %s so the log
             #     opens "Cgmhook.log" in the CWD, but the stamp LINE still uses
             #     %ls (only the PATH was reverted) so its content is intact and
             #     fputws writes the full line to the CWD file. So the CWD
@@ -262,12 +327,71 @@ else
             #     proving the regression is a PATH redirect (wrong location), not
             #     a content truncation, and tying (a)+(b) together: the full stamp
             #     MISSING from %TEMP% (b) is present in the CWD (a).
-            if [ "$REGRESSION_MODE" = "1" ] && [ -e "$WORK/Cgmhook.log" ]; then
+            if [ "$REGRESSION_MODE" = "path" ] && [ -e "$WORK/Cgmhook.log" ]; then
                 if [ -f "$WORK/Cgmhook.log" ] && grep -qF '[GM-HOOK] BUILD ' "$WORK/Cgmhook.log"; then
                     record "broken build redirects FULL stamp to CWD Cgmhook.log (path %s, line %ls)" 1
                 else
                     record "broken build redirects FULL stamp to CWD Cgmhook.log (path %s, line %ls)" 0 \
                         "no full stamp in CWD Cgmhook.log -> broken build did not redirect the full stamp to the CWD"
+                fi
+            fi
+
+            # (d) REGRESSION-LINE: path is still correct (PATH %ls intact) so NO
+            #     CWD Cgmhook.log artifact appears -- the line revert isolates
+            #     CONTENT, not LOCATION (contrast with path mode guard (a)). If a
+            #     CWD artifact DOES appear, the line sed accidentally also broke
+            #     the path (a test bug, not the intended regression).
+            if [ "$REGRESSION_MODE" = "line" ]; then
+                if [ -e "$WORK/Cgmhook.log" ]; then
+                    record "line build keeps path correct (no CWD Cgmhook.log artifact)" 0 \
+                        "Cgmhook.log in wine CWD -> line revert also broke the path (unexpected)"
+                else
+                    record "line build keeps path correct (no CWD Cgmhook.log artifact)" 1
+                fi
+            fi
+
+            # (e) REGRESSION-LINE: %TEMP%\gmhook.log IS written (path correct) but
+            #     the stamp CONTENT is truncated -- MinGW %s collapses each
+            #     wchar_t* arg to its first char, so the full host basename
+            #     ("chrome.exe") is MISSING from the "loaded in <host>" field (it
+            #     reads "loaded in c"). This is the content-truncation half the
+            #     path guards do not cover. A correct %ls build writes the full
+            #     "loaded in chrome.exe" (see positive guard (f-pos)).
+            if [ "$REGRESSION_MODE" = "line" ]; then
+                if [ -f "$GMHOOK_LOG" ] && grep -qF 'loaded in chrome.exe' "$GMHOOK_LOG"; then
+                    record "line build truncates stamp content (full host MISSING from %TEMP% gmhook.log)" 0 \
+                        "full host 'loaded in chrome.exe' present -> line revert did not truncate content"
+                else
+                    record "line build truncates stamp content (full host MISSING from %TEMP% gmhook.log)" 1
+                fi
+            fi
+
+            # (f) REGRESSION-LINE characterization: the [GM-HOOK] BUILD ... loaded
+            #     in LITERALS are still present in the truncated %TEMP% stamp (they
+            #     are format-string constants, not wchar_t args), so the path-mode
+            #     guard (b) substring check ALONE false-passes on a content-
+            #     truncation regression -- proving why a dedicated full-host
+            #     content guard (e) is needed for the LINE half.
+            if [ "$REGRESSION_MODE" = "line" ] && [ -f "$GMHOOK_LOG" ]; then
+                if grep -qF '[GM-HOOK] BUILD ' "$GMHOOK_LOG" && grep -qF 'loaded in' "$GMHOOK_LOG"; then
+                    record "line build still has [GM-HOOK] BUILD/loaded in literals (guard (b) alone false-passes)" 1
+                else
+                    record "line build still has [GM-HOOK] BUILD/loaded in literals (guard (b) alone false-passes)" 0 \
+                        "literals missing -> line revert also dropped the format literals (unexpected)"
+                fi
+            fi
+
+            # (f-pos) POSITIVE: the full host basename IS present in the %TEMP%
+            #     stamp ("loaded in chrome.exe") -- the content-truncation
+            #     counterpart to guard (e). A %s LINE regression collapses the
+            #     host to its first char, so this guard catches a LINE wide-format
+            #     regression that the substring-only guard (b) would false-pass on.
+            if [ -z "$REGRESSION_MODE" ] && [ -f "$GMHOOK_LOG" ]; then
+                if grep -qF 'loaded in chrome.exe' "$GMHOOK_LOG"; then
+                    record "wine %TEMP% gmhook.log stamp has full host (loaded in chrome.exe)" 1
+                else
+                    record "wine %TEMP% gmhook.log stamp has full host (loaded in chrome.exe)" 0 \
+                        "full host missing -> %s line content-truncation regression"
                 fi
             fi
         fi

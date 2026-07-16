@@ -16,10 +16,18 @@
 #      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
 #      hosts (tests/test-shell-host-exclusion.sh) -- binary-level check that
 #      catches IsShellLauncherProcess regressions BEFORE deploying to the VM.
-#   4b. wine smoke test --regression-mode (negative direction): builds a BROKEN
-#      gmhook.dll (%ls->%s path) and asserts the runtime wide-format guards FAIL
-#      on it -- proves the guard catches a broken build, not just that a correct
-#      build passes (tests/test-shell-host-exclusion.sh --regression-mode).
+#   4b. wine smoke test --regression-mode (negative direction, PATH): builds a
+#      BROKEN gmhook.dll (%ls->%s path) and asserts the runtime wide-format
+#      guards FAIL on it -- proves the guard catches a broken build, not just
+#      that a correct build passes (tests/test-shell-host-exclusion.sh
+#      --regression-mode).
+#   4c. wine smoke test --regression-mode=line (negative direction, LINE/CONTENT):
+#      builds a BROKEN gmhook.dll with only the stamp-LINE %ls->%s reverted (path
+#      left intact) and asserts the content guards FAIL on it -- proves a LINE
+#      content-truncation regression (full host "loaded in chrome.exe" missing
+#      while the [GM-HOOK] BUILD/loaded in literals stay) is caught, covering the
+#      other half of the wide-format surface the path guards do not reach
+#      (tests/test-shell-host-exclusion.sh --regression-mode=line).
 #   5. gmproxy session-fix build + invariant test (tests/test-gmproxy-session.sh):
 #      MinGW cross-compile of gmproxy.c proves the session-correctness + graceful-
 #      fallback code BUILDS and yields a PE binary (catches undeclared symbols /
@@ -131,9 +139,9 @@ else
     fi
 fi
 
-# 4b. wine smoke test --regression-mode (negative direction): broken %ls->%s
-#     build must FAIL the runtime wide-format guards (proves the guard catches a
-#     broken build, not just that a correct build passes).
+# 4b. wine smoke test --regression-mode (negative direction, PATH): broken
+#     %ls->%s PATH build must FAIL the runtime wide-format guards (proves the
+#     guard catches a broken build, not just that a correct build passes).
 if [ ! -f "$smoke" ]; then
     record "wine smoke --regression-mode present" 0 "test-shell-host-exclusion.sh missing"
 else
@@ -144,6 +152,22 @@ else
     else
         rc=$?
         record "wine smoke --regression-mode: broken %ls->%s build FAILS the guards" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
+# 4c. wine smoke test --regression-mode=line (negative direction, LINE/CONTENT):
+#     broken stamp-LINE %ls->%s build (path left intact) must FAIL the content
+#     guards (full host "loaded in chrome.exe" missing while literals stay).
+if [ ! -f "$smoke" ]; then
+    record "wine smoke --regression-mode=line present" 0 "test-shell-host-exclusion.sh missing"
+else
+    log="$(mktemp)"
+    if bash "$smoke" --regression-mode=line >"$log" 2>&1; then
+        record "wine smoke --regression-mode=line: broken LINE %ls->%s build FAILS the content guards" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "wine smoke --regression-mode=line: broken LINE %ls->%s build FAILS the content guards" 0 "exit=$rc (log: $log)"
     fi
 fi
 
