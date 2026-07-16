@@ -239,6 +239,15 @@ if (Test-Path $DnsScript) {
     Add-Assertion -Name "Disable-GodMode calls Uninstall-IfeoElevation" -Pass ($Content -match '(?m)^\s+Uninstall-IfeoElevation\s*\r?\n')
     Add-Assertion -Name "IFEO Debugger targets gmproxy.exe" -Pass ($Content -match 'Set-ItemProperty.*Debugger.*gmproxy')
     Add-Assertion -Name "IFEO keys hardened (Harden-RegistryKey)" -Pass ($Content -match 'Harden-RegistryKey.*IfeoBaseSubKey')
+    # Auto-populate IFEO layer (critical processes kept intact).
+    Add-Assertion -Name "Auto-populate helper Get-IfeoElevationCandidates defined" -Pass ($Content -match 'function Get-IfeoElevationCandidates')
+    Add-Assertion -Name "Install-IfeoElevation calls auto-populate helper" -Pass ($Content -match 'Get-IfeoElevationCandidates')
+    Add-Assertion -Name "Auto-populate canonical denylist present (GmCriticalIfeoExclude)" -Pass ($Content -match 'GmCriticalIfeoExclude')
+    Add-Assertion -Name "Auto-populate denylist protects core OS (svchost)" -Pass ($Content -match '"svchost"')
+    Add-Assertion -Name "Auto-populate denylist protects shell (powershell)" -Pass ($Content -match '"powershell"')
+    Add-Assertion -Name "Auto-populate denylist protects God-Mode CLI dep (schtasks)" -Pass ($Content -match '"schtasks"')
+    Add-Assertion -Name "Auto-populate excludes System32/SysWOW64 paths" -Pass ($Content -like '*windows*system32*' -and $Content -like '*windows*syswow64*')
+    Add-Assertion -Name "Uninstall-IfeoElevation enumerates by gmproxy Debugger" -Pass ($Content -match 'Get-ChildItem.*IfeoBase' -and $Content -match 'Debugger.*-notlike.*gmproxy')
 } else {
     Add-Assertion -Name "Script present for IFEO checks" -Pass $false -Details "Skipped (God-Mode-Windows.ps1 missing)"
 }

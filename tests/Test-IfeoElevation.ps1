@@ -16,6 +16,15 @@
       - Enable-GodMode calls Install-IfeoElevation; Disable-GodMode calls Uninstall-IfeoElevation.
       - gmproxy.c still has the IFEO recursion bypass (CreateHardLinkW) the layer depends on.
       - Export-GodModeLogs IFEO diagnostic shows the newly-hooked apps.
+      - Auto-populate: Install-IfeoElevation also calls Get-IfeoElevationCandidates, which
+        scans running processes, AppPaths registry, Program Files, and %LOCALAPPDATA%\Programs,
+        applies a triple safety net (canonical name denylist union of all existing critical
+        lists, Windows/System32/SysWOW64 path-exclusion, dedup by base name), and merges the
+        survivors with the curated seed so any installed normal program is caught at launch
+        while critical/shell/OS processes stay intact.
+      - Uninstall-IfeoElevation now ENUMERATES IFEO keys by Debugger-contains-gmproxy
+        (robust cleanup of curated + auto-populated + legacy + uninstalled apps) instead of
+        a fixed app list.
 
     The app-list includes/excludes are scoped to the $IfeoElevationApps array INSIDE
     Install-IfeoElevation (extracted by regex), so the function's comment prose -- which
@@ -127,6 +136,43 @@ if ($uninstallMatch.Success) {
     Add-Assertion "Uninstall-IfeoElevation: restores ACL (Restore-RegistryKey) before delete" ($uninstallBody -match 'Restore-RegistryKey') "Restore-RegistryKey not called in uninstall (hardened keys could not be removed)"
     Add-Assertion "Uninstall-IfeoElevation: removes Debugger value" ($uninstallBody -match 'Remove-ItemProperty.*Debugger') "Debugger removal missing"
     Add-Assertion "Uninstall-IfeoElevation: removes IFEO key" ($uninstallBody -match 'Remove-Item.*appKey') "key removal missing"
+    # Robust cleanup: uninstall must ENUMERATE IFEO keys by Debugger-contains-gmproxy, not use a fixed app list.
+    Add-Assertion "Uninstall-IfeoElevation: enumerates IFEO keys (Get-ChildItem IfeoBase)" ($uninstallBody -match 'Get-ChildItem.*IfeoBase') "uninstall does not enumerate IFEO keys (not robust to auto-populated/legacy apps)"
+    Add-Assertion "Uninstall-IfeoElevation: filters by Debugger-contains-gmproxy" ($uninstallBody -match 'Debugger.*-notlike.*gmproxy|gmproxy.*-notlike') "uninstall does not select keys by gmproxy Debugger (could remove unrelated IFEO keys)"
+    Add-Assertion "Uninstall-IfeoElevation: NOT fixed-list based (no hardcoded app array)" ($uninstallBody -notmatch '\$IfeoElevationApps\s*=\s*@\(') "uninstall still uses a fixed app array (cannot clean auto-populated/legacy keys)"
+}
+
+# --- 6b. Auto-populate: Get-IfeoElevationCandidates helper + triple safety net ---
+Add-Assertion "Get-IfeoElevationCandidates function defined" ($gm -match 'function\s+Get-IfeoElevationCandidates\s*\{') "Get-IfeoElevationCandidates helper missing"
+Add-Assertion "Install-IfeoElevation calls Get-IfeoElevationCandidates" ($installBody -match 'Get-IfeoElevationCandidates') "install does not call the auto-populate helper"
+Add-Assertion "Install-IfeoElevation merges seed + auto candidates (Select-Object -Unique)" ($installBody -match '\$IfeoElevationApps\s*\+\s*\$autoCandidates.*Select-Object\s+-Unique') "seed + auto candidates not merged/deduped"
+$candMatch = [regex]::Match($gm, '(?s)function\s+Get-IfeoElevationCandidates\s*\{(.*?)\nfunction\s+Install-IfeoElevation\s*\{')
+$candBody = if ($candMatch.Success) { $candMatch.Groups[1].Value } else { "" }
+Add-Assertion "Get-IfeoElevationCandidates body extractable" ($candMatch.Success) "could not isolate Get-IfeoElevationCandidates body"
+if ($candMatch.Success) {
+    # The 4 scan sources.
+    Add-Assertion "Auto-populate: scans running processes (Win32_Process SessionId>0)" ($candBody -match 'Get-CimInstance\s+Win32_Process' -and $candBody -match 'SessionId\s*-gt\s*0') "running-process source missing"
+    Add-Assertion "Auto-populate: scans AppPaths registry" ($candBody -match 'App Paths') "AppPaths registry source missing"
+    Add-Assertion "Auto-populate: scans Program Files" ($candBody -match 'Program Files') "Program Files source missing"
+    Add-Assertion "Auto-populate: scans %LOCALAPPDATA%\Programs" ($candBody -match 'LOCALAPPDATA.*Programs') "per-user Programs source missing"
+    # Triple safety net #1: canonical name denylist covering core OS + shells + God-Mode CLI deps.
+    Add-Assertion "Auto-populate: denylist variable present (GmCriticalIfeoExclude)" ($candBody -match '\$GmCriticalIfeoExclude') "canonical name denylist missing"
+    Add-Assertion "Auto-populate: denylist contains core OS (svchost)" ($candBody -match '"svchost"') "denylist missing core OS name svchost"
+    Add-Assertion "Auto-populate: denylist contains core OS (csrss)" ($candBody -match '"csrss"') "denylist missing core OS name csrss"
+    Add-Assertion "Auto-populate: denylist contains shell (powershell)" ($candBody -match '"powershell"') "denylist missing shell name powershell"
+    Add-Assertion "Auto-populate: denylist contains shell (cmd)" ($candBody -match '"cmd"') "denylist missing shell name cmd"
+    Add-Assertion "Auto-populate: denylist contains terminal (conhost)" ($candBody -match '"conhost"') "denylist missing terminal name conhost"
+    Add-Assertion "Auto-populate: denylist contains God-Mode CLI dep (schtasks)" ($candBody -match '"schtasks"') "denylist missing God-Mode CLI dependency schtasks"
+    Add-Assertion "Auto-populate: denylist contains God-Mode CLI dep (netsh)" ($candBody -match '"netsh"') "denylist missing God-Mode CLI dependency netsh"
+    Add-Assertion "Auto-populate: denylist contains explorer + taskmgr (managed elsewhere)" ($candBody -match '"explorer"' -and $candBody -match '"taskmgr"') "denylist missing explorer/taskmgr"
+    Add-Assertion "Auto-populate: denylist contains gmproxy (no self-hook)" ($candBody -match '"gmproxy"') "denylist missing gmproxy"
+    Add-Assertion "Auto-populate: denylist stored as bare name and name.exe" ($candBody -match 'excludeSet\[\$name\.ToLower' -and $candBody -match '\$name\.exe') "denylist not stored as both bare name and name.exe"
+    # Triple safety net #2: Windows/System32/SysWOW64 path hard-exclusion.
+    Add-Assertion "Auto-populate: excludes System32 path" ($candBody -like '*windows*system32*') "System32 path-exclusion missing"
+    Add-Assertion "Auto-populate: excludes SysWOW64 path" ($candBody -like '*windows*syswow64*') "SysWOW64 path-exclusion missing"
+    # Triple safety net #3: sanity filters (dedup by base name, .exe only).
+    Add-Assertion "Auto-populate: dedups by lowercased base name" ($candBody -match 'seen\.ContainsKey\(\$baseKey\)') "dedup-by-base-name missing"
+    Add-Assertion "Auto-populate: only accepts .exe paths (notmatch exe guard)" ($candBody -match '-notmatch.*exe') ".exe-only sanity filter missing"
 }
 
 # --- 7. Enable/Disable-GodMode wiring (standalone call lines, not the definitions) ---

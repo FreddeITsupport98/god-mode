@@ -4125,6 +4125,137 @@ function Uninstall-ProcessHook {
     explorer.exe is managed by the SystemDesktop session path; taskmgr.exe by the
     Block-TaskManager watcher. This mirrors IsShellLauncherProcess in gmhook.c.
 #>
+function Get-IfeoElevationCandidates {
+    <#
+    .SYNOPSIS
+        Collect candidate executables for IFEO-based SYSTEM elevation.
+    .DESCRIPTION
+        Scans four safe sources (running user-session processes, AppPaths registry,
+        Program Files, and %LOCALAPPDATA%\Programs), applies a triple safety net, and
+        returns a deduplicated list of base names (e.g., "chrome.exe") that should be
+        hooked via IFEO Debugger -> gmproxy.exe. The curated seed in
+        Install-IfeoElevation is merged with these candidates; this function never
+        returns critical/shell/OS processes.
+    #>
+    param([string]$GmProxyExe)
+
+    # Safety net #1: canonical name denylist. UNION of every existing critical list
+    # in the codebase so nothing already protected can regress.
+    # Sources:
+    #   - gmhook.c IsCriticalProcess (core OS)
+    #   - gmhook.c IsShellLauncherProcess (shells/terminals)
+    #   - Start-Monitoring $CriticalProcs (shell/UX brokers + core OS)
+    #   - Invoke-ExistingProcessElevation $CriticalProcs (core OS + script hosts)
+    #   - Install-ProcessHook $CriticalProcs (shells/terminals + core OS)
+    #   - God Mode's own CLI-tool dependencies (it shells these out)
+    #   - Managed by other paths: explorer.exe, taskmgr.exe
+    #   - God Mode binaries: gmproxy.exe, gmhook.dll (no self-hook)
+    $GmCriticalIfeoExclude = @(
+        # Core OS
+        "csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost",
+        "System","Registry","Memory Compression","Secure System","Idle",
+        # Shells / terminals
+        "cmd","powershell","pwsh","wt","conhost","OpenConsole","WindowsTerminal","wsl","wslhost",
+        # Shell/UX brokers (Start-Monitoring list + others)
+        "RuntimeBroker","ApplicationFrameHost","ShellExperienceHost","SearchUI","SearchIndexer",
+        "SearchProtocolHost","SearchFilterHost","SearchHost","StartMenuExperienceHost","TextInputHost",
+        "SystemSettingsBroker","SystemSettings","ShellHost","sihost","taskhostw","ctfmon","LockApp",
+        "LogonUI","fontdrvhost","SecurityHealthSystray","SecurityHealthService","MsMpEng","MsMpEngCP",
+        "MpDefenderCoreService","MsSense","MpCmdRun","NisSrv","SgrmBroker","TiWorker","CompatTelRunner",
+        "WUDFHost","WmiPrvSE","unsecapp","dllhost","rundll32","regsvr32","WmiApSrv",
+        # God Mode's own CLI-tool dependencies
+        "sc","schtasks","wmic","reg","wscript","cscript","mshta","bcdedit","reagentc","wevtutil",
+        "netsh","ipconfig","net","taskkill","whoami",
+        # Managed by other paths
+        "explorer","taskmgr",
+        # God Mode binaries
+        "gmproxy","gmhook"
+    )
+
+    # Build a hash set of both "name.exe" and bare "name" for robust matching.
+    $excludeSet = @{}
+    foreach ($name in $GmCriticalIfeoExclude) {
+        $excludeSet[$name.ToLower()] = $true
+        if ($name -notmatch '\.exe$') { $excludeSet[("$name.exe").ToLower()] = $true }
+    }
+
+    $candidates = @()
+
+    # Source 1: running user-session processes (SessionId > 0) via Win32_Process.
+    try {
+        $procs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.SessionId -gt 0 -and $_.ExecutablePath -and $_.ExecutablePath -like "*.exe"
+        }
+        foreach ($p in $procs) { $candidates += $p.ExecutablePath }
+    } catch {}
+
+    # Source 2: AppPaths registry (installer-registered launchers).
+    $appPathsRoots = @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths"
+    )
+    foreach ($root in $appPathsRoots) {
+        if (-not (Test-Path $root)) { continue }
+        try {
+            Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+                $exePath = $null
+                try { $exePath = (Get-ItemProperty -Path $_.PSPath -Name "(default)" -ErrorAction SilentlyContinue).'(default)' } catch {}
+                if ($exePath -and $exePath -like "*.exe") { $candidates += $exePath }
+            }
+        } catch {}
+    }
+
+    # Source 3: Program Files (top-level + one level deep) and
+    # Source 4: %LOCALAPPDATA%\Programs (per-user installs).
+    $scanDirs = @("C:\Program Files", "C:\Program Files (x86)", "$env:LOCALAPPDATA\Programs") | Where-Object { $_ -and (Test-Path $_) }
+    foreach ($dir in $scanDirs) {
+        try {
+            # Depth 1: top-level *.exe
+            Get-ChildItem -Path $dir -Filter "*.exe" -File -ErrorAction SilentlyContinue | ForEach-Object { $candidates += $_.FullName }
+            # Depth 2: one subdirectory of *.exe
+            Get-ChildItem -Path $dir -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+                Get-ChildItem -Path $_.FullName -Filter "*.exe" -File -ErrorAction SilentlyContinue | ForEach-Object { $candidates += $_.FullName }
+            }
+        } catch {}
+    }
+
+    # Deduplicate by base name, apply name-denylist, path-exclusion, and sanity filters.
+    $seen = @{}
+    $excluded = 0
+    $result = @()
+    foreach ($path in $candidates) {
+        if (-not $path) { continue }
+        try {
+            # Sanity: must be a real .exe with resolvable path.
+            if ($path -notmatch '\.exe\s*$') { continue }
+            $fullPath = $path.Trim()
+            $baseName = [System.IO.Path]::GetFileName($fullPath)
+            if ([string]::IsNullOrWhiteSpace($baseName)) { continue }
+            $baseKey = $baseName.ToLower()
+
+            # Safety net #2: path hard-exclusion (Windows/System32/SysWOW64) and
+            # never hook gmproxy's own image (defense-in-depth on the name denylist).
+            $norm = $fullPath.Replace('/', '\').ToLower()
+            $gmProxyNorm = if ($GmProxyExe) { $GmProxyExe.Replace('/', '\').ToLower() } else { '' }
+            if ($gmProxyNorm -and $norm -eq $gmProxyNorm) { $excluded++; continue }
+            if ($norm -like "*\windows\system32\*" -or $norm -like "*\windows\syswow64\*" -or $norm -match '\\windows\\[^\\]+\.exe$') { $excluded++; continue }
+
+            # Safety net #1: canonical name denylist.
+            if ($excludeSet.ContainsKey($baseKey)) { $excluded++; continue }
+            # Also exclude by bare name without extension.
+            $bare = [System.IO.Path]::GetFileNameWithoutExtension($baseName).ToLower()
+            if ($excludeSet.ContainsKey($bare)) { $excluded++; continue }
+
+            # Deduplicate by base name.
+            if ($seen.ContainsKey($baseKey)) { continue }
+            $seen[$baseKey] = $true
+            $result += $baseName
+        } catch {}
+    }
+
+    return $result
+}
+
 function Install-IfeoElevation {
     Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "ENTRY"
     try {
@@ -4137,6 +4268,8 @@ function Install-IfeoElevation {
 
         # Curated list of normal user programs to launch as SYSTEM via IFEO -> gmproxy.
         # EXCLUDED: shells/terminals + explorer.exe + taskmgr.exe (see function notes).
+        # This seed guarantees known-good apps (including the few safe System32 tools
+        # regedit.exe / mstsc.exe) are always covered even if auto-populate cannot find them.
         $IfeoElevationApps = @(
             "chrome.exe","firefox.exe","msedge.exe","opera.exe","brave.exe","vivaldi.exe","iexplore.exe",
             "notepad.exe","notepad++.exe","wordpad.exe","write.exe",
@@ -4151,11 +4284,15 @@ function Install-IfeoElevation {
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
 
+        # Auto-populate additional candidates from installed/running programs, then merge with the seed.
+        $autoCandidates = Get-IfeoElevationCandidates -GmProxyExe $GmProxyExe
+        $allApps = $IfeoElevationApps + $autoCandidates | Select-Object -Unique
+
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $hooked = 0; $skipped = 0; $failed = 0
 
-        foreach ($app in $IfeoElevationApps) {
+        foreach ($app in $allApps) {
             $appKey = Join-Path $IfeoBase $app
             try {
                 $existing = $null
@@ -4186,8 +4323,13 @@ function Install-IfeoElevation {
                 Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "Failed to hook $app`: $_"
             }
         }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. Listed normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed"
+        $autoCount = $autoCandidates.Count
+        $seedCount = $IfeoElevationApps.Count
+        $totalUnique = $allApps.Count
+        $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
+        if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
@@ -4199,40 +4341,40 @@ function Install-IfeoElevation {
 function Uninstall-IfeoElevation {
     Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "ENTRY"
     try {
-        $IfeoElevationApps = @(
-            "chrome.exe","firefox.exe","msedge.exe","opera.exe","brave.exe","vivaldi.exe","iexplore.exe",
-            "notepad.exe","notepad++.exe","wordpad.exe","write.exe",
-            "winword.exe","excel.exe","powerpnt.exe","outlook.exe","msaccess.exe","onenote.exe",
-            "teams.exe","discord.exe","zoom.exe","skype.exe","webex.exe","slack.exe","telegram.exe",
-            "code.exe","sublime_text.exe","devenv.exe","rider64.exe","pycharm64.exe","idea64.exe","eclipse.exe",
-            "vlc.exe","spotify.exe","winamp.exe","wmplayer.exe","groove.exe","photos.exe","movies.exe",
-            "acrobat.exe","acrord32.exe","foxitreader.exe","sumatrapdf.exe",
-            "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
-            "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
-            "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
-            "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
-        )
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
-        $removed = 0; $failed = 0
-        foreach ($app in $IfeoElevationApps) {
-            $appKey = Join-Path $IfeoBase $app
-            if (-not (Test-Path $appKey)) { continue }
-            try {
-                # Keys are hardened (Admins denied Delete/WriteKey). Restore-RegistryKey
-                # removes the deny rules + re-enables inheritance (with a SYSTEM fallback),
-                # after which an admin can delete the Debugger value and the key itself.
-                $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$app"
-                Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
-                Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
-                if (-not (Test-Path $appKey)) { $removed++ } else { $failed++ }
-            } catch {
-                $failed++
-                Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "WARN" -Message "Failed to unhook $app`: $_"
+        $removed = 0; $failed = 0; $scanned = 0
+
+        # Enumerate every IFEO subkey and remove any whose Debugger value points at gmproxy.
+        # This is robust against: curated seed apps, auto-populated apps, legacy lists,
+        # apps uninstalled between enable/disable, and future dynamic keys.
+        if (Test-Path $IfeoBase) {
+            $subKeys = Get-ChildItem -Path $IfeoBase -ErrorAction SilentlyContinue
+            foreach ($subKey in $subKeys) {
+                $appName = $subKey.PSChildName
+                $appKey = $subKey.PSPath
+                $debugger = $null
+                try {
+                    $debugger = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+                } catch {}
+                $scanned++
+                if (-not $debugger -or $debugger -notlike "*gmproxy*") { continue }
+                try {
+                    # Keys are hardened (Admins denied Delete/WriteKey). Restore-RegistryKey
+                    # removes the deny rules + re-enables inheritance (with a SYSTEM fallback),
+                    # after which an admin can delete the Debugger value and the key itself.
+                    $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$appName"
+                    Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
+                    Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
+                    if (-not (Test-Path $appKey)) { $removed++ } else { $failed++ }
+                } catch {
+                    $failed++
+                    Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "WARN" -Message "Failed to unhook $appName`: $_"
+                }
             }
         }
-        Write-Log -Message "IFEO elevation removed: $removed removed, $failed failed." -Type "INFO" -Color Gray
-        Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "EXIT" -Message "removed=$removed failed=$failed"
+        Write-Log -Message "IFEO elevation removed: $removed removed, $failed failed (scanned $scanned IFEO keys)." -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "EXIT" -Message "removed=$removed failed=$failed scanned=$scanned"
     } catch {
         Write-Log -Message "Uninstall-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
         Write-DebugLog -FunctionName "Uninstall-IfeoElevation" -Action "ERROR" -Message "Outer catch: $_"
