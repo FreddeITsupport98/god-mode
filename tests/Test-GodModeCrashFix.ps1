@@ -60,14 +60,14 @@ if (Test-Path $GmHook) {
     $hookSrc = Get-Content -Raw $GmHook
     Add-Assertion "gmhook.c: cb clamp present (siCopy.cb = sizeof(siCopy))" `
         ($hookSrc -match 'siCopy\.cb\s*=\s*sizeof\(siCopy\)') "cb not clamped to sizeof(STARTUPINFOW)"
-    Add-Assertion "gmhook.c: extended STARTUPINFO skip (cb > sizeof(STARTUPINFOW))" `
-        ($hookSrc -match 'cb\s*>\s*sizeof\(STARTUPINFOW\)') "extended SI not skipped -> 0xC0000005 returns"
+    Add-Assertion "gmhook.c: extended STARTUPINFO downgrade (base sizeof copy + EXTENDED bit clear)" `
+        ($hookSrc -match 'memcpy\(&siCopy,\s*lpStartupInfo,\s*sizeof\(STARTUPINFOW\)\)' -and $hookSrc -match '~0x00080000') "extended SI not downgraded to plain STARTUPINFOW (base-field copy or EXTENDED-bit clear missing) -> 0xC0000005 returns"
     Add-Assertion "gmhook.c: NULL PROCESS_INFORMATION guard" `
         ($hookSrc -match '!lpProcessInformation') "NULL PI guard missing"
     Add-Assertion "gmhook.c: isolated token helper TryCreateProcessWithSystemToken" `
         ($hookSrc -match 'TryCreateProcessWithSystemToken') "helper missing"
-    Add-Assertion "gmhook.c: EXTENDED_STARTUPINFO_PRESENT bypass" `
-        ($hookSrc -match '0x00080000') "EXTENDED flag bypass missing"
+    Add-Assertion "gmhook.c: EXTENDED_STARTUPINFO_PRESENT handled (cleared before token launch)" `
+        ($hookSrc -match '0x00080000') "EXTENDED_STARTUPINFO_PRESENT handling missing"
     Add-Assertion "gmhook.c: e_lfanew sanity in HookModuleIAT" `
         ($hookSrc -match 'e_lfanew\s*<=\s*0') "e_lfanew sanity missing"
     # --- Shell/launcher host exclusion (the actual 0xC0000005 fix) ---

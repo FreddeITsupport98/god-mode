@@ -92,6 +92,7 @@ if (-not $Principal.IsInRole($Role)) {
         if ($Verbose) { $ArgsString += " -Verbose" }
         if ($ExportElevationDiagnostics) { $ArgsString += " -ExportElevationDiagnostics" }
         if ($ElevateAllProcesses) { $ArgsString += " -ElevateAllProcesses" }
+        if ($LaunchTaskMgrAsSystem) { $ArgsString += " -LaunchTaskMgrAsSystem" }
 
         $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
@@ -5783,19 +5784,62 @@ if ($ElevateAllProcesses) {
 if ($LaunchTaskMgrAsSystem) {
     Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "ENTRY"
     Enable-ElevationPrivileges
+
+    # CreateProcessWithTokenW (used by [TokenOps]::CreateProcessFromToken below)
+    # is serviced by the Secondary Logon service (seclogon). If seclogon is stopped
+    # or disabled -- common on tweaked/optimized builds and some VMs -- every
+    # SYSTEM launch via a stolen token fails (Win32 1460/1058) and Task Manager
+    # falls back to an unelevated start. Best-effort ensure it is running first.
+    try {
+        $seclogon = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+        if ($seclogon) {
+            if ($seclogon.StartType -eq 'Disabled') {
+                Set-Service -Name seclogon -StartupType Manual -ErrorAction SilentlyContinue
+                Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "INFO" -Message "seclogon was Disabled; set to Manual"
+            }
+            if ($seclogon.Status -ne 'Running') {
+                Start-Service -Name seclogon -ErrorAction SilentlyContinue
+                Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "INFO" -Message "seclogon start attempted"
+            }
+        }
+    } catch {
+        Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "WARN" -Message "seclogon ensure failed: $($_.Exception.Message)"
+    }
+
     $systemPid = Find-SystemProcessCandidate
+    # Resolve a real Task Manager image to launch. The legacy
+    # $GodModeInstallDir\taskmgr_real.exe copy is only ever DELETED (in
+    # Block/Unblock-TaskManager) and is never created anywhere in the script, so
+    # Test-Path on it was almost always false and the SYSTEM launch was silently
+    # skipped. Prefer the genuine System32 taskmgr.exe and only use the copy if it
+    # happens to exist.
     $TaskMgrCopy = Join-Path $GodModeInstallDir "taskmgr_real.exe"
-    if ($systemPid -ne 0 -and (Test-Path $TaskMgrCopy)) {
-        $result = [TokenOps]::CreateProcessAsSystem($systemPid, $TaskMgrCopy, $TaskMgrCopy, $false)
+    if (Test-Path $TaskMgrCopy) {
+        $TaskMgrTarget = $TaskMgrCopy
+    } else {
+        $TaskMgrTarget = Join-Path $env:WINDIR "System32\taskmgr.exe"
+    }
+    if ($systemPid -ne 0 -and (Test-Path $TaskMgrTarget)) {
+        # Use CreateProcessFromToken -> CreateProcessWithTokenW, which only requires
+        # SeImpersonatePrivilege (held by an interactive Administrator token). The
+        # previous CreateProcessAsSystem -> CreateProcessAsUser path requires
+        # SeAssignPrimaryTokenPrivilege, which Administrator does NOT hold, so it
+        # always failed with Win32 error 1314 (ERROR_PRIVILEGE_NOT_HELD) and fell
+        # back to an unelevated Start-Process -- the exact "it does not elevate to
+        # system" symptom. CreateProcessAsUser remains correct when the caller is
+        # already SYSTEM (used by the scheduled-task monitor via
+        # Invoke-ParallelElevation), just not for this admin-CLI launcher.
+        $result = [TokenOps]::CreateProcessFromToken($systemPid, $TaskMgrTarget, $TaskMgrTarget, $false)
         if ($result -eq 0) {
-            Write-Log -Message "Task Manager launched as SYSTEM." -Type "INFO" -Color Green
+            Write-Log -Message "Task Manager launched as SYSTEM (via CreateProcessWithTokenW)." -Type "INFO" -Color Green
         } else {
-            Write-Log -Message "Task Manager SYSTEM launch failed (error $result). Falling back to normal launch." -Type "WARN" -Color Yellow
-            Start-Process $TaskMgrCopy
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessWithTokenW"
+            Write-Log -Message "Task Manager SYSTEM launch failed (error $($result): $($errMsg)). Falling back to normal launch." -Type "WARN" -Color Yellow
+            Start-Process $TaskMgrTarget
         }
     } else {
-        Write-Log -Message "No SYSTEM token or taskmgr copy available for SYSTEM launch." -Type "WARN" -Color Yellow
-        if (Test-Path $TaskMgrCopy) { Start-Process $TaskMgrCopy }
+        Write-Log -Message "No SYSTEM token or Task Manager image available for SYSTEM launch." -Type "WARN" -Color Yellow
+        if (Test-Path $TaskMgrTarget) { Start-Process $TaskMgrTarget }
     }
     Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "EXIT"
     Exit

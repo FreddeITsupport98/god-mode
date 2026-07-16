@@ -217,32 +217,42 @@ static BOOL IsShellLauncherProcess(const wchar_t* baseName) {
    CreateProcessW). Isolated into its own function so an MSVC __try/__except
    guard around the call can convert any fault into a plain FALSE instead of
    crashing the host process (the 0xC0000005 seen after "Defender processes
-   terminated."). The deterministic checks below are the actual fix and work on
-   every toolchain; the SEH guard is defense-in-depth on MSVC builds. */
+   terminated."). The deterministic normalization below is the actual fix and
+   works on every toolchain; the SEH guard is defense-in-depth on MSVC builds. */
 static BOOL TryCreateProcessWithSystemToken(
     CreateProcessWithTokenW_t pCpwt,
     LPCWSTR lpApplicationName, LPWSTR lpCommandLine,
     DWORD dwCreationFlags, LPVOID lpEnvironment, LPCWSTR lpCurrentDirectory,
     LPSTARTUPINFOW lpStartupInfo, LPPROCESS_INFORMATION lpProcessInformation)
 {
-    /* CreateProcessWithTokenW cannot consume an EXTENDED_STARTUPINFO (it has no
-       attribute-list support), needs a non-NULL PROCESS_INFORMATION, and needs
-       the stolen SYSTEM token. */
+    /* CreateProcessWithTokenW cannot consume an EXTENDED_STARTUPINFO attribute
+       list, needs a non-NULL PROCESS_INFORMATION, and needs the stolen SYSTEM
+       token. The NULL/guard checks below stay hard requirements; everything
+       else is normalized so we can still take the token path. */
     if (!pCpwt || !gSystemToken || !lpProcessInformation) return FALSE;
-    if (dwCreationFlags & 0x00080000) return FALSE; /* EXTENDED_STARTUPINFO_PRESENT */
 
-    /* Build a PLAIN STARTUPINFOW copy. If the caller passed a larger STARTUPINFOEX
-       (cb > sizeof(STARTUPINFOW)) we must NOT hand our truncated local to
-       CreateProcessWithTokenW: the kernel would read the lpAttributeList pointer
-       at offset sizeof(STARTUPINFOW) -- past this stack variable -- and
-       dereference garbage, causing STATUS_ACCESS_VIOLATION (0xC0000005).
-       Fall back to the real CreateProcessW instead, which handles STARTUPINFOEX. */
+    /* Build a PLAIN STARTUPINFOW copy. If the caller passed a STARTUPINFOEX
+       (cb > sizeof(STARTUPINFOW) and/or EXTENDED_STARTUPINFO_PRESENT set) -- which
+       is how explorer.exe launches Task Manager and most modern shell apps -- we
+       DOWNGRADE to a plain STARTUPINFOW instead of bailing out unelevated:
+         - copy only the first sizeof(STARTUPINFOW) bytes (STARTUPINFOEX begins
+           with an embedded STARTUPINFOW, so those bytes are always valid),
+         - clamp cb to sizeof(STARTUPINFOW) so the kernel never reads an
+           lpAttributeList pointer past our local (the original 0xC0000005 was
+           caused by leaving cb == sizeof(STARTUPINFOEX) on a truncated local),
+         - CLEAR the EXTENDED_STARTUPINFO_PRESENT (0x00080000) bit from the
+           creation flags we pass on, so the kernel does not treat our plain
+           STARTUPINFOW as a STARTUPINFOEX and try to dereference an attribute
+           list that is not there.
+       The caller's attribute list (inherited handle list / mitigation policies)
+       is intentionally dropped so the child can be BORN as SYSTEM; on any
+       failure we still fall back to the real CreateProcessW (which preserves
+       the attribute list but runs unelevated), so there is no regression. */
     STARTUPINFOW siCopy = {0};
     LPSTARTUPINFOW pSi;
     if (lpStartupInfo) {
-        if (lpStartupInfo->cb > sizeof(STARTUPINFOW)) return FALSE; /* extended SI */
-        if (lpStartupInfo->cb == sizeof(STARTUPINFOW)) {
-            siCopy = *lpStartupInfo;
+        if (lpStartupInfo->cb >= sizeof(STARTUPINFOW)) {
+            memcpy(&siCopy, lpStartupInfo, sizeof(STARTUPINFOW)); /* base fields (plain OR EX) */
         } else if (lpStartupInfo->cb > 0) {
             memcpy(&siCopy, lpStartupInfo, lpStartupInfo->cb);
         }
@@ -257,8 +267,11 @@ static BOOL TryCreateProcessWithSystemToken(
         pSi = &siCopy;
     }
 
+    /* Strip EXTENDED_STARTUPINFO_PRESENT: we now pass a plain STARTUPINFOW. */
+    DWORD flagsOut = dwCreationFlags & ~0x00080000u;
+
     return pCpwt(gSystemToken, 0, lpApplicationName, lpCommandLine,
-        dwCreationFlags, lpEnvironment, lpCurrentDirectory, pSi, lpProcessInformation);
+        flagsOut, lpEnvironment, lpCurrentDirectory, pSi, lpProcessInformation);
 }
 
 static BOOL WINAPI HookCreateProcessW(
