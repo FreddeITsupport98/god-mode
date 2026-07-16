@@ -85,6 +85,8 @@ if (Test-Path $GmHook) {
         ($hookSrc -match '!IsCriticalProcess\(baseName\)\s*&&\s*!IsShellLauncherProcess\(baseName\)') "GetMsgProc/DllMain do not AND IsShellLauncherProcess"
     Add-Assertion "gmhook.c: recursion guard resets on re-entry return" `
         ($hookSrc -match 'InterlockedExchange\(&inHook,\s*0\);\s*\r?\n\s*return pOrigCreateProcessW') "recursion guard leak (inHook not reset before return)"
+    Add-Assertion "gmhook.c: IsHookInstalled diagnostic export present" `
+        ($hookSrc -match '__declspec\(dllexport\)\s+BOOL\s+IsHookInstalled') "IsHookInstalled export missing (wine smoke test depends on it)"
 } else {
     Add-Assertion "gmhook.c exists" $false "file not found: $GmHook"
 }

@@ -611,6 +611,17 @@ __declspec(dllexport) void UninstallHook(void) {
     }
 }
 
+/* Read-only diagnostic export: returns TRUE if the CreateProcessW IAT hook has
+   been installed in this host process, FALSE otherwise. Used by the wine smoke
+   test (tests/test-shell-host-exclusion.sh -> Test-ShellHostExclusion.c) to
+   verify that shell/launcher hosts (pwsh/powershell/cmd/terminals) are NOT
+   IAT-hooked in-process -- the 0xC0000005 fix -- BEFORE deploying to the
+   Windows VM. Safe to call from any thread: it only reads the hookInstalled
+   flag set by DllMain / GetMsgProc. */
+__declspec(dllexport) BOOL IsHookInstalled(void) {
+    return hookInstalled;
+}
+
 /* Explicit injection helper: injects this DLL into a target process */
 __declspec(dllexport) BOOL InjectIntoProcess(DWORD pid) {
     if (!gHModule) return FALSE;

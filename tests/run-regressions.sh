@@ -7,6 +7,10 @@
 #   3. PowerShell regression suites via pwsh:
 #        - Test-GodModeCrashFix.ps1  (the 0xC0000005 crash-fix regression)
 #        - Test-Suite.ps1            (DNSGuard / God-Mode structure suite)
+#   4. wine smoke test: loads the built gmhook.dll into pwsh.exe + chrome.exe
+#      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
+#      hosts (tests/test-shell-host-exclusion.sh) -- binary-level check that
+#      catches IsShellLauncherProcess regressions BEFORE deploying to the VM.
 #
 # Prints a FAIL SUMMARY (N) block and exits 1 on any failure, 0 if all pass.
 # Usage: bash tests/run-regressions.sh
@@ -92,6 +96,21 @@ else
             record "pwsh $suite" 0 "exit=$rc (log: $log)"
         fi
     done
+fi
+
+# 4. wine smoke test: gmhook.dll shell-host exclusion (binary-level).
+smoke="$SCRIPT_DIR/test-shell-host-exclusion.sh"
+if [ ! -f "$smoke" ]; then
+    record "test-shell-host-exclusion.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$smoke" >"$log" 2>&1; then
+        record "wine smoke: gmhook.dll not hooked in pwsh.exe (chrome.exe control hooked)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "wine smoke: gmhook.dll not hooked in pwsh.exe (chrome.exe control hooked)" 0 "exit=$rc (log: $log)"
+    fi
 fi
 
 # Final summary with FAIL SUMMARY (N).
