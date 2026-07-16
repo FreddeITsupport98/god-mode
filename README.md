@@ -273,6 +273,15 @@ Tests cover:
 - Scheduled task registration/unregistration
 - File integrity and hash checks
 
+### Regression Binder & wine Smoke Test
+
+Run the full regression binder (shellcheck + MinGW/wine C test + PowerShell suites + the `gmhook.dll` wine smoke test) in one command:
+```bash
+bash tests/run-regressions.sh
+```
+
+`tests/test-shell-host-exclusion.sh` builds `gmhook.dll` with MinGW, loads it into `pwsh.exe` and `chrome.exe` stub hosts (built from `tests/Test-ShellHostExclusion.c`) under wine, and asserts via the exported `IsHookInstalled()` diagnostic that the `CreateProcessW` IAT hook is NOT installed in shell/launcher hosts (the `0xC0000005` fix) and IS installed in the `chrome.exe` control. This catches `IsShellLauncherProcess` regressions at the BINARY level before deploying to the Windows VM. It prints a FAIL SUMMARY (N) block and exits 1 on any failure.
+
 ---
 
 ## Syntax Checking
@@ -300,6 +309,7 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 
 ### Unreleased
 
+- **2026-07-16 18:05 UTC** — Added a wine smoke test that catches `gmhook.dll` shell-host-exclusion regressions BEFORE deploying to the Windows VM. `driver/gmhook.c` exports a read-only `IsHookInstalled()` diagnostic; `tests/Test-ShellHostExclusion.c` is a stub host built twice (as `pwsh.exe` and `chrome.exe`) that loads the real `gmhook.dll` under wine and asserts the `CreateProcessW` IAT hook is NOT installed in `pwsh.exe` and IS installed in the `chrome.exe` control. `tests/test-shell-host-exclusion.sh` runs it with a FAIL SUMMARY (N) + exit-1 contract and is wired into `tests/run-regressions.sh` as step 4; `Test-GodModeCrashFix.ps1` gained a source assertion guarding the new export.
 - **2026-07-15 18:59 UTC** — Fixed PowerShell 7 (`pwsh.exe`) fatal crash `0xC0000005` (STATUS_ACCESS_VIOLATION) inside `Kernel32.CreateProcess`. Root cause: `gmhook.dll` was injected into shell/launcher hosts (PowerShell, cmd, terminals) and rerouted their `CreateProcessW` calls through the stolen-token `CreateProcessWithTokenW` path — a native access violation PowerShell `try/catch` cannot recover from (it kills `pwsh.exe`). Fix: `gmhook.c` adds `IsShellLauncherProcess()` (excludes `pwsh.exe`, `powershell.exe`, `cmd.exe`, `wt.exe`, `conhost.exe`, `OpenConsole.exe`, `WindowsTerminal.exe` from IAT hooking at the `HookCreateProcessW` pass-through, `GetMsgProc`, and `DllMain` sites); `Install-ProcessHook` adds the same hosts to its `$CriticalProcs` DLL-injection skip-list. These hosts are still elevated to SYSTEM via `Invoke-HybridElevation` / `CreateProcessAsSystem`; they are simply not IAT-hooked in-process. Also fixed a `HookCreateProcessW` recursion-guard leak (one re-entry permanently left `inHook==1`, silently disabling elevation) and documented why MinGW builds rely on deterministic STARTUPINFO validation instead of SEH (the `<excpt.h>` `__try1` macro emits invalid `.seh_endproc`/`.text.startup` directives under `-O2` on mingw-w64 16.x). Regression tests extended in `tests/Test-GmHookFix.c` and `tests/Test-GodModeCrashFix.ps1`.
 - **2026-07-10 20:08 UTC** — Added rotating raw debug/error dumper (`Export-RawDebugDump`) with automatic log rotation (keeps 5 most recent dumps) and global `trap` auto-capture; also hardened `Uninstall-GodModePersistence` and `Uninstall-Persistence` to explicitly delete payloads via `cmd /c del /f /q` before directory removal for reliable cleanup against hardened ACLs
 - **2026-07-10 19:09 UTC** — Added `Harden-RegistryKey` and `Restore-RegistryKey` helpers; integrated multi-layer registry ACL hardening into DNS Lockout, DoH, and God Mode enable/disable flows
@@ -337,6 +347,9 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 | `God-Mode-Windows.ps1` | Main dual-suite script (DNS Lockout + God Mode) |
 | `syntax_check.ps1` | Enhanced multi-layer syntax checker, regression validator, and auto-chmod utility |
 | `tests/Test-Suite.ps1` | Regression test suite for syntax, installer logic, and menu integrity |
+| `tests/Test-ShellHostExclusion.c` | wine smoke-test stub host for gmhook.dll shell-host exclusion |
+| `tests/test-shell-host-exclusion.sh` | wine smoke-test runner: builds gmhook.dll + pwsh.exe/chrome.exe stubs, runs under wine, FAIL SUMMARY (N) + exit-1 |
+
 | `changelog.md` | External project changelog |
 | `driver/build.ps1` | Auto-detecting C component build script (MSVC / MinGW) |
 | `driver/gmproxy.c` | IFEO proxy source — launches apps as SYSTEM via token theft |
