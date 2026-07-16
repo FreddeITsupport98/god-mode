@@ -2066,7 +2066,20 @@ public class TokenOps {
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool SetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, ref int TokenInformation, int TokenInformationLength);
 
+    [DllImport("advapi32.dll", SetLastError = true)]
+    public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
+
+    [DllImport("wtsapi32.dll")]
+    public static extern uint WTSGetActiveConsoleSessionId();
+
     public const int TokenSessionId = 12;
+
+    // Sentinel returned by CreateProcessAsSystem when the stolen SYSTEM token lives
+    // in Session 0 and SeTcbPrivilege is unavailable to relocate it to the active
+    // interactive session. The caller must NOT birth the child ownerless -- it
+    // falls through to the service-based elevation path instead. Negative so it
+    // never collides with a real Win32 error code (which are positive DWORDs).
+    public const int SESSION0_REFUSED = -1;
 
     [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     public static extern bool CreateProcessAsUser(
@@ -2096,8 +2109,44 @@ public class TokenOps {
                     return Marshal.GetLastWin32Error();
                 }
                 try {
-                    int sessionId = 1;
-                    SetTokenInformation(hPrimaryToken, TokenSessionId, ref sessionId, 4);
+                    // Resolve the active interactive console session. If no console is
+                    // attached (0xFFFFFFFF) default to 1 -- the typical interactive session.
+                    uint activeSession = WTSGetActiveConsoleSessionId();
+                    if (activeSession == 0xFFFFFFFF) activeSession = 1;
+
+                    // Query the duplicated token's session. A Session-0 token (sourced from
+                    // services.exe / svchost when winlogon/dwm/fontdrvhost are PPL-protected)
+                    // would birth the child ownerless in Session 0 -> empty User column, no
+                    // visible window. We MUST relocate it to the active session before launch.
+                    int tokenSession = 0;
+                    IntPtr tokenInfo = IntPtr.Zero;
+                    try {
+                        tokenInfo = Marshal.AllocHGlobal(4);
+                        int returnLength = 0;
+                        if (GetTokenInformation(hPrimaryToken, TokenSessionId, tokenInfo, 4, out returnLength)) {
+                            tokenSession = Marshal.ReadInt32(tokenInfo);
+                        }
+                    } finally {
+                        if (tokenInfo != IntPtr.Zero) Marshal.FreeHGlobal(tokenInfo);
+                    }
+
+                    // SeTcbPrivilege ("Act as part of the operating system") is required for
+                    // SetTokenInformation(TokenSessionId) to relocate a token across sessions.
+                    // Only held when running as SYSTEM (this path is guarded by $isSystem in
+                    // PowerShell). Enable it best-effort; if it is absent, relocation fails.
+                    EnablePrivilege("SeTcbPrivilege");
+
+                    if (tokenSession != (int)activeSession) {
+                        int sid = (int)activeSession;
+                        if (!SetTokenInformation(hPrimaryToken, TokenSessionId, ref sid, 4)) {
+                            // Refuse ownerless birth: return a distinctive sentinel so the
+                            // PowerShell caller logs it and falls through to the service path
+                            // (Monitor-ElevateProcess Phase 2) instead of producing a broken
+                            // ownerless window (empty User column / no launch).
+                            return SESSION0_REFUSED;
+                        }
+                    }
+
                     STARTUPINFO si = new STARTUPINFO();
                     si.cb = Marshal.SizeOf(si);
                     si.lpDesktop = "WinSta0\\Default";
@@ -2259,16 +2308,31 @@ function Find-SystemProcessCandidate {
     $diagnostics = @()
     $diagnostics += "Scan started. Total processes: $($allProcs.Count)"
 
-    $session1Names = @("winlogon.exe","dwm.exe","fontdrvhost.exe")
-    foreach ($name in $session1Names) {
-        $candidates = $allProcs | Where-Object { $_.Name -eq $name -and $_.SessionId -eq 1 }
+    # Resolve the active interactive console session so we only steal a SYSTEM
+    # token that already lives in THAT session. A token sourced from Session 0
+    # (services.exe / svchost -- Session-0 SYSTEM) births the child ownerless in
+    # Session 0 -> empty User column, no visible window. A token from a different
+    # interactive session (RDP) births the child on the wrong desktop. Falls back
+    # to 1 (the typical interactive session) if WTSGetActiveConsoleSessionId is
+    # unavailable or no console session is attached (returns 0xFFFFFFFF).
+    $activeSession = 1
+    try {
+        $rawSid = [TokenOps]::WTSGetActiveConsoleSessionId()
+        if ($rawSid -ne [uint32]0xFFFFFFFF) { $activeSession = [int]$rawSid }
+    } catch {
+        $diagnostics += "WTSGetActiveConsoleSessionId unavailable; defaulting activeSession=1"
+    }
+
+    $priorityNames = @("winlogon.exe","dwm.exe","fontdrvhost.exe")
+    foreach ($name in $priorityNames) {
+        $candidates = $allProcs | Where-Object { $_.Name -eq $name -and $_.SessionId -eq $activeSession }
         foreach ($proc in $candidates) {
             try {
                 $owner = ($proc | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue).User
                 if ($owner -eq "SYSTEM") {
                     $test = [TokenOps]::TestOpenProcess($proc.ProcessId)
                     if ($test) {
-                        $diagnostics += "SUCCESS: Selected Session 1 SYSTEM process: $($proc.Name) PID=$($proc.ProcessId)"
+                        $diagnostics += "SUCCESS: Selected Session $activeSession SYSTEM process: $($proc.Name) PID=$($proc.ProcessId)"
                         Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "INFO" -Message ($diagnostics -join " | ")
                         $script:CachedSystemPid = $proc.ProcessId
                         $script:CachedSystemPidTimestamp = Get-Date
@@ -2276,20 +2340,24 @@ function Find-SystemProcessCandidate {
                     } else {
                         $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
                         $rc = Get-Win32ErrorRootCause -ErrorCode $err -Context "OpenProcess"
-                        $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 Owner=SYSTEM | TestOpenProcess failed | $rc"
+                        $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=$activeSession Owner=SYSTEM | TestOpenProcess failed | $rc"
                     }
                 } else {
-                    $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 Owner=$owner (not SYSTEM)"
+                    $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=$activeSession Owner=$owner (not SYSTEM)"
                 }
             } catch {
-                $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=1 | WMI GetOwner exception: $($_.Exception.Message)"
+                $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) Session=$activeSession | WMI GetOwner exception: $($_.Exception.Message)"
             }
         }
     }
 
-    $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe","lsass.exe","MsMpEng.exe")
+    # Fallback: any SYSTEM process in an INTERACTIVE session (Session > 0) only.
+    # services.exe is explicitly excluded -- it is SYSTEM but runs in Session 0,
+    # and a Session-0 token births the child ownerless (empty User column, no
+    # visible window). Same for smss/csrss/wininit/lsass (Session 0 OS core).
+    $excludeNames = @("System","Registry","smss.exe","csrss.exe","wininit.exe","lsass.exe","services.exe","MsMpEng.exe")
     $scanned = 0
-    foreach ($proc in ($allProcs | Where-Object { $_.ProcessId -gt 4 -and $_.Name -notin $excludeNames } | Sort-Object { $_.SessionId } -Descending)) {
+    foreach ($proc in ($allProcs | Where-Object { $_.ProcessId -gt 4 -and $_.SessionId -gt 0 -and $_.Name -notin $excludeNames } | Sort-Object { $_.SessionId } -Descending)) {
         if ($scanned -ge $MaxScan) { break }
         $scanned++
         try {
@@ -2314,7 +2382,7 @@ function Find-SystemProcessCandidate {
             $diagnostics += "REJECTED: $($proc.Name) PID=$($proc.ProcessId) | WMI GetOwner exception: $($_.Exception.Message)"
         }
     }
-    Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "ERROR" -Message "No usable SYSTEM process found after $scanned scans. Details: $($diagnostics -join ' | ')" -RootCause "All SYSTEM candidates rejected due to PPL protection, missing privileges, or session mismatch. Check Export-ElevationDiagnostics dump."
+    Write-DebugLog -FunctionName "Find-SystemProcessCandidate" -Action "ERROR" -Message "No usable SYSTEM process found after $scanned scans. Details: $($diagnostics -join ' | ')" -RootCause "All SYSTEM candidates rejected due to PPL protection, missing privileges, or session mismatch (Session 0 excluded -- a Session-0 token would birth the child ownerless). Check Export-ElevationDiagnostics dump."
     Export-ElevationDiagnostics -Trigger "NoSystemProcessCandidate"
     return 0
 }
@@ -5026,9 +5094,11 @@ function Monitor-ElevateProcess {
             if ($result -eq 0) {
                 Start-Sleep -Milliseconds 500
                 Stop-NonSystemInstances -ProcessName "$procName.exe"
-                Write-Log -Message "Monitor elevated: $procName (direct token + Session 1)" -Type "INFO" -Color Gray
+                Write-Log -Message "Monitor elevated: $procName (direct token + active session)" -Type "INFO" -Color Gray
                 Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
                 return $true
+            } elseif ($result -eq [TokenOps]::SESSION0_REFUSED) {
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "CreateProcessAsSystem refused ownerless birth for $procName (Session-0 token, no SeTcb); falling through to service path"
             }
         }
     }

@@ -114,16 +114,47 @@ static BOOL EnablePrivilege(LPCWSTR privName) {
     return ok && GetLastError() == 0;
 }
 
+/* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
+   lives in wtsapi32.dll; load it dynamically so no extra link dependency is added
+   (gmhook.dll is not linked against wtsapi32). Returns 1 (the typical interactive
+   session) if the API is missing or no console session is attached (0xFFFFFFFF).
+   Mirrors gmproxy.c's GetActiveConsoleSessionId so the hook selects a SYSTEM
+   token that already lives in the active session -- a Session-0 SYSTEM token
+   (e.g. a Session-0 csrss) would birth children ownerless (empty User column,
+   no visible window). */
+static DWORD GmHookGetActiveConsoleSessionId(void) {
+    HMODULE hWts = GetModuleHandleW(L"wtsapi32.dll");
+    if (!hWts) hWts = LoadLibraryW(L"wtsapi32.dll");
+    if (!hWts) return 1;
+    typedef DWORD (WINAPI *WTSGetActiveConsoleSessionId_t)(void);
+    WTSGetActiveConsoleSessionId_t pfn =
+        (WTSGetActiveConsoleSessionId_t)GetProcAddress(hWts, "WTSGetActiveConsoleSessionId");
+    if (!pfn) return 1;
+    DWORD sid = pfn();
+    return (sid == 0xFFFFFFFF) ? 1 : sid;
+}
+
 static DWORD FindSystemPid(void) {
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnap == INVALID_HANDLE_VALUE) return 0;
     PROCESSENTRY32W pe;
     pe.dwSize = sizeof(pe);
+    DWORD activeSession = GmHookGetActiveConsoleSessionId();
     const wchar_t* names[] = { L"winlogon.exe", L"dwm.exe", L"fontdrvhost.exe", L"csrss.exe" };
     for (int i = 0; i < 4; i++) {
         if (Process32FirstW(hSnap, &pe)) {
             do {
                 if (_wcsicmp(pe.szExeFile, names[i]) == 0) {
+                    /* Session filter: only accept a SYSTEM process in the active
+                       interactive session. A Session-0 SYSTEM token (e.g. the
+                       Session-0 csrss) births children ownerless (empty User
+                       column, no visible window). ProcessIdToSessionId is
+                       exported by kernel32 (already linked). Skip if the session
+                       cannot be resolved or is not the active session. */
+                    DWORD procSession = 0;
+                    if (!ProcessIdToSessionId(pe.th32ProcessID, &procSession) || procSession != activeSession) {
+                        continue;
+                    }
                     HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
                     if (hProc) {
                         HANDLE hTok;

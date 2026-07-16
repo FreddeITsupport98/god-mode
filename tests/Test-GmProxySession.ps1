@@ -81,6 +81,7 @@ if (-not $ProjectRoot) { $ProjectRoot = $ScriptRoot }
 
 $GodMode = Join-Path $ProjectRoot "God-Mode-Windows.ps1"
 $GmProxy = Join-Path $ProjectRoot "driver/gmproxy.c"
+$GmHook = Join-Path $ProjectRoot "driver/gmhook.c"
 
 Write-Host "=====================================================" -ForegroundColor Cyan
 Write-Host "  God-Mode gmproxy Session Fix + Monitor Guard Regression" -ForegroundColor Cyan
@@ -90,12 +91,17 @@ if (-not (Test-Path $GmProxy)) {
     Add-Assertion "gmproxy.c exists" $false "file not found: $GmProxy"
     Write-Summary
 }
+if (-not (Test-Path $GmHook)) {
+    Add-Assertion "gmhook.c exists" $false "file not found: $GmHook"
+    Write-Summary
+}
 if (-not (Test-Path $GodMode)) {
     Add-Assertion "God-Mode-Windows.ps1 exists" $false "file not found: $GodMode"
     Write-Summary
 }
 
 $proxy = Get-Content -Raw $GmProxy
+$gmhook = Get-Content -Raw $GmHook
 $gm = Get-Content -Raw $GodMode
 
 # --- 1. gmproxy.c: active-console-session resolution ---
@@ -173,5 +179,29 @@ Add-Assertion "God-Mode-Windows.ps1: Disable-GodMode stops the feedback listener
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs includes GM-PROXY DIAGNOSTIC LOG section" ($gm -match 'GM-PROXY DIAGNOSTIC LOG') "Export-GodModeLogs does not surface the gmproxy diagnostic log"
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs reads gmproxy.log from TEMP" ($gm -match 'Join-Path[\s\S]{0,40}?gmproxy\.log') "Export-GodModeLogs does not read gmproxy.log"
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs handles a missing gmproxy log gracefully" ($gm -match 'No gmproxy log found') "Export-GodModeLogs does not guard a missing gmproxy log"
+
+# --- 11. God-Mode-Windows.ps1: CreateProcessAsSystem session-correctness (SeTcb + ownerless guard) ---
+# Fixes the monitor's kill+relaunch path birthing Firefox/Chrome ownerless in Session 0
+# (empty User column, no visible window) when winlogon/dwm/fontdrvhost are PPL-protected.
+Add-Assertion "God-Mode-Windows.ps1: TokenOps enables SeTcbPrivilege in CreateProcessAsSystem" ($gm -match 'EnablePrivilege\(\s*"SeTcbPrivilege"\s*\)') "CreateProcessAsSystem does not enable SeTcbPrivilege -- SetTokenInformation(TokenSessionId) cannot relocate a Session-0 token"
+Add-Assertion "God-Mode-Windows.ps1: TokenOps has SESSION0_REFUSED sentinel (ownerless birth refused)" ($gm -match 'SESSION0_REFUSED') "SESSION0_REFUSED sentinel missing -- ownerless Session-0 births would still occur"
+Add-Assertion "God-Mode-Windows.ps1: TokenOps has GetTokenInformation P/Invoke (token session query)" ($gm -match 'public static extern bool GetTokenInformation') "GetTokenInformation P/Invoke missing -- cannot query the duplicated token's session"
+Add-Assertion "God-Mode-Windows.ps1: TokenOps has WTSGetActiveConsoleSessionId P/Invoke" ($gm -match 'WTSGetActiveConsoleSessionId') "WTSGetActiveConsoleSessionId P/Invoke missing -- cannot resolve the active interactive session in C#"
+Add-Assertion "God-Mode-Windows.ps1: CreateProcessAsSystem queries token session before launch" ($gm -match 'GetTokenInformation\(hPrimaryToken,\s*TokenSessionId') "CreateProcessAsSystem does not query the token's session before deciding to relocate"
+Add-Assertion "God-Mode-Windows.ps1: CreateProcessAsSystem returns SESSION0_REFUSED on relocation failure" ($gm -match 'return SESSION0_REFUSED') "CreateProcessAsSystem does not refuse ownerless birth when session relocation fails"
+Add-Assertion "God-Mode-Windows.ps1: Monitor-ElevateProcess logs SESSION0_REFUSED fall-through to service path" ($gm -match 'SESSION0_REFUSED[\s\S]{0,300}?service path') "Monitor-ElevateProcess does not log the SESSION0_REFUSED fall-through to the service path"
+
+# --- 12. God-Mode-Windows.ps1: Find-SystemProcessCandidate session-aware (Session 0 excluded) ---
+Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate resolves activeSession via WTSGetActiveConsoleSessionId" ($gm -match '\[TokenOps\]::WTSGetActiveConsoleSessionId') "Find-SystemProcessCandidate does not resolve the active console session via [TokenOps]::WTSGetActiveConsoleSessionId()"
+Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate uses \$activeSession (not hardcoded 1)" ($gm -match '\$activeSession') "Find-SystemProcessCandidate does not use an activeSession variable"
+Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate priority filter uses \$activeSession" ($gm -match '\$_.SessionId\s+-eq\s+\$activeSession') "Find-SystemProcessCandidate priority filter does not use \$activeSession"
+Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate excludes services.exe (Session-0 SYSTEM)" ($gm -match '"services\.exe"') "Find-SystemProcessCandidate does not exclude services.exe -- could steal a Session-0 SYSTEM token"
+Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate fallback filters SessionId -gt 0" ($gm -match '\$_.ProcessId\s+-gt\s+4\s+-and\s+\$_.SessionId\s+-gt\s+0') "Find-SystemProcessCandidate fallback does not filter SessionId -gt 0 -- Session-0 SYSTEM tokens would be selected"
+
+# --- 13. gmhook.c: FindSystemPid session-aware (no Session-0 SYSTEM token) ---
+Add-Assertion "gmhook.c: GmHookGetActiveConsoleSessionId helper defined (dynamic wtsapi32 load)" ($gmhook -match 'static\s+DWORD\s+GmHookGetActiveConsoleSessionId\s*\(') "GmHookGetActiveConsoleSessionId helper missing -- gmhook cannot resolve the active session"
+Add-Assertion "gmhook.c: dynamically loads WTSGetActiveConsoleSessionId (wtsapi32)" ($gmhook -match 'WTSGetActiveConsoleSessionId' -and $gmhook -match 'wtsapi32\.dll') "gmhook does not dynamically load WTSGetActiveConsoleSessionId"
+Add-Assertion "gmhook.c: FindSystemPid uses ProcessIdToSessionId session filter" ($gmhook -match 'ProcessIdToSessionId\(pe\.th32ProcessID,\s*&procSession\)') "FindSystemPid does not filter by ProcessIdToSessionId -- could steal a Session-0 SYSTEM token"
+Add-Assertion "gmhook.c: FindSystemPid skips non-active-session candidates" ($gmhook -match 'procSession\s*!=\s*activeSession') "FindSystemPid does not skip non-active-session candidates"
 
 Write-Summary
