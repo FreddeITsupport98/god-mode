@@ -16,6 +16,10 @@
 #      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
 #      hosts (tests/test-shell-host-exclusion.sh) -- binary-level check that
 #      catches IsShellLauncherProcess regressions BEFORE deploying to the VM.
+#   4b. wine smoke test --regression-mode (negative direction): builds a BROKEN
+#      gmhook.dll (%ls->%s path) and asserts the runtime wide-format guards FAIL
+#      on it -- proves the guard catches a broken build, not just that a correct
+#      build passes (tests/test-shell-host-exclusion.sh --regression-mode).
 #   5. gmproxy session-fix build + invariant test (tests/test-gmproxy-session.sh):
 #      MinGW cross-compile of gmproxy.c proves the session-correctness + graceful-
 #      fallback code BUILDS and yields a PE binary (catches undeclared symbols /
@@ -124,6 +128,22 @@ else
     else
         rc=$?
         record "wine smoke: gmhook.dll not hooked in pwsh.exe (chrome.exe control hooked)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
+# 4b. wine smoke test --regression-mode (negative direction): broken %ls->%s
+#     build must FAIL the runtime wide-format guards (proves the guard catches a
+#     broken build, not just that a correct build passes).
+if [ ! -f "$smoke" ]; then
+    record "wine smoke --regression-mode present" 0 "test-shell-host-exclusion.sh missing"
+else
+    log="$(mktemp)"
+    if bash "$smoke" --regression-mode >"$log" 2>&1; then
+        record "wine smoke --regression-mode: broken %ls->%s build FAILS the guards" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "wine smoke --regression-mode: broken %ls->%s build FAILS the guards" 0 "exit=$rc (log: $log)"
     fi
 fi
 
