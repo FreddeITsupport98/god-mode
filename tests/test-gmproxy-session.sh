@@ -50,6 +50,12 @@ grep -q 'SeTcbPrivilege' "$SRC" && record "src: SeTcbPrivilege present" 1 || rec
 grep -q 'FindAnySystemProcessPid' "$SRC" && record "src: FindAnySystemProcessPid present" 1 || record "src: FindAnySystemProcessPid present" 0 "not found"
 grep -q 'haveToken' "$SRC" && record "src: haveToken gate present" 1 || record "src: haveToken gate present" 0 "not found"
 grep -q 'CreateProcessW(hardlinkPath' "$SRC" && record "src: graceful fallback CreateProcessW(hardlinkPath) present" 1 || record "src: graceful fallback CreateProcessW(hardlinkPath) present" 0 "not found"
+grep -q 'DiagLog' "$SRC" && record "src: DiagLog helper present" 1 || record "src: DiagLog helper present" 0 "not found"
+grep -q 'GmProxyDiagLogOpen' "$SRC" && record "src: GmProxyDiagLogOpen present" 1 || record "src: GmProxyDiagLogOpen present" 0 "not found"
+grep -q 'gmproxy.log' "$SRC" && record "src: durable gmproxy.log path present" 1 || record "src: durable gmproxy.log path present" 0 "not found"
+grep -q 'SignalGmProxyFeedback' "$SRC" && record "src: SignalGmProxyFeedback present" 1 || record "src: SignalGmProxyFeedback present" 0 "not found"
+grep -q 'GodMode-GmProxyFeedback' "$SRC" && record "src: feedback pipe name present" 1 || record "src: feedback pipe name present" 0 "not found"
+grep -q 'OPEN_EXISTING' "$SRC" && record "src: feedback pipe non-blocking OPEN_EXISTING present" 1 || record "src: feedback pipe non-blocking OPEN_EXISTING present" 0 "not found"
 
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then

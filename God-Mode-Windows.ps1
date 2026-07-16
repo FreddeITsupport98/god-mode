@@ -3252,6 +3252,20 @@ function Export-GodModeLogs {
             $LogContent += Get-Content -Raw -Path $BuildLog -ErrorAction SilentlyContinue
         }
 
+        # gmproxy IFEO proxy diagnostic log: gmproxy mirrors its stderr diagnostics
+        # to %TEMP%\gmproxy.log (durable, append) so they survive even when IFEO
+        # launches it detached with no console. Same $env:TEMP as $LogFile above,
+        # which matches gmproxy's GetTempPathW since both run as the admin user.
+        $GmProxyDiagLog = Join-Path $env:TEMP "gmproxy.log"
+        $LogContent += "`r`n===== GM-PROXY DIAGNOSTIC LOG ====="
+        $LogContent += "`r`n(Source: $GmProxyDiagLog)"
+        if (Test-Path $GmProxyDiagLog) {
+            $LogContent += "`r`n"
+            $LogContent += Get-Content -Raw -Path $GmProxyDiagLog -ErrorAction SilentlyContinue
+        } else {
+            $LogContent += "`r`n[No gmproxy log found] (expected at $GmProxyDiagLog)"
+        }
+
         # Error summary from debug log
         $ErrorCount = 0
         if (Test-Path $DebugLogFile) {
@@ -4706,6 +4720,14 @@ function Get-NonSystemProcessesParallel {
 $script:ProcessCreationQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 $script:ProcessCreationWatcher = $null
 
+# GmProxy graceful-fallback PID handoff: gmproxy.exe signals the monitor with the
+# PID it launched as the current user (named pipe GodMode-GmProxyFeedback) so the
+# monitor can elevate it IN PLACE (ReplaceProcessTokenForPid) instead of the 15s
+# periodic scan kill+relaunching a duplicate. Fed by Start-GmProxyFeedbackListener
+# (ThreadJob pipe server); drained by the Start-Monitoring loop.
+$script:GmProxyFeedbackQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+$script:GmProxyFeedbackPipeJob = $null
+
 function Register-ProcessCreationWatcher {
     try {
         $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
@@ -4759,6 +4781,68 @@ function Unregister-ProcessCreationWatcher {
     $script:ProcessCreationWatcherActive = $false
     if ($script:ProcessCreationQueue) {
         $script:ProcessCreationQueue.Clear()
+    }
+}
+
+function Start-GmProxyFeedbackListener {
+    # Named-pipe server (\\.\pipe\GodMode-GmProxyFeedback) that receives PIDs from
+    # gmproxy.exe's graceful-fallback launch path and enqueues them for IN-PLACE
+    # SYSTEM elevation (ReplaceProcessTokenForPid) -- avoiding the 15s periodic
+    # scan's kill+relaunch duplicate. Runs on a background ThreadJob so it never
+    # blocks the Start-Monitoring loop. Best-effort: any pipe error is swallowed
+    # and retried; the periodic scan remains a fallback if this listener is absent.
+    if ($script:GmProxyFeedbackPipeJob -and $script:GmProxyFeedbackPipeJob.State -eq 'Running') { return $true }
+    try {
+        $job = Start-ThreadJob -ScriptBlock {
+            param($queue)
+            $pipeName = 'GodMode-GmProxyFeedback'
+            while ($true) {
+                $pipe = $null
+                try {
+                    # Grant SYSTEM + Administrators full control and Everyone read/write
+                    # so an admin-user-launched gmproxy.exe (IFEO) can connect to this
+                    # SYSTEM-created pipe. Fall back to the default ACL if the
+                    # access-control types are unavailable on this runtime.
+                    try {
+                        $pipeSec = New-Object System.IO.Pipes.PipeSecurity
+                        $pipeSec.AddAccessRule((New-Object System.IO.Pipes.PipeAccessRule('Everyone', [System.IO.Pipes.PipeAccessRights]::ReadWrite, [System.Security.AccessControl.AccessControlType]::Allow)))
+                        $pipeSec.AddAccessRule((New-Object System.IO.Pipes.PipeAccessRule('SYSTEM', [System.IO.Pipes.PipeAccessRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)))
+                        $pipeSec.AddAccessRule((New-Object System.IO.Pipes.PipeAccessRule('Administrators', [System.IO.Pipes.PipeAccessRights]::FullControl, [System.Security.AccessControl.AccessControlType]::Allow)))
+                        $pipe = New-Object System.IO.Pipes.NamedPipeServerStream($pipeName, [System.IO.Pipes.PipeDirection]::In, 254, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::None, 0, 0, $pipeSec)
+                    } catch {
+                        $pipe = New-Object System.IO.Pipes.NamedPipeServerStream($pipeName, [System.IO.Pipes.PipeDirection]::In, 254, [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]::None, 0, 0)
+                    }
+                    $pipe.WaitForConnection()
+                    $sr = New-Object System.IO.StreamReader($pipe)
+                    $line = $sr.ReadLine()
+                    if ($line) {
+                        $m = [regex]::Match($line, '^PID=(\d+)')
+                        if ($m.Success) {
+                            $pidVal = [int]$m.Groups[1].Value
+                            if ($pidVal -gt 0) { [void]$queue.Add($pidVal) }
+                        }
+                    }
+                } catch {
+                    Start-Sleep -Milliseconds 200
+                } finally {
+                    if ($pipe) { try { $pipe.Dispose() } catch {} }
+                }
+            }
+        } -ArgumentList $script:GmProxyFeedbackQueue
+        Set-Variable -Name GmProxyFeedbackPipeJob -Value $job -Scope Script
+        Write-Log -Message "GmProxy feedback pipe listener started (pipe: GodMode-GmProxyFeedback)." -Type "INFO" -Color Gray
+        return $true
+    } catch {
+        Write-Log -Message "GmProxy feedback pipe listener failed to start: $_" -Type "WARN" -Color Yellow
+        return $false
+    }
+}
+
+function Stop-GmProxyFeedbackListener {
+    if ($script:GmProxyFeedbackPipeJob) {
+        $job = $script:GmProxyFeedbackPipeJob
+        try { $job | Stop-Job -ErrorAction SilentlyContinue; $job | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+        Set-Variable -Name GmProxyFeedbackPipeJob -Value $null -Scope Script
     }
 }
 
@@ -4861,6 +4945,47 @@ function Invoke-ExistingProcessElevation {
     Write-Log -Message "Aggressive process elevation complete ($successCount succeeded, $failCount failed, $skipped skipped)." -Type "INFO" -Color Gray
 }
 
+function Invoke-GmProxyFeedbackElevation {
+    # In-place SYSTEM elevation of a PID handed off by gmproxy.exe's graceful-
+    # fallback launch path (named pipe GodMode-GmProxyFeedback). Replaces the
+    # process token in place via [TokenOps]::ReplaceProcessTokenForPid -- no kill,
+    # no relaunch, no duplicate. gmproxy's fallback only runs for IFEO-hooked
+    # normal programs (shells/critical/OS are excluded by Install-IfeoElevation),
+    # so the PID is expected to be a safe normal app; a conservative shell/critical
+    # name guard is applied here as defense-in-depth. If in-place replacement
+    # fails, NO kill+relaunch is attempted here -- the 15s periodic scan remains
+    # the safety net (same as before this optimization).
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if (-not $isSystem) { return $false }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch { return $false }
+    # Defense-in-depth: never token-swap a shell host or critical OS process.
+    $SkipNames = @("powershell","pwsh","cmd","conhost","WindowsTerminal","OpenConsole","wsl","wslhost","wt","explorer","taskmgr","csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost","taskhostw","sihost","ShellHost","ctfmon","System","Registry","Secure System","Memory Compression","ApplicationFrameHost","RuntimeBroker")
+    if ($SkipNames -contains $proc.Name) {
+        Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is shell/critical; skipping in-place elevation"
+        return $false
+    }
+    Enable-ElevationPrivileges
+    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    $systemPid = Find-SystemProcessCandidate
+    if ($systemPid -eq 0) {
+        Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "INFO" -Message "No SYSTEM token source for PID=$ProcessId; periodic scan will handle it"
+        return $false
+    }
+    $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
+    if ($result) {
+        Write-Log -Message "GmProxy feedback: elevated PID=$ProcessId ($($proc.Name)) in place (token replacement, no kill+relaunch)" -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "EXIT" -Message "In-place success for PID=$ProcessId name=$($proc.Name)"
+        return $true
+    } else {
+        Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "INFO" -Message "In-place replacement failed for PID=$ProcessId name=$($proc.Name); periodic scan will handle it"
+        return $false
+    }
+}
+
 function Monitor-ElevateProcess {
     param([string]$Path, [string]$Arguments = "", [int]$ProcessId = 0, [switch]$HideWindow)
     if (-not (Test-Path $Path)) {
@@ -4951,6 +5076,14 @@ function Start-Monitoring {
         Write-Log -Message "Monitor is running as Administrator (not SYSTEM). Elevation blocks will be skipped; only resurrection-killer and stealth mode are active." -Type "WARN" -Color Yellow
     }
 
+    # --- GmProxy graceful-fallback feedback listener: receives PIDs from gmproxy.exe
+    #     (named pipe GodMode-GmProxyFeedback) and drains them into
+    #     $script:GmProxyFeedbackQueue for in-place SYSTEM elevation, avoiding the
+    #     15s periodic scan kill+relaunch duplicate. Only meaningful as SYSTEM. ---
+    if ($isSystem) {
+        $null = Start-GmProxyFeedbackListener
+    }
+
     # --- One-time elevation of all existing user-session processes at startup ---
     Invoke-ExistingProcessElevation
 
@@ -4968,6 +5101,18 @@ function Start-Monitoring {
                             $lastElevatedPid[$evt.ProcessId] = Get-Date
                             Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow
                         }
+                    }
+                }
+            }
+            # --- GmProxy graceful-fallback feedback: in-place elevation of PIDs handed
+            #     off by gmproxy.exe (no kill+relaunch duplicate). ---
+            if ($script:GmProxyFeedbackQueue -and $script:GmProxyFeedbackQueue.Count -gt 0) {
+                while ($script:GmProxyFeedbackQueue.Count -gt 0) {
+                    $fbPid = [int]$script:GmProxyFeedbackQueue[0]
+                    $script:GmProxyFeedbackQueue.RemoveAt(0)
+                    if ($fbPid -gt 0 -and -not $lastElevatedPid.ContainsKey($fbPid)) {
+                        $lastElevatedPid[$fbPid] = Get-Date
+                        Invoke-GmProxyFeedbackElevation -ProcessId $fbPid
                     }
                 }
             }
@@ -5287,6 +5432,7 @@ function Disable-GodMode {
     Remove-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
     Unregister-StealthTask
     Unregister-ProcessCreationWatcher
+    Stop-GmProxyFeedbackListener
     Unregister-SystemWatchdog
     Unblock-TaskManager
 

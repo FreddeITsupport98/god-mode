@@ -27,25 +27,40 @@
     22. Non-ASCII whitespace characters (tabs, non-breaking spaces)
     23. Backtick at end of line (accidental line continuation)
     24. Auto-chmod executable permissions
+    --- Upgrades (2026-07-16) ---
+    * Honest ERROR aggregation: the summary now derives ERROR/WARN file lists from $FileFailures
+      (single source of truth) so the exit code always reflects real [ERROR] findings. This fixes a
+      $script: scoping bug where Add-Failure's arrays never aggregated and the checker always printed
+      "Failed: 0" regardless of ERROR tags.
+    * Heuristic scanners downgraded ERROR->WARN: brace/paren/bracket mismatch, try/catch mismatch,
+      and redirect-trap inside double-quoted strings (string literals are NOT parsed as operators).
+      AST (#1) + PSParser (#2) remain the authoritative ERROR parse checks.
+    * Elevation-loop (Verb=runAs without UseShellExecute) is now STRING-AWARE: only flags
+      `Verb = runAs` in bare code, not inside quoted string literals (test files that mention the
+      pattern inside a -notmatch regex are no longer false-flagged).
+    * Best-effort toolchain checks (SKIP if the tool is not on PATH): C compile via
+      x86_64-w64-mingw32-gcc / gcc / cl.exe (-fsyntax-only; ': error:' -> ERROR, ': warning:' -> WARN),
+      shellcheck -S warning on .sh, python -m py_compile on .py, node --check on .js.
+    * Auto-chmod extended to .sh / .py / .js (chmod +x on Unix, ACL ReadAndExecute on Windows).
     Use this as the BASE syntax check script before any deployment.
 #>
 
 param([string]$ScanDir = (Split-Path -Parent $PSScriptRoot))
 
-$FailedFiles = @()
-$ErrorFiles = @()
-$Warnings = @()
-$FileFailures = @{}  # key = fileName, value = array of failure messages
+$script:FailedFiles = @()
+$script:ErrorFiles = @()
+$script:Warnings = @()
+$FileFailures = @{}  # key = fileName, value = array of failure messages (single source of truth; reference-type, aggregates across function/script scope)
 
 function Add-Failure {
     param([string]$FileName, [string]$Message, [string]$Severity = "ERROR")
     if (-not $FileFailures.ContainsKey($FileName)) { $FileFailures[$FileName] = @() }
     $FileFailures[$FileName] += "[$Severity] $Message"
     if ($Severity -eq "ERROR") {
-        if ($FailedFiles -notcontains $FileName) { $FailedFiles += $FileName }
-        if ($ErrorFiles -notcontains $FileName) { $ErrorFiles += $FileName }
+        if ($script:FailedFiles -notcontains $FileName) { $script:FailedFiles += $FileName }
+        if ($script:ErrorFiles -notcontains $FileName) { $script:ErrorFiles += $FileName }
     } else {
-        if ($Warnings -notcontains $FileName) { $Warnings += $FileName }
+        if ($script:Warnings -notcontains $FileName) { $script:Warnings += $FileName }
     }
 }
 
@@ -358,20 +373,25 @@ foreach ($File in $Ps1Files) {
 
     # 16. Redirection operator trap check: >>> and <<< inside double-quoted strings or bare text
     # PowerShell parses >>> and <<< as redirection operators, which causes "Missing file specification after redirection operator".
+    # NOTE: >>> / <<< INSIDE a double-quoted string is NOT parsed as redirection (string literals are
+    # not tokenized for operators), so that case is downgraded to WARN. The bare-text case (outside
+    # any quote) remains a hard ERROR. The checker self-skips its own >>>/<<< diagnostic/regex lines.
     $i = 1
     foreach ($Line in $Lines) {
         $Trimmed = $Line.Trim()
         if ($Trimmed -match '^\s*#') { $i++; continue }
         # Skip single-quoted strings (literal, no redirection parsing inside)
         if ($Trimmed -match "^'") { $i++; continue }
+        # Self-skip: this meta-script's own >>>/<<< regex/diagnostic lines would otherwise self-flag.
+        if ($FileName -eq 'syntax_check.ps1' -and $Line -match '>>>|<<<') { $i++; continue }
         # Detect inside double-quoted strings or bare text
         $dqMatches = [regex]::Matches($Line, '"([^\"]*)"')
         $Found = $false
         foreach ($m in $dqMatches) {
             $segment = $m.Groups[1].Value
             if ($segment -match '>>>|<<<') {
-                Write-Host "[REDIRECT-TRAP] $FilePath L$i`: Redirection operator sequence (>>> or <<<) inside double-quoted string segment: `"$segment`". PowerShell parses this as a redirection operator and throws 'Missing file specification after redirection operator'. Replace with `***` or similar safe markers." -ForegroundColor Red
-                Add-Failure -FileName $FileName -Message "L$i`: Redirection operator trap (>>> or <<<) inside double-quoted string - replace with ***" -Severity "ERROR"
+                Write-Host "[REDIRECT-TRAP] $FilePath L$i`: Redirection operator sequence (>>> or <<<) inside double-quoted string segment: `$segment`. PowerShell does NOT parse operators inside string literals, so this is not a redirection at parse time - but it can confuse readers/linters. WARN only; consider `***` or similar safe markers." -ForegroundColor Yellow
+                Add-Failure -FileName $FileName -Message "L$i`: Redirection operator sequence (>>> or <<<) inside double-quoted string - not a parse error (string literal), review only" -Severity "WARN"
                 $Found = $true
             }
         }
@@ -413,8 +433,11 @@ foreach ($File in $Ps1Files) {
         $i++
     }
 
-    # 18. Unmatched braces / brackets / parentheses (stack-based check)
-    # This catches the most common parser-level structural errors that AST and PSParser may miss.
+    # 18. Unmatched braces / brackets / parentheses (stack-based HEURISTIC check)
+    # HEURISTIC: this naive stack walker does not fully understand here-strings, multi-line strings,
+    # comments, or array-index/type-cast brackets, so it produces false positives. Authoritative
+    # structural parse errors are already caught as ERROR by check #1 (AST) and #2 (PSParser), so
+    # this check is downgraded to WARN - it stays as a diagnostic hint, not a build blocker.
     $BraceStack = [System.Collections.Generic.List[pscustomobject]]::new()
     $i = 1
     foreach ($Line in $Lines) {
@@ -440,20 +463,20 @@ foreach ($File in $Ps1Files) {
                 if ($ch -eq '(') { $BraceStack.Add([pscustomobject]@{ Char = '('; Line = $i; Col = $j }) }
                 if ($ch -eq '}') {
                     if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '{') {
-                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing brace } . No matching opening brace found." -ForegroundColor Red
-                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing brace }" -Severity "ERROR"
+                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing brace } . No matching opening brace found." -ForegroundColor Yellow
+                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing brace }" -Severity "WARN"
                     } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
                 }
                 if ($ch -eq ']') {
                     if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '[') {
-                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing bracket ] . No matching opening bracket found." -ForegroundColor Red
-                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing bracket ]" -Severity "ERROR"
+                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing bracket ] . No matching opening bracket found." -ForegroundColor Yellow
+                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing bracket ]" -Severity "WARN"
                     } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
                 }
                 if ($ch -eq ')') {
                     if ($BraceStack.Count -eq 0 -or $BraceStack[$BraceStack.Count - 1].Char -ne '(') {
-                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing parenthesis ) . No matching opening parenthesis found." -ForegroundColor Red
-                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing parenthesis )" -Severity "ERROR"
+                        Write-Host "[BRACE-MISMATCH] $FilePath L$i`: Unmatched closing parenthesis ) . No matching opening parenthesis found." -ForegroundColor Yellow
+                        Add-Failure -FileName $FileName -Message "L$i`: Unmatched closing parenthesis )" -Severity "WARN"
                     } else { $BraceStack.RemoveAt($BraceStack.Count - 1) }
                 }
             }
@@ -465,8 +488,8 @@ foreach ($File in $Ps1Files) {
     }
     foreach ($Open in $BraceStack) {
         $charName = if ($Open.Char -eq '{') { 'brace' } elseif ($Open.Char -eq '[') { 'bracket' } else { 'parenthesis' }
-        Write-Host "[BRACE-MISMATCH] $FilePath L$($Open.Line)`: Unmatched opening $charName $Open.Char . No matching closing character found." -ForegroundColor Red
-        Add-Failure -FileName $FileName -Message "L$($Open.Line)`: Unmatched opening $charName $Open.Char" -Severity "ERROR"
+        Write-Host "[BRACE-MISMATCH] $FilePath L$($Open.Line)`: Unmatched opening $charName $Open.Char . No matching closing character found." -ForegroundColor Yellow
+        Add-Failure -FileName $FileName -Message "L$($Open.Line)`: Unmatched opening $charName $Open.Char" -Severity "WARN"
     }
 
     # 19. Unbalanced quotes (single/double)
@@ -517,15 +540,39 @@ foreach ($File in $Ps1Files) {
         $i++
     }
 
-    # 21. UseShellExecute missing when Verb = runAs
+    # 21. UseShellExecute missing when Verb = runAs (STRING-AWARE)
     # In PowerShell 7 / .NET Core, ProcessStartInfo.UseShellExecute defaults to $false.
     # When UseShellExecute = $false, the Verb property is completely ignored, so UAC elevation never happens.
     # This causes an infinite auto-elevation loop (the exact bug we fixed in OS-Guard).
+    # STRING-AWARE: only flag `Verb = runAs` that appears in BARE code, not inside a quoted string
+    # literal. Test files that mention `Verb = "runAs"` inside a -notmatch regex pattern are NOT real
+    # elevation bugs, so they must not be flagged. The AST (#1) / PSParser (#2) checks remain authoritative.
     $i = 1
     foreach ($Line in $Lines) {
         $Trimmed = $Line.Trim()
         if ($Trimmed -match '^\s*#') { $i++; continue }
-        if ($Line -match 'Verb\s*=\s*"runAs"' -or $Line -match "Verb\s*=\s*'runAs'") {
+        # Walk the line tracking string context; only detect Verb = runAs in BARE code (not in a string literal).
+        $InString = $false
+        $StringChar = ''
+        $Escaping = $false
+        $CharArray = $Line.ToCharArray()
+        $VerbHit = $false
+        for ($j = 0; $j -lt $CharArray.Length; $j++) {
+            $ch = $CharArray[$j]
+            if ($Escaping) { $Escaping = $false; continue }
+            if ($ch -eq '`') { $Escaping = $true; continue }
+            if ($InString) {
+                if ($ch -eq $StringChar) { $InString = $false; $StringChar = '' }
+                continue
+            }
+            if ($ch -eq '"' -or $ch -eq "'") { $InString = $true; $StringChar = $ch; continue }
+            # Bare code: look for an identifier-leading `Verb = "runAs"` or `Verb = 'runAs'` assignment.
+            if ($ch -eq 'V' -and ($j -eq 0 -or (-not [char]::IsLetterOrDigit($CharArray[$j-1]) -and $CharArray[$j-1] -ne '_'))) {
+                $rest = $Line.Substring($j)
+                if ($rest -match '^Verb\s*=\s*("runAs"|''runAs'')') { $VerbHit = $true; break }
+            }
+        }
+        if ($VerbHit) {
             # Check if UseShellExecute = $true appears anywhere in the same file (simplified: within 20 lines)
             $FoundUseShell = $false
             $start = [Math]::Max(0, $i - 20)
@@ -582,9 +629,12 @@ foreach ($File in $Ps1Files) {
         $i++
     }
 
-    # 25.5. Try/Catch/Finally stack mismatch
+    # 25.5. Try/Catch/Finally stack mismatch (HEURISTIC)
     # PowerShell requires that every `try` block be paired with at least one `catch` or `finally` block.
     # This catches the common parser error: "The Try statement is missing its Catch or Finally block."
+    # HEURISTIC: this line-by-line scanner does not track multi-line/string context perfectly and can
+    # false-fire; a genuine missing catch/finally is already a hard ERROR via check #1 (AST), so this
+    # check is downgraded to WARN - diagnostic hint only, not a build blocker.
     $i = 1
     $TryStack = [System.Collections.Generic.List[pscustomobject]]::new()
     foreach ($Line in $Lines) {
@@ -615,8 +665,8 @@ foreach ($File in $Ps1Files) {
                     }
                     if ($rest -match '^catch\b') {
                         if ($TryStack.Count -eq 0 -or $TryStack[$TryStack.Count - 1].Keyword -ne 'try') {
-                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'catch' found without a matching 'try' block." -ForegroundColor Red
-                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'catch' without a matching 'try' block" -Severity "ERROR"
+                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'catch' found without a matching 'try' block." -ForegroundColor Yellow
+                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'catch' without a matching 'try' block" -Severity "WARN"
                         } else {
                             # Replace the top try with a catch marker so we can detect duplicate catches without finally
                             $TryStack[$TryStack.Count - 1] = [pscustomobject]@{ Keyword = 'catch'; Line = $i; Col = $j }
@@ -626,8 +676,8 @@ foreach ($File in $Ps1Files) {
                     }
                     if ($rest -match '^finally\b') {
                         if ($TryStack.Count -eq 0 -or ($TryStack[$TryStack.Count - 1].Keyword -ne 'try' -and $TryStack[$TryStack.Count - 1].Keyword -ne 'catch')) {
-                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'finally' found without a matching 'try' block." -ForegroundColor Red
-                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'finally' without a matching 'try' block" -Severity "ERROR"
+                            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$i': Unmatched 'finally' found without a matching 'try' block." -ForegroundColor Yellow
+                            Add-Failure -FileName $FileName -Message "L$i': Unmatched 'finally' without a matching 'try' block" -Severity "WARN"
                         } else {
                             # Mark as closed (finally satisfies the try requirement)
                             $TryStack.RemoveAt($TryStack.Count - 1)
@@ -645,8 +695,8 @@ foreach ($File in $Ps1Files) {
     }
     foreach ($Open in $TryStack) {
         if ($Open.Keyword -eq 'try') {
-            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$($Open.Line)': 'try' block at L$($Open.Line) is missing its 'catch' or 'finally' block." -ForegroundColor Red
-            Add-Failure -FileName $FileName -Message "L$($Open.Line)': 'try' block missing 'catch' or 'finally' block" -Severity "ERROR"
+            Write-Host "[TRY-CATCH-MISMATCH] $FilePath L$($Open.Line)': 'try' block at L$($Open.Line) is missing its 'catch' or 'finally' block." -ForegroundColor Yellow
+            Add-Failure -FileName $FileName -Message "L$($Open.Line)': 'try' block missing 'catch' or 'finally' block" -Severity "WARN"
         }
     }
 
@@ -862,21 +912,146 @@ foreach ($File in $Ps1Files) {
     } catch {}
 }
 
+# 27. Best-effort compile / linter checks for C, shell, python, and javascript.
+# These invoke REAL toolchains (when present) to catch what static heuristics miss: undeclared symbols,
+# wrong typedefs, shellcheck SC warnings, python bytecode errors, JS syntax errors. Each tool is OPTIONAL:
+# if the binary is not on PATH, the check is SKIPped (info) rather than failed. The collected script file
+# lists are also reused by the .sh/.py/.js auto-chmod pass (#28) and the per-language summary.
+$ShFiles = @(Get-ChildItem -Path $ScanDir -Filter "*.sh" -File -Recurse -ErrorAction SilentlyContinue)
+$PyFiles = @(Get-ChildItem -Path $ScanDir -Filter "*.py" -File -Recurse -ErrorAction SilentlyContinue)
+$JsFiles = @(Get-ChildItem -Path $ScanDir -Filter "*.js" -File -Recurse -ErrorAction SilentlyContinue)
+
+# (a) C best-effort COMPILE check (-fsyntax-only catches undeclared symbols / wrong typedefs without link deps).
+#     Restricted to .c translation units; .h headers are not standalone-compilable and are already covered
+#     by the C-section brace/string/preprocessor heuristics above. gmproxy.c needs -municode (tchar/_UNICODE).
+$CcCompiler = $null
+foreach ($cand in @('x86_64-w64-mingw32-gcc', 'gcc', 'cl.exe')) {
+    $cmd = Get-Command -Name $cand -ErrorAction SilentlyContinue
+    if ($cmd) { $CcCompiler = $cand; break }
+}
+if ($CcCompiler) {
+    Write-Host "[C-CC] Using compiler: $CcCompiler (-fsyntax-only)" -ForegroundColor DarkGray
+    foreach ($CFile in $CFiles) {
+        $CFileName = $CFile.Name
+        $CFilePath = $CFile.FullName
+        $ccArgs = @('-fsyntax-only')
+        if ($CFileName -eq 'gmproxy.c') { $ccArgs += '-municode' }
+        $ccArgs += $CFilePath
+        $ccOut = & $CcCompiler @ccArgs 2>&1
+        $ccText = $ccOut | Out-String
+        # gcc real errors print as ': error:'; missing-header 'fatal error:' has no ': error:' match,
+        # so a toolchain-missing-header file is silently skipped rather than falsely flagged.
+        if ($ccText -match ': error:') {
+            Write-Host "[C-CC-ERR] $CFilePath`: compiler reported errors:" -ForegroundColor Red
+            Write-Host $ccText -ForegroundColor DarkRed
+            Add-Failure -FileName $CFileName -Message "C compiler (-fsyntax-only) reported errors - see output" -Severity "ERROR"
+        } elseif ($ccText -match ': warning:') {
+            Write-Host "[C-CC-WARN] $CFilePath`: compiler reported warnings (non-fatal)" -ForegroundColor Yellow
+            Add-Failure -FileName $CFileName -Message "C compiler (-fsyntax-only) reported warnings" -Severity "WARN"
+        }
+    }
+} else {
+    Write-Host "[SKIP] C compile check (no x86_64-w64-mingw32-gcc / gcc / cl.exe on PATH)" -ForegroundColor Gray
+}
+
+# (b) shellcheck on every .sh (-S warning => ERROR on any warning-or-worse, mirroring run-regressions.sh).
+$shellcheck = Get-Command -Name 'shellcheck' -ErrorAction SilentlyContinue
+if ($shellcheck) {
+    foreach ($File in $ShFiles) {
+        $ShName = $File.Name
+        $ShPath = $File.FullName
+        $scOut = & shellcheck -S warning -f gcc $ShPath 2>&1
+        $scText = $scOut | Out-String
+        if ($LASTEXITCODE -ne 0 -and $scText.Trim().Length -gt 0) {
+            Write-Host "[SH-ERR] $ShPath`: shellcheck reported issues:" -ForegroundColor Red
+            Write-Host $scText -ForegroundColor DarkRed
+            Add-Failure -FileName $ShName -Message "shellcheck (-S warning) reported issues - see output" -Severity "ERROR"
+        }
+    }
+} else {
+    Write-Host "[SKIP] shellcheck check (shellcheck not on PATH)" -ForegroundColor Gray
+}
+
+# (c) python -m py_compile on every .py.
+$python = Get-Command -Name 'python3' -ErrorAction SilentlyContinue
+if (-not $python) { $python = Get-Command -Name 'python' -ErrorAction SilentlyContinue }
+if ($python) {
+    $pyBin = $python.Source
+    foreach ($File in $PyFiles) {
+        $PyName = $File.Name
+        $PyPath = $File.FullName
+        $pyOut = & $pyBin -m py_compile $PyPath 2>&1
+        $pyText = $pyOut | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[PY-ERR] $PyPath`: python py_compile failed:" -ForegroundColor Red
+            Write-Host $pyText -ForegroundColor DarkRed
+            Add-Failure -FileName $PyName -Message "python -m py_compile failed - see output" -Severity "ERROR"
+        }
+    }
+} else {
+    Write-Host "[SKIP] python py_compile check (python3/python not on PATH)" -ForegroundColor Gray
+}
+
+# (d) node --check on every .js.
+$node = Get-Command -Name 'node' -ErrorAction SilentlyContinue
+if ($node) {
+    foreach ($File in $JsFiles) {
+        $JsName = $File.Name
+        $JsPath = $File.FullName
+        $jsOut = & node --check $JsPath 2>&1
+        $jsText = $jsOut | Out-String
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[JS-ERR] $JsPath`: node --check failed:" -ForegroundColor Red
+            Write-Host $jsText -ForegroundColor DarkRed
+            Add-Failure -FileName $JsName -Message "node --check failed - see output" -Severity "ERROR"
+        }
+    }
+} else {
+    Write-Host "[SKIP] node --check (node not on PATH)" -ForegroundColor Gray
+}
+
+# 28. Auto-chmod: extend the .ps1 chmod pass (#26) to .sh / .py / .js scripts (rule 5.2:
+#     auto chmod to executable all other scripts when the scan directory is checked).
+#     Uses chmod +x on Unix (the Get-Acl/Set-Acl ACL path is Windows-only) with an ACL fallback.
+$chmodCmd = Get-Command -Name 'chmod' -ErrorAction SilentlyContinue
+foreach ($File in (@($ShFiles) + @($PyFiles) + @($JsFiles))) {
+    try {
+        if ($chmodCmd) {
+            & chmod +x $File.FullName 2>$null
+        } else {
+            $Acl = Get-Acl -Path $File.FullName -ErrorAction SilentlyContinue
+            if ($Acl) {
+                $UsersSid = New-Object System.Security.Principal.SecurityIdentifier("S-1-1-0")
+                $ReadExecute = [System.Security.AccessControl.FileSystemRights]::ReadAndExecute
+                $AllowRule = New-Object System.Security.AccessControl.FileSystemAccessRule($UsersSid, $ReadExecute, "None", "None", "Allow")
+                $Acl.AddAccessRule($AllowRule)
+                Set-Acl -Path $File.FullName -AclObject $Acl -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+}
+
 Write-Host "`n=====================================================" -ForegroundColor DarkGray
 Write-Host " SYNTAX CHECK SUMMARY " -ForegroundColor White
 Write-Host "=====================================================" -ForegroundColor DarkGray
-$TotalChecked = $Ps1Files.Count + $AllCFiles.Count
-$ErrorCount = $ErrorFiles.Count
-$WarnCount = $Warnings.Count
+# Honest aggregation: derive ERROR/WARN file lists directly from $FileFailures (the single source of
+# truth that aggregates correctly across function/script scope) rather than relying solely on the
+# $script: arrays. This guarantees the exit code reflects real [ERROR] findings even if a scope bug
+# ever resurfaces in Add-Failure.
+$ErrorFileList = @($FileFailures.Keys | Where-Object { @($FileFailures[$_] | Where-Object { $_ -match '^\[ERROR\]' }).Count -gt 0 } | Sort-Object)
+$WarnFileList  = @($FileFailures.Keys | Where-Object { @($FileFailures[$_] | Where-Object { $_ -match '^\[WARN\]'  }).Count -gt 0 } | Sort-Object)
+$TotalChecked = $Ps1Files.Count + $AllCFiles.Count + @($ShFiles).Count + @($PyFiles).Count + @($JsFiles).Count
+$ErrorCount = $ErrorFileList.Count
+$WarnCount = $WarnFileList.Count
 $PassCount = $TotalChecked - $ErrorCount
-Write-Host "Total checked: $TotalChecked (PS: $($Ps1Files.Count), C: $($AllCFiles.Count))" -ForegroundColor Gray
+Write-Host "Total checked: $TotalChecked (PS: $($Ps1Files.Count), C: $($AllCFiles.Count), SH: $(@($ShFiles).Count), PY: $(@($PyFiles).Count), JS: $(@($JsFiles).Count))" -ForegroundColor Gray
 Write-Host "Passed:        $PassCount" -ForegroundColor Green
-Write-Host "Warnings:      $WarnCount" -ForegroundColor Yellow
+Write-Host "Warnings:      $WarnCount (file(s))" -ForegroundColor Yellow
 Write-Host "Failed:        $ErrorCount" -ForegroundColor Red
 
 if ($ErrorCount -gt 0) {
     Write-Host "`nFAIL SUMMARY ($ErrorCount)" -ForegroundColor Red -BackgroundColor Black
-    foreach ($File in $ErrorFiles) {
+    foreach ($File in $ErrorFileList) {
         Write-Host "  $File" -ForegroundColor Red
         foreach ($Msg in $FileFailures[$File] | Where-Object { $_ -match '^\[ERROR\]' }) {
             Write-Host "    $Msg" -ForegroundColor DarkRed

@@ -9,7 +9,9 @@
 #        - Test-IfeoElevation.ps1    (IFEO + gmproxy normal-program elevation regression)
 #        - Test-Suite.ps1            (DNSGuard / God-Mode structure suite)
 #        - Test-GmProxySession.ps1   (gmproxy session-correct SYSTEM-token launch +
-#                                    monitor blank-owner kill guard regression)
+#                                    monitor blank-owner kill guard regression +
+#                                    durable gmproxy.log diagnostics + gmproxy<->monitor
+#                                    named-pipe PID handoff for in-place elevation)
 #   4. wine smoke test: loads the built gmhook.dll into pwsh.exe + chrome.exe
 #      stubs and asserts the CreateProcessW IAT hook is NOT installed in shell
 #      hosts (tests/test-shell-host-exclusion.sh) -- binary-level check that
@@ -17,7 +19,12 @@
 #   5. gmproxy session-fix build + invariant test (tests/test-gmproxy-session.sh):
 #      MinGW cross-compile of gmproxy.c proves the session-correctness + graceful-
 #      fallback code BUILDS and yields a PE binary (catches undeclared symbols /
-#      wrong typedefs before deploying to the VM).
+#      wrong typedefs before deploying to the VM). Also grep-proves the durable
+#      gmproxy.log diagnostics + SignalGmProxyFeedback named-pipe handoff symbols.
+#   6. syntax_check.ps1 honesty test (tests/test-syntax-check.sh): proves the upgraded
+#      checker exits 0 on a clean .ps1 and exits 1 + prints a FAIL SUMMARY (N) block on
+#      a broken .ps1 (unterminated function) and a broken .c (int main({) -- guarding
+#      against the old $script: scoping bug that always printed "Failed: 0".
 #
 # Prints a FAIL SUMMARY (N) block and exits 1 on any failure, 0 if all pass.
 # Usage: bash tests/run-regressions.sh
@@ -132,6 +139,21 @@ else
     else
         rc=$?
         record "gmproxy session-fix: compiles + invariants (MinGW)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
+# 6. syntax_check.ps1 honesty test (clean -> exit 0; broken .ps1/.c -> exit 1 + FAIL SUMMARY).
+synhonest="$SCRIPT_DIR/test-syntax-check.sh"
+if [ ! -f "$synhonest" ]; then
+    record "test-syntax-check.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$synhonest" >"$log" 2>&1; then
+        record "syntax_check.ps1 honesty (clean=exit0, broken=exit1+FAIL SUMMARY)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "syntax_check.ps1 honesty (clean=exit0, broken=exit1+FAIL SUMMARY)" 0 "exit=$rc (log: $log)"
     fi
 fi
 

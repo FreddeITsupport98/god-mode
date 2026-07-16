@@ -144,4 +144,34 @@ if ($parMatch.Success) {
 $totalGuardCount = ([regex]::Matches($gm, '\$owner\s+-and\s+\$owner\.User\s+-and\s+\$owner\.User\s+-ne\s+"SYSTEM"')).Count
 Add-Assertion "God-Mode-Windows.ps1: blank-owner guard appears >= 3 times (Stop + 2 Parallel)" ($totalGuardCount -ge 3) "only $totalGuardCount blank-owner guard(s) overall (need >= 3)"
 
+# --- 7. gmproxy.c: durable diagnostic log (%TEMP%\gmproxy.log) ---
+Add-Assertion "gmproxy.c: DiagLog helper defined (mirrors stderr to a log file)" ($proxy -match 'static\s+void\s+DiagLog\s*\(') "DiagLog helper missing -- stderr-only diagnostics would be invisible when IFEO launches gmproxy detached"
+Add-Assertion "gmproxy.c: GmProxyDiagLogOpen helper defined" ($proxy -match 'static\s+FILE\*\s+GmProxyDiagLogOpen\s*\(') "GmProxyDiagLogOpen helper missing"
+Add-Assertion "gmproxy.c: durable log written under TEMP via GetTempPathW + gmproxy.log" ($proxy -match 'GetTempPathW' -and $proxy -match 'gmproxy\.log') "durable gmproxy.log path missing -- diagnostics would not survive a detached launch"
+Add-Assertion "gmproxy.c: log file opened append-mode (_wfopen with a)" ($proxy -match '_wfopen\s*\([^)]*L"a"') "log file not opened in append mode"
+Add-Assertion "gmproxy.c: DiagLog writes to BOTH stderr and the log file (vfwprintf x2)" (([regex]::Matches($proxy,'vfwprintf')).Count -ge 2) "DiagLog does not mirror to both stderr and the log file"
+
+# --- 8. gmproxy.c: monitor feedback named-pipe handoff (in-place elevation) ---
+Add-Assertion "gmproxy.c: SignalGmProxyFeedback helper defined" ($proxy -match 'static\s+void\s+SignalGmProxyFeedback\s*\(') "SignalGmProxyFeedback helper missing -- graceful-fallback PID cannot be handed to the monitor"
+Add-Assertion "gmproxy.c: feedback named pipe GodMode-GmProxyFeedback present" ($proxy -match 'GodMode-GmProxyFeedback') "named pipe GodMode-GmProxyFeedback missing"
+Add-Assertion "gmproxy.c: feedback payload PID= over the pipe" ($proxy -match 'PID=%lu') "feedback payload PID= missing"
+Add-Assertion "gmproxy.c: feedback pipe client is non-blocking (CreateFileW + OPEN_EXISTING)" ($proxy -match 'SignalGmProxyFeedback[\s\S]{0,300}?CreateFileW' -and $proxy -match 'OPEN_EXISTING') "feedback pipe client not non-blocking CreateFileW/OPEN_EXISTING"
+Add-Assertion "gmproxy.c: graceful-fallback hands the launched PID to the monitor" ($proxy -match 'SignalGmProxyFeedback\s*\(\s*pi\.dwProcessId') "graceful-fallback does not hand the launched PID to the monitor"
+
+# --- 9. God-Mode-Windows.ps1: monitor feedback listener + in-place elevation ---
+Add-Assertion "God-Mode-Windows.ps1: Start-GmProxyFeedbackListener defined" ($gm -match 'function\s+Start-GmProxyFeedbackListener') "Start-GmProxyFeedbackListener missing"
+Add-Assertion "God-Mode-Windows.ps1: Stop-GmProxyFeedbackListener defined" ($gm -match 'function\s+Stop-GmProxyFeedbackListener') "Stop-GmProxyFeedbackListener missing"
+Add-Assertion "God-Mode-Windows.ps1: Invoke-GmProxyFeedbackElevation defined" ($gm -match 'function\s+Invoke-GmProxyFeedbackElevation') "Invoke-GmProxyFeedbackElevation missing"
+Add-Assertion "God-Mode-Windows.ps1: GmProxyFeedbackQueue queue declared" ($gm -match 'GmProxyFeedbackQueue') "GmProxyFeedbackQueue missing"
+Add-Assertion "God-Mode-Windows.ps1: listener uses NamedPipeServerStream + GodMode-GmProxyFeedback" ($gm -match 'NamedPipeServerStream' -and $gm -match 'GodMode-GmProxyFeedback') "named pipe server side missing"
+Add-Assertion "God-Mode-Windows.ps1: in-place elevation uses ReplaceProcessTokenForPid (no kill-relaunch)" ($gm -match 'function\s+Invoke-GmProxyFeedbackElevation[\s\S]{0,500}?ReplaceProcessTokenForPid') "Invoke-GmProxyFeedbackElevation does not call ReplaceProcessTokenForPid"
+Add-Assertion "God-Mode-Windows.ps1: Start-Monitoring starts the feedback listener" ($gm -match 'Start-GmProxyFeedbackListener') "Start-Monitoring does not start the feedback listener"
+Add-Assertion "God-Mode-Windows.ps1: Start-Monitoring drains GmProxyFeedbackQueue into in-place elevation" ($gm -match 'GmProxyFeedbackQueue[\s\S]{0,200}?Invoke-GmProxyFeedbackElevation') "Start-Monitoring does not drain GmProxyFeedbackQueue into Invoke-GmProxyFeedbackElevation"
+Add-Assertion "God-Mode-Windows.ps1: Disable-GodMode stops the feedback listener" ($gm -match 'Stop-GmProxyFeedbackListener') "Disable-GodMode does not stop the feedback listener"
+
+# --- 10. God-Mode-Windows.ps1: Export-GodModeLogs (option 11) surfaces gmproxy.log ---
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs includes GM-PROXY DIAGNOSTIC LOG section" ($gm -match 'GM-PROXY DIAGNOSTIC LOG') "Export-GodModeLogs does not surface the gmproxy diagnostic log"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs reads gmproxy.log from TEMP" ($gm -match 'Join-Path[\s\S]{0,40}?gmproxy\.log') "Export-GodModeLogs does not read gmproxy.log"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs handles a missing gmproxy log gracefully" ($gm -match 'No gmproxy log found') "Export-GodModeLogs does not guard a missing gmproxy log"
+
 Write-Summary

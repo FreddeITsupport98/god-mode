@@ -13,6 +13,7 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <tchar.h>
+#include <stdarg.h>   /* va_list for DiagLog() */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
@@ -59,6 +60,78 @@ static BOOL EnablePrivilege(LPCWSTR privName) {
     BOOL ok = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
     CloseHandle(hToken);
     return ok && GetLastError() == 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Diagnostics: mirror stderr diagnostic lines to a durable log file   */
+/* (%TEMP%\gmproxy.log) so they survive even when IFEO launches        */
+/* gmproxy.exe detached (no console). Surfaced in Export-GodModeLogs   */
+/* (menu option [11]) via the "===== GM-PROXY DIAGNOSTIC LOG ====="    */
+/* section. Best-effort: if the file cannot be opened, stderr still    */
+/* receives every line and the launch is never affected.               */
+/* ------------------------------------------------------------------ */
+static FILE* g_GmProxyDiagLog = NULL;
+
+static FILE* GmProxyDiagLogOpen(void) {
+    if (g_GmProxyDiagLog) return g_GmProxyDiagLog;
+    wchar_t tempDir[MAX_PATH] = {0};
+    DWORD len = GetTempPathW(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) return NULL;
+    /* Leave room for the "gmproxy.log" suffix + a session header line. */
+    if (wcslen(tempDir) > (MAX_PATH - 24)) return NULL;
+    wchar_t path[MAX_PATH] = {0};
+    swprintf(path, MAX_PATH, L"%sgmproxy.log", tempDir);
+    g_GmProxyDiagLog = _wfopen(path, L"a");
+    if (g_GmProxyDiagLog) {
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t header[80] = {0};
+        swprintf(header, 80, L"=== gmproxy diag session %04u-%02u-%02u %02u:%02u:%02u ===\n",
+                 (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+                 (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+        fwprintf(g_GmProxyDiagLog, L"%s", header);
+        fflush(g_GmProxyDiagLog);
+    }
+    return g_GmProxyDiagLog;
+}
+
+/* Write a diagnostic line to BOTH stderr and the durable gmproxy.log. */
+static void DiagLog(const wchar_t* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfwprintf(stderr, fmt, ap);
+    va_end(ap);
+    FILE* f = GmProxyDiagLogOpen();
+    if (f) {
+        va_start(ap, fmt);
+        vfwprintf(f, fmt, ap);
+        va_end(ap);
+        fflush(f);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Monitor feedback: hand a gracefully-launched PID to the God Mode    */
+/* monitor via named pipe \\.\pipe\GodMode-GmProxyFeedback so the       */
+/* monitor can elevate it IN PLACE (ReplaceProcessTokenForPid) instead */
+/* of the 15s periodic scan kill+relaunching it (which would spawn a   */
+/* duplicate). Non-blocking: if no monitor is listening, CreateFile    */
+/* fails immediately (ERROR_FILE_NOT_FOUND) and we skip -- the         */
+/* periodic scan remains a fallback. Never affects the launch.         */
+/* ------------------------------------------------------------------ */
+static void SignalGmProxyFeedback(DWORD pid) {
+    if (pid == 0) return;
+    HANDLE hPipe = CreateFileW(L"\\\\.\\pipe\\GodMode-GmProxyFeedback",
+                               GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hPipe == INVALID_HANDLE_VALUE) return; /* monitor not running / not SYSTEM yet */
+    char buf[40];
+    int n = snprintf(buf, sizeof(buf), "PID=%lu\n", (unsigned long)pid);
+    if (n > 0) {
+        if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+        DWORD written = 0;
+        WriteFile(hPipe, buf, (DWORD)n, &written, NULL);
+    }
+    CloseHandle(hPipe);
 }
 
 /* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
@@ -202,14 +275,14 @@ static DWORD FindAnySystemProcessPid(void) {
 
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
-        fwprintf(stderr, L"[GM-PROXY] Usage: gmproxy.exe <path_to_original.exe> [args...]\n");
+        DiagLog(L"[GM-PROXY] Usage: gmproxy.exe <path_to_original.exe> [args...]\n");
         return 1;
     }
 
     /* Reject over-long target paths up front: several stack buffers below are
        MAX_PATH wide and wcscpy/swprintf would otherwise overflow them. */
     if (wcslen(argv[1]) >= MAX_PATH) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: target path too long (>= MAX_PATH).\n");
+        DiagLog(L"[GM-PROXY] ERROR: target path too long (>= MAX_PATH).\n");
         return 1;
     }
 
@@ -239,9 +312,9 @@ int wmain(int argc, wchar_t* argv[]) {
                reassert it in case the duplicate's session drifted. Best-effort. */
             DWORD sid = activeSession;
             if (!SetTokenInformation(hPrimary, TokenSessionId, &sid, sizeof(sid))) {
-                fwprintf(stderr, L"[GM-PROXY] INFO: SetTokenInformation(session=%lu) not applied (source already in session).\n", activeSession);
+                DiagLog(L"[GM-PROXY] INFO: SetTokenInformation(session=%lu) not applied (source already in session).\n", activeSession);
             }
-            fwprintf(stderr, L"[GM-PROXY] Acquired active-session SYSTEM token from PID %lu (session %lu).\n", srcPid, activeSession);
+            DiagLog(L"[GM-PROXY] Acquired active-session SYSTEM token from PID %lu (session %lu).\n", srcPid, activeSession);
         }
     }
 
@@ -257,10 +330,10 @@ int wmain(int argc, wchar_t* argv[]) {
                 DWORD sid = activeSession;
                 if (SetTokenInformation(hTmp, TokenSessionId, &sid, sizeof(sid))) {
                     hPrimary = hTmp;
-                    fwprintf(stderr, L"[GM-PROXY] Relocated SYSTEM token from PID %lu to session %lu.\n", anyPid, activeSession);
+                    DiagLog(L"[GM-PROXY] Relocated SYSTEM token from PID %lu to session %lu.\n", anyPid, activeSession);
                 } else {
                     CloseHandle(hTmp);
-                    fwprintf(stderr, L"[GM-PROXY] WARN: cannot relocate SYSTEM token to session %lu (no SeTcb). Will degrade to normal launch.\n", activeSession);
+                    DiagLog(L"[GM-PROXY] WARN: cannot relocate SYSTEM token to session %lu (no SeTcb). Will degrade to normal launch.\n", activeSession);
                 }
             }
         }
@@ -268,7 +341,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     const BOOL haveToken = (hPrimary != NULL);
     if (!haveToken) {
-        fwprintf(stderr, L"[GM-PROXY] WARN: no usable SYSTEM token in session %lu; will launch target as current user (not SYSTEM).\n", activeSession);
+        DiagLog(L"[GM-PROXY] WARN: no usable SYSTEM token in session %lu; will launch target as current user (not SYSTEM).\n", activeSession);
     }
 
     // Build command line from argv
@@ -326,7 +399,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (!usedHardlink) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: Failed to create hardlink/copy for IFEO bypass. GLE=%lu\n", GetLastError());
+        DiagLog(L"[GM-PROXY] ERROR: Failed to create hardlink/copy for IFEO bypass. GLE=%lu\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, cmdLine);
         if (hPrimary) CloseHandle(hPrimary);
         return 1;
@@ -366,7 +439,13 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!ok) {
         ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
         if (ok) {
-            fwprintf(stderr, L"[GM-PROXY] Launched %s as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+            DiagLog(L"[GM-PROXY] Launched %s as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+            /* Hand the PID to the God Mode monitor so it can elevate this process
+               IN PLACE (token replacement) instead of the 15s periodic scan
+               kill+relaunching it (which would spawn a duplicate). Best-effort:
+               if no monitor is listening, the periodic scan remains a fallback. */
+            SignalGmProxyFeedback(pi.dwProcessId);
+            DiagLog(L"[GM-PROXY] Handed PID %lu to monitor via GodMode-GmProxyFeedback for in-place elevation.\n", pi.dwProcessId);
         }
     }
 
@@ -374,14 +453,14 @@ int wmain(int argc, wchar_t* argv[]) {
     DeleteFileW(hardlinkPath);
 
     if (!ok) {
-        fwprintf(stderr, L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
+        DiagLog(L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, cmdLine);
         if (hPrimary) CloseHandle(hPrimary);
         return 1;
     }
 
     if (haveToken) {
-        fwprintf(stderr, L"[GM-PROXY] SUCCESS: Launched %s as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+        DiagLog(L"[GM-PROXY] SUCCESS: Launched %s as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
     }
 
     CloseHandle(pi.hProcess);
