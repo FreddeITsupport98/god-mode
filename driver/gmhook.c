@@ -127,6 +127,25 @@ static void GmWidenAscii(const char* src, wchar_t* dst, size_t cap) {
     dst[i] = 0;
 }
 
+/* Ensure a wide path buffer ends with a single trailing backslash. GetTempPathW
+   is documented to return a path ending in '\', and on real Windows AND wine it
+   does -- this is a defensive belt-and-suspenders that appends a backslash only
+   if some non-conforming environment ever omitted one (a no-op in practice;
+   callers already guard the length). NOTE: the wine smoke-test Cgmhook.log
+   artifact was NOT a missing backslash -- it was %s in MinGW's wide
+   swprintf/fwprintf truncating wchar_t arguments to their first character; that
+   is fixed by using %ls (wide) in the format strings below. Mirrors gmproxy.c. */
+static void GmEnsureTrailingBackslash(wchar_t* path, size_t cap) {
+    if (!path || cap == 0) return;
+    size_t n = wcslen(path);
+    if (n == 0) return;
+    if (path[n - 1] == L'\\') return;       /* already ends with a backslash */
+    if (n + 1 < cap) {
+        path[n] = L'\\';
+        path[n + 1] = 0;
+    }
+}
+
 /* Build-version stamp: baked in at compile time via __DATE__/__TIME__, so it
    changes on every recompile. Written to %TEMP%\gmhook.log on every
    DLL_PROCESS_ATTACH (best-effort, mutex try-locked so DllMain never blocks
@@ -141,9 +160,10 @@ static void GmHookWriteBuildStamp(void) {
     wchar_t tempDir[MAX_PATH] = {0};
     DWORD len = GetTempPathW(MAX_PATH, tempDir);
     if (len == 0 || len >= MAX_PATH) return;
+    GmEnsureTrailingBackslash(tempDir, MAX_PATH);   /* harden: wine may omit the trailing '\' */
     if (wcslen(tempDir) > (MAX_PATH - 24)) return;
     wchar_t path[MAX_PATH] = {0};
-    swprintf(path, MAX_PATH, L"%sgmhook.log", tempDir);
+    swprintf(path, MAX_PATH, L"%lsgmhook.log", tempDir);   /* %ls: wide (MinGW swprintf %s reads wchar_t as narrow -> truncates) */
 
     /* Host process base name (so the stamp shows who loaded this DLL). */
     wchar_t modName[MAX_PATH] = {0};
@@ -159,7 +179,7 @@ static void GmHookWriteBuildStamp(void) {
     GetLocalTime(&st);
     wchar_t line[256] = {0};
     swprintf(line, 256,
-        L"[GM-HOOK] BUILD %s %s loaded in %s (attach %04u-%02u-%02u %02u:%02u:%02u)\n",
+        L"[GM-HOOK] BUILD %ls %ls loaded in %ls (attach %04u-%02u-%02u %02u:%02u:%02u)\n",   /* %ls: wide wdate/wtime/baseName (MinGW %s truncates wchar_t) */
         wdate, wtime, baseName,
         (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
         (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
@@ -182,7 +202,7 @@ static void GmHookWriteBuildStamp(void) {
             }
             FILE* f = _wfopen(path, truncate ? L"w" : L"a");
             if (f) {
-                fwprintf(f, L"%s", line);
+                fputws(line, f);   /* fputws: write the wide line without %s truncation */
                 fflush(f);
                 fclose(f);
             }

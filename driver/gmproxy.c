@@ -83,6 +83,25 @@ static void GmWidenAscii(const char* src, wchar_t* dst, size_t cap) {
     dst[i] = 0;
 }
 
+/* Ensure a wide path buffer ends with a single trailing backslash. GetTempPathW
+   is documented to return a path ending in '\', and on real Windows AND wine it
+   does -- this is a defensive belt-and-suspenders that appends a backslash only
+   if some non-conforming environment ever omitted one (a no-op in practice;
+   callers already guard the length). NOTE: the wine smoke-test Cgmproxy.log
+   artifact was NOT a missing backslash -- it was %s in MinGW's wide
+   swprintf/fwprintf truncating wchar_t arguments to their first character; that
+   is fixed by using %ls (wide) in the format strings below. Mirrored in gmhook.c. */
+static void GmEnsureTrailingBackslash(wchar_t* path, size_t cap) {
+    if (!path || cap == 0) return;
+    size_t n = wcslen(path);
+    if (n == 0) return;
+    if (path[n - 1] == L'\\') return;       /* already ends with a backslash */
+    if (n + 1 < cap) {
+        path[n] = L'\\';
+        path[n + 1] = 0;
+    }
+}
+
 static FILE* g_GmProxyDiagLog = NULL;
 
 static FILE* GmProxyDiagLogOpen(void) {
@@ -90,10 +109,11 @@ static FILE* GmProxyDiagLogOpen(void) {
     wchar_t tempDir[MAX_PATH] = {0};
     DWORD len = GetTempPathW(MAX_PATH, tempDir);
     if (len == 0 || len >= MAX_PATH) return NULL;
+    GmEnsureTrailingBackslash(tempDir, MAX_PATH);   /* harden: wine may omit the trailing '\' */
     /* Leave room for the "gmproxy.log" suffix + a session header line. */
     if (wcslen(tempDir) > (MAX_PATH - 24)) return NULL;
     wchar_t path[MAX_PATH] = {0};
-    swprintf(path, MAX_PATH, L"%sgmproxy.log", tempDir);
+    swprintf(path, MAX_PATH, L"%lsgmproxy.log", tempDir);   /* %ls: wide (MinGW swprintf %s reads wchar_t as narrow -> truncates) */
     g_GmProxyDiagLog = _wfopen(path, L"a");
     if (g_GmProxyDiagLog) {
         SYSTEMTIME st;
@@ -102,7 +122,7 @@ static FILE* GmProxyDiagLogOpen(void) {
         swprintf(header, 80, L"=== gmproxy diag session %04u-%02u-%02u %02u:%02u:%02u ===\n",
                  (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
                  (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
-        fwprintf(g_GmProxyDiagLog, L"%s", header);
+        fputws(header, g_GmProxyDiagLog);   /* fputws: write the wide header without %s truncation */
         fflush(g_GmProxyDiagLog);
     }
     return g_GmProxyDiagLog;
@@ -307,7 +327,7 @@ int wmain(int argc, wchar_t* argv[]) {
         wchar_t wdate[16] = {0}, wtime[16] = {0};
         GmWidenAscii(__DATE__, wdate, 16);
         GmWidenAscii(__TIME__, wtime, 16);
-        DiagLog(L"[GM-PROXY] BUILD %s %s (compiled)\n", wdate, wtime);
+        DiagLog(L"[GM-PROXY] BUILD %ls %ls (compiled)\n", wdate, wtime);   /* %ls: wide wdate/wtime (MinGW %s truncates wchar_t) */
     }
 
     EnablePrivilege(L"SeDebugPrivilege");
@@ -412,13 +432,13 @@ int wmain(int argc, wchar_t* argv[]) {
     wchar_t* lastSlash = wcsrchr(dirPath, L'\\');
     if (lastSlash) lastSlash[1] = 0; /* keep trailing backslash */
 
-    swprintf(hardlinkPath, MAX_PATH, L"%sgmproxy_%lu_%s", dirPath, GetCurrentProcessId(), baseName);
+    swprintf(hardlinkPath, MAX_PATH, L"%lsgmproxy_%lu_%ls", dirPath, GetCurrentProcessId(), baseName);   /* %ls: wide dirPath + baseName */
 
     BOOL usedHardlink = CreateHardLinkW(hardlinkPath, argv[1], NULL);
     if (!usedHardlink) {
         wchar_t tempDir[MAX_PATH] = {0};
         GetTempPathW(MAX_PATH, tempDir);
-        swprintf(hardlinkPath, MAX_PATH, L"%s\\gmproxy_%lu_%s", tempDir, GetCurrentProcessId(), baseName);
+        swprintf(hardlinkPath, MAX_PATH, L"%ls\\gmproxy_%lu_%ls", tempDir, GetCurrentProcessId(), baseName);   /* %ls: wide tempDir + baseName */
         usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
     }
 
@@ -463,7 +483,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!ok) {
         ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
         if (ok) {
-            DiagLog(L"[GM-PROXY] Launched %s as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+            DiagLog(L"[GM-PROXY] Launched %ls as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
             /* Hand the PID to the God Mode monitor so it can elevate this process
                IN PLACE (token replacement) instead of the 15s periodic scan
                kill+relaunching it (which would spawn a duplicate). Best-effort:
@@ -484,7 +504,7 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     if (haveToken) {
-        DiagLog(L"[GM-PROXY] SUCCESS: Launched %s as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);
+        DiagLog(L"[GM-PROXY] SUCCESS: Launched %ls as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
     }
 
     CloseHandle(pi.hProcess);

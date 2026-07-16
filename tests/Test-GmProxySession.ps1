@@ -211,7 +211,7 @@ Add-Assertion "gmhook.c: FindSystemPid skips non-active-session candidates" ($gm
 # deployed (stale vs. freshly rebuilt).
 Add-Assertion "gmproxy.c: GmWidenAscii helper defined (ASCII char->wchar_t for __DATE__/__TIME__)" ($proxy -match 'static\s+void\s+GmWidenAscii\s*\(') "GmWidenAscii helper missing -- __DATE__/__TIME__ cannot be widened for the wide DiagLog"
 Add-Assertion "gmproxy.c: build stamp uses __DATE__ and __TIME__ (changes every recompile)" ($proxy -match '__DATE__' -and $proxy -match '__TIME__') "gmproxy.c build stamp does not use __DATE__/__TIME__ -- stamp would not change per build"
-Add-Assertion "gmproxy.c: emits [GM-PROXY] BUILD stamp via DiagLog in wmain" ($proxy -match '\[GM-PROXY\]\s*BUILD\s+%s\s+%s') "gmproxy.c does not emit a [GM-PROXY] BUILD stamp in wmain"
+Add-Assertion "gmproxy.c: emits [GM-PROXY] BUILD stamp via DiagLog in wmain" ($proxy -match '\[GM-PROXY\]\s*BUILD\s+%ls\s+%ls') "gmproxy.c does not emit a [GM-PROXY] BUILD stamp in wmain (expect %ls %ls wide format)"
 Add-Assertion "gmhook.c: GmWidenAscii helper defined" ($gmhook -match 'static\s+void\s+GmWidenAscii\s*\(') "gmhook.c GmWidenAscii helper missing"
 Add-Assertion "gmhook.c: GmHookWriteBuildStamp helper defined" ($gmhook -match 'static\s+void\s+GmHookWriteBuildStamp\s*\(') "gmhook.c GmHookWriteBuildStamp helper missing"
 Add-Assertion "gmhook.c: build stamp uses __DATE__ and __TIME__" ($gmhook -match '__DATE__' -and $gmhook -match '__TIME__') "gmhook.c build stamp does not use __DATE__/__TIME__"
@@ -224,5 +224,33 @@ Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-PROXY B
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-HOOK BUILD stamp" ($gm -match "Select-String[\s\S]{0,80}?GM-HOOK BUILD") "Export-GodModeLogs does not extract the last GM-HOOK BUILD stamp"
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs reads gmhook.log from TEMP" ($gm -match 'Join-Path[\s\S]{0,40}?gmhook\.log') "Export-GodModeLogs does not read gmhook.log"
 Add-Assertion "God-Mode-Windows.ps1: Uninstall-ProcessHook removes gmhook.log (uninstaller kept current)" ($gm -match 'function\s+Uninstall-ProcessHook[\s\S]{0,4000}?gmhook\.log') "Uninstall-ProcessHook does not remove gmhook.log -- uninstaller not kept current with the new diagnostic log"
+
+# --- 15. GetTempPathW trailing-backslash hardening (defensive belt-and-suspenders) ---
+# GetTempPathW is documented to return a path ending in '\', and on real Windows
+# AND wine it does -- GmEnsureTrailingBackslash is a defensive no-op that appends
+# a backslash only if some non-conforming environment ever omitted one. NOTE: the
+# actual Cgmhook.log wine artifact was NOT a missing backslash -- see section 16
+# (the %s->%ls wide-format fix is the real root cause).
+Add-Assertion "gmproxy.c: GmEnsureTrailingBackslash helper defined (trailing-backslash hardening)" ($proxy -match 'static\s+void\s+GmEnsureTrailingBackslash\s*\(') "GmEnsureTrailingBackslash helper missing -- gmproxy.log path not hardened against a non-trailing-backslash GetTempPathW return"
+Add-Assertion "gmproxy.c: GmProxyDiagLogOpen calls GmEnsureTrailingBackslash after GetTempPathW" ($proxy -match 'GmProxyDiagLogOpen[\s\S]{0,300}?GetTempPathW[\s\S]{0,120}?GmEnsureTrailingBackslash') "GmProxyDiagLogOpen does not normalize the temp dir after GetTempPathW -- wine could concatenate tempDir+gmproxy.log"
+Add-Assertion "gmhook.c: GmEnsureTrailingBackslash helper defined" ($gmhook -match 'static\s+void\s+GmEnsureTrailingBackslash\s*\(') "gmhook.c GmEnsureTrailingBackslash helper missing -- gmhook.log path not hardened"
+Add-Assertion "gmhook.c: GmHookWriteBuildStamp calls GmEnsureTrailingBackslash after GetTempPathW" ($gmhook -match 'GmHookWriteBuildStamp[\s\S]{0,300}?GetTempPathW[\s\S]{0,120}?GmEnsureTrailingBackslash') "GmHookWriteBuildStamp does not normalize the temp dir after GetTempPathW -- wine could concatenate tempDir+gmhook.log (the Cgmhook.log artifact)"
+
+# --- 16. Wide-format %ls fix (MinGW swprintf/fwprintf %s truncates wchar_t* to 1 char) ---
+# ROOT CAUSE of the wine smoke-test Cgmhook.log/Cgmproxy.log repo-root artifact + the
+# garbled [[ stamps: %s in MinGW's wide swprintf/fwprintf/vfwprintf reads a wchar_t*
+# argument as a narrow char* and stops at the first 0x00 byte (the high byte of the
+# first ASCII wchar_t), truncating to one character. So "%sgmhook.log" with tempDir=
+# "C:\...\Temp\" became "Cgmhook.log", and the stamp line wrote only "[" per attach.
+# Fix: %s -> %ls (wide, consistent across MSVC and MinGW) for every wchar_t* arg, and
+# fputws for pre-built wide line writes. Probe-confirmed under wine.
+Add-Assertion "gmproxy.c: log path swprintf uses %ls (wide) for the wchar_t tempDir" ($proxy -match '%lsgmproxy\.log') "gmproxy.c log path still uses %s -- MinGW would truncate tempDir to 1 char -> Cgmproxy.log in CWD"
+Add-Assertion "gmproxy.c: BUILD stamp DiagLog uses %ls for widened __DATE__/__TIME__" ($proxy -match '\[GM-PROXY\]\s*BUILD\s+%ls\s+%ls') "gmproxy.c BUILD stamp still uses %s -- MinGW would truncate wdate/wtime to 1 char (garbled stamp)"
+Add-Assertion "gmproxy.c: diag session header written via fputws (not fwprintf %s)" ($proxy -match 'fputws\s*\(\s*header') "gmproxy.c header still uses fwprintf %s -- MinGW would truncate the wide header"
+Add-Assertion "gmproxy.c: IFEO-bypass hardlink swprintf uses %ls for dirPath + baseName" ($proxy -match '%lsgmproxy_%lu_%ls') "gmproxy.c hardlink path still uses %s -- MinGW would truncate dirPath/baseName"
+Add-Assertion "gmproxy.c: graceful-fallback + success DiagLog use %ls for argv[1]" ($proxy -match 'Launched %ls as current user' -and $proxy -match 'Launched %ls as SYSTEM') "gmproxy.c Launched DiagLogs still use %s -- MinGW would truncate argv[1] (the target path)"
+Add-Assertion "gmhook.c: log path swprintf uses %ls (wide) for the wchar_t tempDir" ($gmhook -match '%lsgmhook\.log') "gmhook.c log path still uses %s -- MinGW would truncate tempDir to 1 char -> Cgmhook.log in CWD (the artifact)"
+Add-Assertion "gmhook.c: BUILD stamp line uses %ls for wdate/wtime/baseName" ($gmhook -match '\[GM-HOOK\]\s*BUILD\s+%ls\s+%ls\s+loaded in %ls') "gmhook.c BUILD line still uses %s -- MinGW would truncate wdate/wtime/baseName to 1 char (garbled [[ stamp)"
+Add-Assertion "gmhook.c: stamp line written via fputws (not fwprintf %s)" ($gmhook -match 'fputws\s*\(\s*line') "gmhook.c stamp line still uses fwprintf %s -- MinGW would truncate the wide line to 1 char"
 
 Write-Summary

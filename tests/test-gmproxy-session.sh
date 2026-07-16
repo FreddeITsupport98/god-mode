@@ -65,6 +65,17 @@ grep -qF '__TIME__' "$SRC" && record "src: __TIME__ build-stamp present" 1 || re
 grep -qF 'GmWidenAscii' "$SRC" && record "src: GmWidenAscii helper present" 1 || record "src: GmWidenAscii helper present" 0 "not found"
 grep -qF '[GM-PROXY] BUILD' "$SRC" && record "src: [GM-PROXY] BUILD stamp present" 1 || record "src: [GM-PROXY] BUILD stamp present" 0 "not found"
 
+# GetTempPathW trailing-backslash hardening: wine smoke tests can return a temp
+# path WITHOUT a trailing '\', which would concatenate tempDir+filename
+# (Cgmhook.log artifact). GmEnsureTrailingBackslash normalizes it.
+grep -qF 'GmEnsureTrailingBackslash' "$SRC" && record "src: GmEnsureTrailingBackslash trailing-backslash hardening present" 1 || record "src: GmEnsureTrailingBackslash trailing-backslash hardening present" 0 "not found"
+
+# Wide-format %ls fix: MinGW's wide swprintf %s truncates a wchar_t* arg to its
+# first character (reads it as narrow, stops at the 0x00 high byte), which was the
+# REAL root cause of the Cgmhook.log/Cgmproxy.log wine artifact + garbled stamps.
+# %ls (wide) is consistent across MSVC and MinGW.
+grep -qF '%lsgmproxy.log' "$SRC" && record "src: %ls wide-format log path present (MinGW %s truncation fix)" 1 || record "src: %ls wide-format log path present (MinGW %s truncation fix)" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"
