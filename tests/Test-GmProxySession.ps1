@@ -204,4 +204,25 @@ Add-Assertion "gmhook.c: dynamically loads WTSGetActiveConsoleSessionId (wtsapi3
 Add-Assertion "gmhook.c: FindSystemPid uses ProcessIdToSessionId session filter" ($gmhook -match 'ProcessIdToSessionId\(pe\.th32ProcessID,\s*&procSession\)') "FindSystemPid does not filter by ProcessIdToSessionId -- could steal a Session-0 SYSTEM token"
 Add-Assertion "gmhook.c: FindSystemPid skips non-active-session candidates" ($gmhook -match 'procSession\s*!=\s*activeSession') "FindSystemPid does not skip non-active-session candidates"
 
+# --- 14. Build-version stamps (gmproxy + gmhook) + option-11 surfacing ---
+# Each C binary bakes in a compile-time stamp via __DATE__/__TIME__ (changes on
+# every recompile) and writes it to %TEMP%\gmproxy.log / %TEMP%\gmhook.log so
+# Export-GodModeLogs (option [11]) can confirm at a glance which build is
+# deployed (stale vs. freshly rebuilt).
+Add-Assertion "gmproxy.c: GmWidenAscii helper defined (ASCII char->wchar_t for __DATE__/__TIME__)" ($proxy -match 'static\s+void\s+GmWidenAscii\s*\(') "GmWidenAscii helper missing -- __DATE__/__TIME__ cannot be widened for the wide DiagLog"
+Add-Assertion "gmproxy.c: build stamp uses __DATE__ and __TIME__ (changes every recompile)" ($proxy -match '__DATE__' -and $proxy -match '__TIME__') "gmproxy.c build stamp does not use __DATE__/__TIME__ -- stamp would not change per build"
+Add-Assertion "gmproxy.c: emits [GM-PROXY] BUILD stamp via DiagLog in wmain" ($proxy -match '\[GM-PROXY\]\s*BUILD\s+%s\s+%s') "gmproxy.c does not emit a [GM-PROXY] BUILD stamp in wmain"
+Add-Assertion "gmhook.c: GmWidenAscii helper defined" ($gmhook -match 'static\s+void\s+GmWidenAscii\s*\(') "gmhook.c GmWidenAscii helper missing"
+Add-Assertion "gmhook.c: GmHookWriteBuildStamp helper defined" ($gmhook -match 'static\s+void\s+GmHookWriteBuildStamp\s*\(') "gmhook.c GmHookWriteBuildStamp helper missing"
+Add-Assertion "gmhook.c: build stamp uses __DATE__ and __TIME__" ($gmhook -match '__DATE__' -and $gmhook -match '__TIME__') "gmhook.c build stamp does not use __DATE__/__TIME__"
+Add-Assertion "gmhook.c: writes [GM-HOOK] BUILD stamp to gmhook.log under TEMP (GetTempPathW)" ($gmhook -match 'GetTempPathW' -and $gmhook -match 'gmhook\.log' -and $gmhook -match '\[GM-HOOK\]\s*BUILD') "gmhook.c does not write a [GM-HOOK] BUILD stamp to %TEMP%\gmhook.log"
+Add-Assertion "gmhook.c: build stamp mirrored to OutputDebugStringW (live DebugView)" ($gmhook -match 'OutputDebugStringW') "gmhook.c build stamp not mirrored to OutputDebugStringW"
+Add-Assertion "gmhook.c: build stamp mutex-serialized (CreateMutexW + GodMode_GmHookLog, no DllMain block)" ($gmhook -match 'CreateMutexW' -and $gmhook -match 'GodMode_GmHookLog') "gmhook.c build stamp not mutex-serialized -- concurrent attaches could corrupt gmhook.log"
+Add-Assertion "gmhook.c: DllMain calls GmHookWriteBuildStamp on DLL_PROCESS_ATTACH" ($gmhook -match 'GmHookWriteBuildStamp\s*\(\s*\)') "DllMain does not call GmHookWriteBuildStamp on attach"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs has GM BUILD VERSIONS section" ($gm -match 'GM BUILD VERSIONS') "Export-GodModeLogs does not have a GM BUILD VERSIONS section"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-PROXY BUILD stamp" ($gm -match "Select-String[\s\S]{0,80}?GM-PROXY BUILD") "Export-GodModeLogs does not extract the last GM-PROXY BUILD stamp"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-HOOK BUILD stamp" ($gm -match "Select-String[\s\S]{0,80}?GM-HOOK BUILD") "Export-GodModeLogs does not extract the last GM-HOOK BUILD stamp"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs reads gmhook.log from TEMP" ($gm -match 'Join-Path[\s\S]{0,40}?gmhook\.log') "Export-GodModeLogs does not read gmhook.log"
+Add-Assertion "God-Mode-Windows.ps1: Uninstall-ProcessHook removes gmhook.log (uninstaller kept current)" ($gm -match 'function\s+Uninstall-ProcessHook[\s\S]{0,4000}?gmhook\.log') "Uninstall-ProcessHook does not remove gmhook.log -- uninstaller not kept current with the new diagnostic log"
+
 Write-Summary

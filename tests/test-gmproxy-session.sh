@@ -57,6 +57,14 @@ grep -q 'SignalGmProxyFeedback' "$SRC" && record "src: SignalGmProxyFeedback pre
 grep -q 'GodMode-GmProxyFeedback' "$SRC" && record "src: feedback pipe name present" 1 || record "src: feedback pipe name present" 0 "not found"
 grep -q 'OPEN_EXISTING' "$SRC" && record "src: feedback pipe non-blocking OPEN_EXISTING present" 1 || record "src: feedback pipe non-blocking OPEN_EXISTING present" 0 "not found"
 
+# Build-version stamp invariants (baked in via __DATE__/__TIME__, changes every
+# recompile; surfaced in Export-GodModeLogs option [11] so a stale vs. freshly
+# rebuilt gmproxy.exe is identifiable at a glance).
+grep -qF '__DATE__' "$SRC" && record "src: __DATE__ build-stamp present" 1 || record "src: __DATE__ build-stamp present" 0 "not found"
+grep -qF '__TIME__' "$SRC" && record "src: __TIME__ build-stamp present" 1 || record "src: __TIME__ build-stamp present" 0 "not found"
+grep -qF 'GmWidenAscii' "$SRC" && record "src: GmWidenAscii helper present" 1 || record "src: GmWidenAscii helper present" 0 "not found"
+grep -qF '[GM-PROXY] BUILD' "$SRC" && record "src: [GM-PROXY] BUILD stamp present" 1 || record "src: [GM-PROXY] BUILD stamp present" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

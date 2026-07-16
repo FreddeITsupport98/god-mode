@@ -70,6 +70,19 @@ static BOOL EnablePrivilege(LPCWSTR privName) {
 /* section. Best-effort: if the file cannot be opened, stderr still    */
 /* receives every line and the launch is never affected.               */
 /* ------------------------------------------------------------------ */
+/* Widen an ASCII (char) string to wchar_t in-place. __DATE__/__TIME__ are
+   narrow char literals; this widens them (ASCII, direct char->wchar_t) so they
+   can be logged via the wide DiagLog without relying on %hs/%S (whose meaning
+   differs between MSVC and MinGW wprintf modes). */
+static void GmWidenAscii(const char* src, wchar_t* dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    size_t i = 0;
+    if (src) {
+        for (; src[i] && i + 1 < cap; i++) dst[i] = (wchar_t)(unsigned char)src[i];
+    }
+    dst[i] = 0;
+}
+
 static FILE* g_GmProxyDiagLog = NULL;
 
 static FILE* GmProxyDiagLogOpen(void) {
@@ -284,6 +297,17 @@ int wmain(int argc, wchar_t* argv[]) {
     if (wcslen(argv[1]) >= MAX_PATH) {
         DiagLog(L"[GM-PROXY] ERROR: target path too long (>= MAX_PATH).\n");
         return 1;
+    }
+
+    /* Build-version stamp (baked in at compile time via __DATE__/__TIME__):
+       changes on every recompile, so Export-GodModeLogs (menu option [11]) can
+       confirm at a glance which gmproxy.exe build is actually deployed on the
+       VM (stale vs. freshly rebuilt). First line of every diag session. */
+    {
+        wchar_t wdate[16] = {0}, wtime[16] = {0};
+        GmWidenAscii(__DATE__, wdate, 16);
+        GmWidenAscii(__TIME__, wtime, 16);
+        DiagLog(L"[GM-PROXY] BUILD %s %s (compiled)\n", wdate, wtime);
     }
 
     EnablePrivilege(L"SeDebugPrivilege");

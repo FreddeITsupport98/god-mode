@@ -114,6 +114,84 @@ static BOOL EnablePrivilege(LPCWSTR privName) {
     return ok && GetLastError() == 0;
 }
 
+/* Widen an ASCII (char) string to wchar_t in-place (ASCII, direct char->wchar_t).
+   __DATE__/__TIME__ are narrow char literals; this widens them so they can be
+   logged via the wide fwprintf without relying on %hs/%S (whose meaning differs
+   between MSVC and MinGW wprintf modes). Mirrors gmproxy.c's GmWidenAscii. */
+static void GmWidenAscii(const char* src, wchar_t* dst, size_t cap) {
+    if (!dst || cap == 0) return;
+    size_t i = 0;
+    if (src) {
+        for (; src[i] && i + 1 < cap; i++) dst[i] = (wchar_t)(unsigned char)src[i];
+    }
+    dst[i] = 0;
+}
+
+/* Build-version stamp: baked in at compile time via __DATE__/__TIME__, so it
+   changes on every recompile. Written to %TEMP%\gmhook.log on every
+   DLL_PROCESS_ATTACH (best-effort, mutex try-locked so DllMain never blocks
+   under the loader lock, size-capped at ~256KB so it cannot grow unbounded
+   across thousands of attaches) and mirrored to OutputDebugStringW for live
+   DebugView tracing. Export-GodModeLogs (menu option [11]) extracts the last
+   `[GM-HOOK] BUILD` line so a stale vs. freshly-rebuilt gmhook.dll is
+   identifiable at a glance; the host process base name is included so the dump
+   also shows which processes actually loaded the new DLL. Never affects the
+   hook: every step is best-effort and errors are ignored. */
+static void GmHookWriteBuildStamp(void) {
+    wchar_t tempDir[MAX_PATH] = {0};
+    DWORD len = GetTempPathW(MAX_PATH, tempDir);
+    if (len == 0 || len >= MAX_PATH) return;
+    if (wcslen(tempDir) > (MAX_PATH - 24)) return;
+    wchar_t path[MAX_PATH] = {0};
+    swprintf(path, MAX_PATH, L"%sgmhook.log", tempDir);
+
+    /* Host process base name (so the stamp shows who loaded this DLL). */
+    wchar_t modName[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, modName, MAX_PATH);
+    wchar_t* baseName = wcsrchr(modName, L'\\');
+    if (baseName) baseName++; else baseName = modName;
+
+    wchar_t wdate[16] = {0}, wtime[16] = {0};
+    GmWidenAscii(__DATE__, wdate, 16);
+    GmWidenAscii(__TIME__, wtime, 16);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    wchar_t line[256] = {0};
+    swprintf(line, 256,
+        L"[GM-HOOK] BUILD %s %s loaded in %s (attach %04u-%02u-%02u %02u:%02u:%02u)\n",
+        wdate, wtime, baseName,
+        (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+        (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+
+    /* Live debug trace (DebugView) -- no file needed. */
+    OutputDebugStringW(line);
+
+    /* Serialize appends across the many processes that load this DLL. Use a
+       try-lock (zero timeout) so DllMain never blocks under the loader lock. */
+    HANDLE hMutex = CreateMutexW(NULL, FALSE, L"GodMode_GmHookLog");
+    if (hMutex) {
+        if (WaitForSingleObject(hMutex, 0) == WAIT_OBJECT_0) {
+            /* Size cap: if the log exceeds 256KB, truncate it (rewrite fresh)
+               so it cannot grow unbounded across thousands of attaches. */
+            WIN32_FILE_ATTRIBUTE_DATA fad;
+            BOOL truncate = FALSE;
+            if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+                ULONGLONG sz = ((ULONGLONG)fad.nFileSizeHigh << 32) | (ULONGLONG)fad.nFileSizeLow;
+                if (sz > (256 * 1024)) truncate = TRUE;
+            }
+            FILE* f = _wfopen(path, truncate ? L"w" : L"a");
+            if (f) {
+                fwprintf(f, L"%s", line);
+                fflush(f);
+                fclose(f);
+            }
+            ReleaseMutex(hMutex);
+        }
+        CloseHandle(hMutex);
+    }
+}
+
 /* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
    lives in wtsapi32.dll; load it dynamically so no extra link dependency is added
    (gmhook.dll is not linked against wtsapi32). Returns 1 (the typical interactive
@@ -714,6 +792,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved) {
     if (reason == DLL_PROCESS_ATTACH) {
         gHModule = hModule;
         DisableThreadLibraryCalls(hModule);
+        /* Build-version stamp to %TEMP%\gmhook.log + OutputDebugStringW (see
+           GmHookWriteBuildStamp). Best-effort, never affects the hook. */
+        GmHookWriteBuildStamp();
         InitializeCriticalSection(&gHookLock);
         pNtSetInfo = (NtSetInformationProcess_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtSetInformationProcess");
         /* Resolve pCreateWithToken eagerly if advapi32.dll is already loaded;

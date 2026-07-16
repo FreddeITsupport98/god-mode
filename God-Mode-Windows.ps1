@@ -3325,6 +3325,43 @@ function Export-GodModeLogs {
         # launches it detached with no console. Same $env:TEMP as $LogFile above,
         # which matches gmproxy's GetTempPathW since both run as the admin user.
         $GmProxyDiagLog = Join-Path $env:TEMP "gmproxy.log"
+        $GmHookDiagLog = Join-Path $env:TEMP "gmhook.log"
+
+        # --- GM BUILD VERSIONS: at-a-glance identification of the deployed
+        #     gmproxy.exe / gmhook.dll build. The C binaries bake in a
+        #     compile-time stamp via __DATE__/__TIME__ (changes every recompile)
+        #     and write it to %TEMP%\gmproxy.log / %TEMP%\gmhook.log on launch /
+        #     DLL load. This section extracts the LAST BUILD line from each log
+        #     plus the installed binary LastWriteTime, so a stale vs. freshly
+        #     rebuilt binary is identifiable without scrolling the full dumps.
+        $LogContent += "`r`n===== GM BUILD VERSIONS ====="
+        # gmproxy.exe build stamp + deployed-file timestamp.
+        $ProxyBuild = $null
+        if (Test-Path $GmProxyDiagLog) {
+            try { $ProxyBuild = (Select-String -Path $GmProxyDiagLog -Pattern 'GM-PROXY BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
+        }
+        $LogContent += "`r`ngmproxy.exe build stamp: $(if ($ProxyBuild) { $ProxyBuild.Trim() } else { '[not yet logged -- gmproxy has not run since deploy]' })"
+        if (Test-Path $ProxyDest) {
+            $LogContent += "`r`ngmproxy.exe deployed (LastWriteTime): $((Get-Item $ProxyDest).LastWriteTime)"
+        } else {
+            $LogContent += "`r`ngmproxy.exe deployed (LastWriteTime): [MISSING -- not installed at $ProxyDest]"
+        }
+        # gmhook.dll build stamp + deployed-file timestamp.
+        $HookBuild = $null
+        if (Test-Path $GmHookDiagLog) {
+            try { $HookBuild = (Select-String -Path $GmHookDiagLog -Pattern 'GM-HOOK BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
+        }
+        $LogContent += "`r`ngmhook.dll build stamp: $(if ($HookBuild) { $HookBuild.Trim() } else { '[not yet logged -- gmhook.dll has not been injected/loaded since deploy]' })"
+        if (Test-Path $HookDest) {
+            $LogContent += "`r`ngmhook.dll deployed (LastWriteTime): $((Get-Item $HookDest).LastWriteTime)"
+        } else {
+            $LogContent += "`r`ngmhook.dll deployed (LastWriteTime): [MISSING -- not installed at $HookDest]"
+        }
+        $LogContent += "`r`n(Source logs: $GmProxyDiagLog , $GmHookDiagLog)"
+        $LogContent += "`r`nNOTE: the BUILD stamp changes every recompile (__DATE__/__TIME__). If the stamp"
+        $LogContent += "`r`n      matches your latest build, the new binary is deployed. If it shows an"
+        $LogContent += "`r`n      older stamp or 'not yet logged', the VM is running a stale binary or"
+        $LogContent += "`r`n      the binary has not run since the last copy."
         $LogContent += "`r`n===== GM-PROXY DIAGNOSTIC LOG ====="
         $LogContent += "`r`n(Source: $GmProxyDiagLog)"
         if (Test-Path $GmProxyDiagLog) {
@@ -4174,6 +4211,12 @@ function Uninstall-ProcessHook {
         $HookDll = Join-Path $GodModeInstallDir "gmhook.dll"
         if (Test-Path $ProxyExe) { Remove-Item -Path $ProxyExe -Force -ErrorAction SilentlyContinue }
         if (Test-Path $HookDll) { Remove-Item -Path $HookDll -Force -ErrorAction SilentlyContinue }
+
+        # Remove the gmhook.dll build-stamp diagnostic log (added with the
+        # build-version stamp feature; written to %TEMP%\gmhook.log by
+        # GmHookWriteBuildStamp on every DLL load). Best-effort.
+        $GmHookDiagLog = Join-Path $env:TEMP "gmhook.log"
+        if (Test-Path $GmHookDiagLog) { Remove-Item -Path $GmHookDiagLog -Force -ErrorAction SilentlyContinue }
 
         Write-Log -Message "Process hook uninstalled (IFEO keys and binaries removed)." -Type "INFO" -Color Gray
     } catch {
