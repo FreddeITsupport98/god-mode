@@ -253,4 +253,26 @@ Add-Assertion "gmhook.c: log path swprintf uses %ls (wide) for the wchar_t tempD
 Add-Assertion "gmhook.c: BUILD stamp line uses %ls for wdate/wtime/baseName" ($gmhook -match '\[GM-HOOK\]\s*BUILD\s+%ls\s+%ls\s+loaded in %ls') "gmhook.c BUILD line still uses %s -- MinGW would truncate wdate/wtime/baseName to 1 char (garbled [[ stamp)"
 Add-Assertion "gmhook.c: stamp line written via fputws (not fwprintf %s)" ($gmhook -match 'fputws\s*\(\s*line') "gmhook.c stamp line still uses fwprintf %s -- MinGW would truncate the wide line to 1 char"
 
+# --- 17. gmproxy.c + Invoke-HybridElevation: ownerless Session-0 birth refusal ---
+# Belt-and-suspenders for the Firefox/Chrome "launches without user column" fix.
+# (a) gmproxy.c: when gmproxy itself runs in Session 0 (invoked by a SYSTEM
+#     service / Session-0 scheduled task) AND no session-correct SYSTEM token is
+#     obtainable, it must REFUSE (return 1) instead of falling to a current-user
+#     CreateProcessW that would inherit Session 0 -> ownerless child. The normal
+#     IFEO path (interactive session) keeps its current-user fallback.
+# (b) Invoke-HybridElevation Phase 2: the scheduled-task fallback (S-1-5-18
+#     principal, Session 0) must route its task action through gmproxy.exe (which
+#     relocates the token to the active session) instead of launching the target
+#     directly (which births ownerless). If gmproxy is missing, refuse (graceful
+#     degradation). Mirrors Start-ProcessWithService.
+Add-Assertion "gmproxy.c: detects own session via ProcessIdToSessionId(GetCurrentProcessId())" ($proxy -match 'ProcessIdToSessionId\s*\(\s*GetCurrentProcessId\s*\(\s*\)\s*,') "gmproxy.c does not query its own session -- cannot detect a Session-0 (service/scheduled-task) invocation"
+Add-Assertion "gmproxy.c: mySessionIsZero guard variable present" ($proxy -match 'mySessionIsZero') "mySessionIsZero guard missing -- ownerless-birth refusal cannot gate on Session 0"
+Add-Assertion "gmproxy.c: REFUSE diag present (ownerless Session-0 birth refused)" ($proxy -match '\[GM-PROXY\]\s*REFUSE') "REFUSE diag missing -- ownerless-birth refusal not implemented"
+Add-Assertion "gmproxy.c: refusal returns 1 on Session-0 ownerless birth (no current-user launch in Session 0)" ($proxy -match 'mySessionIsZero\s*\)\s*\{[\s\S]{0,500}?return\s+1') "refusal does not return 1 when mySessionIsZero -- ownerless Session-0 current-user launch would still occur"
+Add-Assertion "gmproxy.c: graceful current-user fallback preserved below the refusal guard (non-Session-0 IFEO path)" ($proxy -match 'mySessionIsZero[\s\S]{0,600}?CreateProcessW\s*\(\s*hardlinkPath') "current-user CreateProcessW fallback not preserved after the refusal guard -- normal IFEO graceful degradation would break"
+Add-Assertion "God-Mode-Windows.ps1: Start-ProcessWithService routes Session-0 service through gmproxy (session-correct SYSTEM)" ($gm -match 'refusing Session-0 service launch to avoid ownerless birth') "Start-ProcessWithService does not refuse ownerless when gmproxy missing / does not route the service through gmproxy -- the LIVE monitor ownerless path would regress"
+Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 routes scheduled task through gmproxy (not direct target path)" ($gm -match 'New-ScheduledTaskAction\s+-Execute\s+\$GmProxyExe\s+-Argument\s+\$taskArgs') "Invoke-HybridElevation Phase 2 does not route the scheduled-task action through gmproxy -- ownerless Session-0 birth would still occur"
+Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 refuses ownerless when gmproxy missing (graceful degradation)" ($gm -match 'refusing Session-0 scheduled-task launch to avoid ownerless birth') "Invoke-HybridElevation Phase 2 does not refuse ownerless birth when gmproxy is missing -- would spawn an unusable Session-0 copy"
+Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 no longer launches the target directly as the task action (ownerless path removed)" ($gm -notmatch 'New-ScheduledTaskAction\s+-Execute\s+\$Path\s+-Argument\s+\$Arguments') "Invoke-HybridElevation Phase 2 still launches the target directly as the scheduled-task action -- ownerless Session-0 birth path not removed"
+
 Write-Summary

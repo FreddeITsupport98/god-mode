@@ -7,9 +7,22 @@
 #
 # Usage: pwsh -File driver\build.ps1  (or powershell -File driver\build.ps1 on older systems)
 
-param([string]$OutDir = (Join-Path $env:TEMP "GodModeBuild"))
+param([string]$OutDir = "")
 $DriverDir = $PSScriptRoot
 $ErrorActionPreference = "Stop"
+
+# Resolve a temp output dir that works even when $env:TEMP is unset (e.g. Linux
+# pwsh invoked from fish, where TEMP is not exported). Falls back to .NET
+# GetTempPath() (/tmp on Linux, %TEMP% on Windows) so the build never aborts on a
+# null TEMP at param-bind time. Preserves the original $env:TEMP\GodModeBuild
+# default when TEMP is set.
+if (-not $OutDir) {
+    $baseTemp = $env:TEMP
+    if ([string]::IsNullOrWhiteSpace($baseTemp)) {
+        try { $baseTemp = [System.IO.Path]::GetTempPath() } catch { $baseTemp = "/tmp" }
+    }
+    $OutDir = Join-Path $baseTemp "GodModeBuild"
+}
 
 function Test-Tool {
     param([string]$Name)

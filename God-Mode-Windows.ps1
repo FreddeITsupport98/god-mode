@@ -2892,13 +2892,32 @@ function Invoke-HybridElevation {
     Write-Log -Message "Service-elevation failed for $procName, falling back to scheduled task..." -Type "WARN" -Color Yellow
     Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 1 failed. Proceeding to Phase 2 (scheduled task)."
 
-    # --- Phase 2: Scheduled task fallback (original method) ---
+    # --- Phase 2: Scheduled task fallback (session-correct via gmproxy) ---
+    # A scheduled task with -UserId "S-1-5-18" -LogonType ServiceAccount runs as
+    # SYSTEM in Session 0 with no interactive desktop. Launching the GUI app
+    # directly as the task action (the old method) births the child ownerless in
+    # Session 0 -> blank User column, no visible window (the Firefox/Chrome
+    # "launches without user column" symptom). Routing the task action through
+    # gmproxy.exe fixes it: the task runs gmproxy AS SYSTEM (holds SeTcbPrivilege),
+    # gmproxy steals a SYSTEM token and relocates it to the active interactive
+    # session via SetTokenInformation(TokenSessionId) before
+    # CreateProcessWithTokenW -> the child is born session-correct SYSTEM
+    # (visible, User=SYSTEM). If gmproxy.exe is NOT installed, REFUSE to birth an
+    # ownerless child: return $false so the caller keeps the existing user-context
+    # process (graceful degradation). Mirrors Start-ProcessWithService +
+    # driver/gmproxy.c (which also refuses ownerless Session-0 birth).
+    $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+    if (-not (Test-Path $GmProxyExe)) {
+        Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "WARN" -Message "Phase 2: gmproxy.exe not found at $GmProxyExe; refusing Session-0 scheduled-task launch to avoid ownerless birth (graceful degradation). Target: $Path"
+        return $false
+    }
+    $taskArgs = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
     try {
         # Kill existing instances first so single-instance apps don't immediately exit
         Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Milliseconds 800
 
-        $action = New-ScheduledTaskAction -Execute $Path -Argument $Arguments
+        $action = New-ScheduledTaskAction -Execute $GmProxyExe -Argument $taskArgs
         $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
             -LogonType ServiceAccount -RunLevel Highest
         $tempTask = "Elevate_" + (Get-Random -Minimum 1000 -Maximum 99999)

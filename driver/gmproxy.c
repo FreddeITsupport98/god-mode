@@ -342,6 +342,21 @@ int wmain(int argc, wchar_t* argv[]) {
 
     DWORD activeSession = GetActiveConsoleSessionId();
 
+    /* Detect whether gmproxy itself was born in Session 0 (the isolated services
+       session). This happens when a Windows service or a "run whether logged on or
+       not" scheduled task invokes gmproxy (Start-ProcessWithService /
+       Invoke-HybridElevation Phase 2). In that case a current-user fallback launch
+       below would inherit Session 0 -> an ownerless child (blank User column, no
+       interactive desktop) -- the reported unusable symptom. We use this to REFUSE
+       ownerless birth instead of degrading when no session-correct SYSTEM token is
+       obtainable. In the normal IFEO path gmproxy runs in the user's interactive
+       session (mySession != 0), so the current-user fallback stays available. */
+    DWORD mySession = 0;
+    BOOL mySessionIsZero = FALSE;
+    if (ProcessIdToSessionId(GetCurrentProcessId(), &mySession)) {
+        mySessionIsZero = (mySession == 0);
+    }
+
     /* Prefer a SYSTEM token that ALREADY lives in the active interactive
        session (winlogon/dwm/fontdrvhost, or any session-correct SYSTEM process).
        A token sourced from Session 0 (services/lsass) produces an ownerless
@@ -481,6 +496,24 @@ int wmain(int argc, wchar_t* argv[]) {
        Mode monitor will still elevate it to SYSTEM via its normal kill+relaunch
        path, so this is strictly better than a broken ownerless launch. */
     if (!ok) {
+        /* Belt-and-suspenders ownerless-birth refusal: if gmproxy itself is
+           running in Session 0 (invoked by a SYSTEM service / Session-0 scheduled
+           task), a current-user CreateProcessW launch here would inherit
+           Session 0 -> an ownerless child (blank User column, no desktop). We
+           only reach this fallback when the session-correct SYSTEM token launch
+           above also failed, so the only honest outcome is to REFUSE rather than
+           birth an unusable ownerless process. The caller (Start-ProcessWithService
+           / scheduled task) sees no child; the user can relaunch the app normally.
+           In the normal IFEO path gmproxy runs in the interactive session
+           (mySession != 0), so the graceful current-user fallback below stays
+           available there. */
+        if (mySessionIsZero) {
+            DiagLog(L"[GM-PROXY] REFUSE: gmproxy is in Session %lu with no session-correct SYSTEM token; aborting to avoid ownerless Session-0 birth (would inherit Session 0, blank User column).\n", mySession);
+            DeleteFileW(hardlinkPath);
+            HeapFree(GetProcessHeap(), 0, cmdLine);
+            if (hPrimary) CloseHandle(hPrimary);
+            return 1;
+        }
         ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
         if (ok) {
             DiagLog(L"[GM-PROXY] Launched %ls as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
