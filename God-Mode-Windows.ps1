@@ -5230,7 +5230,7 @@ function Start-IfeoNewAppWatcher {
         catch-up rescan. Best-effort throughout; any watcher error is swallowed
         so it never affects the monitor loop.
         The Deleted event enqueues a DEFERRED stale-prune entry (grace period
-        ~3s) so an updater's new .exe lands first; the Start-Monitoring drain
+        ~5s) so an updater's new .exe lands first; the Start-Monitoring drain
         then re-scans and removes the gmproxy IFEO key only if the .exe is gone
         everywhere -- never touching unrelated keys, never retriggering on
         updater swaps (the new .exe's Created event re-hooks it).
@@ -5261,12 +5261,38 @@ function Start-IfeoNewAppWatcher {
                     param($sender, $e)
                     if ($e.FullPath -and $e.FullPath -like '*.exe') {
                         [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                        # Re-arm (updater swap): the app reappeared, so cancel any
+                        # pending stale-prune for this base name -- never remove a
+                        # gmproxy IFEO key mid-update. The prune drain's re-scan is
+                        # the belt-and-suspenders; this avoids even attempting it.
+                        $cn = [System.IO.Path]::GetFileName($e.FullPath)
+                        if (-not [string]::IsNullOrWhiteSpace($cn)) {
+                            for ($ci = $script:IfeoPruneQueue.Count - 1; $ci -ge 0; $ci--) {
+                                try {
+                                    if ($script:IfeoPruneQueue[$ci].BaseName -eq $cn) {
+                                        $script:IfeoPruneQueue.RemoveAt($ci)
+                                    }
+                                } catch {}
+                            }
+                        }
                     }
                 }
                 $w.Renamed += {
                     param($sender, $e)
                     if ($e.FullPath -and $e.FullPath -like '*.exe') {
                         [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                        # Re-arm (updater swap, .tmp->.exe rename): cancel any
+                        # pending stale-prune for this base name (app reappeared).
+                        $rn = [System.IO.Path]::GetFileName($e.FullPath)
+                        if (-not [string]::IsNullOrWhiteSpace($rn)) {
+                            for ($ri = $script:IfeoPruneQueue.Count - 1; $ri -ge 0; $ri--) {
+                                try {
+                                    if ($script:IfeoPruneQueue[$ri].BaseName -eq $rn) {
+                                        $script:IfeoPruneQueue.RemoveAt($ri)
+                                    }
+                                } catch {}
+                            }
+                        }
                     }
                 }
                 $w.Error += {
@@ -5275,7 +5301,7 @@ function Start-IfeoNewAppWatcher {
                 }
                 $w.Deleted += {
                     # A watched .exe was deleted (uninstall, or updater swapping the
-                    # binary). Enqueue a DEFERRED stale-prune entry with a ~3s grace
+                    # binary). Enqueue a DEFERRED stale-prune entry with a ~5s grace
                     # period so an updater's new .exe lands before we decide; the
                     # Start-Monitoring drain re-scans and removes the gmproxy IFEO key
                     # only if the base name is gone everywhere (never touches unrelated
@@ -5287,7 +5313,7 @@ function Start-IfeoNewAppWatcher {
                             [void]$script:IfeoPruneQueue.Add([PSCustomObject]@{
                                 BaseName = $bn
                                 FullPath = $e.FullPath
-                                DueTime  = (Get-Date).AddSeconds(3)
+                                DueTime  = (Get-Date).AddSeconds(5)
                             })
                         }
                     }
@@ -5623,7 +5649,7 @@ function Start-Monitoring {
                 }
             }
             # --- Deferred IFEO stale-prune drain: when a watched .exe is Deleted,
-            #     the watcher enqueues a prune entry with a ~3s grace period (so an
+            #     the watcher enqueues a prune entry with a ~5s grace period (so an
             #     updater's new .exe lands first). After the grace period we re-scan
             #     the watched dirs for that base name; the gmproxy IFEO key is removed
             #     ONLY if the .exe is gone everywhere (gmproxy-guarded, never touches

@@ -279,5 +279,17 @@ Add-Assertion "Start-Monitoring: prune drain removes via Remove-IfeoElevationFor
 Add-Assertion "Start-Monitoring: prune drain gated on watcher active (no work when stopped)" ($gm -match 'IfeoNewAppWatcherActive.*IfeoPruneQueue' -or $gm -match 'IfeoPruneQueue.*IfeoNewAppWatcherActive') "prune drain is not gated on the watcher being active -- could run after Disable"
 Add-Assertion "Stop-IfeoNewAppWatcher clears IfeoPruneQueue" ($gm -match 'IfeoPruneQueue\.Clear\(\)') "Stop-IfeoNewAppWatcher does not clear the prune queue -- entries could survive across enable/disable cycles"
 Add-Assertion "Instant watcher: still NO polling after prune feature (no Start-Sleep call in watcher body)" ($startBody -notmatch 'Start-Sleep\s*-') "watcher body now contains a Start-Sleep call -- the prune feature must stay event-driven, not poll"
+# Re-arm hardening: a slow updater (delete old .exe, then write the new one
+# over >3s) could let a fixed 3s grace fire before the new .exe lands. Bumped
+# to 5s, AND Created/Renamed cancel any pending prune for the same base name
+# (the app reappeared -> updater swap, NOT an uninstall) so a gmproxy IFEO key
+# is never removed mid-update. The drain's re-scan is the belt-and-suspenders.
+Add-Assertion "Instant watcher: grace period bumped to 5s (AddSeconds(5) in Deleted handler)" ($startBody -match 'AddSeconds\(5\)') "grace period is not 5s -- a slow updater's new .exe could land after the prune fires and a launch in the gap would not be born as SYSTEM"
+$createdHandlerMatch = [regex]::Match($startBody, '(?s)\$w\.Created\s*\+=\s*\{(.*?)\n\s+\}\s*\n\s+\$w\.Renamed')
+$createdHandlerBody = if ($createdHandlerMatch.Success) { $createdHandlerMatch.Groups[1].Value } else { "" }
+Add-Assertion "Instant watcher: Created handler re-arms (cancels pending prune on update)" ($createdHandlerBody -match 'IfeoPruneQueue' -and $createdHandlerBody -match 'RemoveAt') "Created handler does not cancel a pending stale-prune for the same base name -- a gmproxy IFEO key could be removed mid-updater-swap"
+$renamedHandlerMatch = [regex]::Match($startBody, '(?s)\$w\.Renamed\s*\+=\s*\{(.*?)\n\s+\}\s*\n\s+\$w\.Error')
+$renamedHandlerBody = if ($renamedHandlerMatch.Success) { $renamedHandlerMatch.Groups[1].Value } else { "" }
+Add-Assertion "Instant watcher: Renamed handler re-arms (cancels pending prune on .tmp->.exe update)" ($renamedHandlerBody -match 'IfeoPruneQueue' -and $renamedHandlerBody -match 'RemoveAt') "Renamed handler does not cancel a pending stale-prune -- updaters that land via .tmp->.exe rename could lose the hook mid-swap"
 
 Write-Summary
