@@ -186,6 +186,27 @@ else
     fi
 fi
 
+# 5b. gmproxy ownerless-birth REFUSE wine runtime test: RUNS the freshly-built
+#     gmproxy.exe under wine with a dummy target -- NORMAL build -> graceful
+#     current-user fallback (exit 0); FORCED build (-DGMPROXY_TEST_FORCE_SESSION0=1)
+#     -> ownerless-birth REFUSE (exit 1 + [GM-PROXY] REFUSE in %TEMP%\gmproxy.log).
+#     Runtime analogue of the source-level section 17/18 invariants: proves BOTH
+#     branches of the ownerless-birth fix behave at runtime, not just in source
+#     (tests/test-gmproxy-refuse.sh).
+gmrefuse="$SCRIPT_DIR/test-gmproxy-refuse.sh"
+if [ ! -f "$gmrefuse" ]; then
+    record "test-gmproxy-refuse.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$gmrefuse" >"$log" 2>&1; then
+        record "gmproxy REFUSE: wine runtime (NORMAL fallback + FORCED refuse)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "gmproxy REFUSE: wine runtime (NORMAL fallback + FORCED refuse)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
 # 6. syntax_check.ps1 honesty test (clean -> exit 0; broken .ps1/.c -> exit 1 + FAIL SUMMARY).
 synhonest="$SCRIPT_DIR/test-syntax-check.sh"
 if [ ! -f "$synhonest" ]; then

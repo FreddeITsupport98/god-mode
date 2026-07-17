@@ -2913,10 +2913,6 @@ function Invoke-HybridElevation {
     }
     $taskArgs = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
     try {
-        # Kill existing instances first so single-instance apps don't immediately exit
-        Get-Process -Name $procName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Milliseconds 800
-
         $action = New-ScheduledTaskAction -Execute $GmProxyExe -Argument $taskArgs
         $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
             -LogonType ServiceAccount -RunLevel Highest
@@ -2942,6 +2938,32 @@ function Invoke-HybridElevation {
             Write-Log -Message "Elevated task did not start: $Path" -Type "WARN" -Color Yellow
             Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "ERROR" -Message "Scheduled task fallback did not enter Running state for $Path" -RootCause "Task Scheduler may be disabled, the Task Scheduler service may be stopped, or the executable path is invalid for a service-account context."
             return $false
+        }
+
+        # --- Kill AFTER success (mirrors Monitor-ElevateProcess): only purge
+        #     non-SYSTEM duplicates AFTER the SYSTEM child is confirmed alive.
+        #     The old kill-before-launch (Get-Process|Stop-Process + 800ms sleep)
+        #     left the user with NO app if gmproxy-as-task refused or the SYSTEM
+        #     child lost the single-instance race -- the user app was already
+        #     dead before the launch was even attempted. Killing after success
+        #     avoids that: if no SYSTEM instance surfaces (gmproxy refused, the
+        #     task did not actually birth a session-correct SYSTEM child, or a
+        #     single-instance app's SYSTEM copy exited back to the still-alive
+        #     user copy), we KEEP the existing user-context process (graceful
+        #     degradation) instead of purging it -- strictly safer than
+        #     kill-before. When a SYSTEM child IS confirmed, purge the user
+        #     duplicate so only SYSTEM remains (same end state as the live
+        #     monitor path). Wait briefly for the child to surface first.
+        $systemAlive = $false
+        for ($i = 0; $i -lt 10; $i++) {
+            if (Test-SystemProcessExists -ProcessName "$procName.exe") { $systemAlive = $true; break }
+            Start-Sleep -Milliseconds 200
+        }
+        if ($systemAlive) {
+            Stop-NonSystemInstances -ProcessName "$procName.exe"
+            Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "INFO" -Message "Phase 2: SYSTEM instance confirmed for $procName; purged non-SYSTEM duplicates (kill-after-success, mirrors Monitor-ElevateProcess)."
+        } else {
+            Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "WARN" -Message "Phase 2: no SYSTEM instance detected for $procName after task launch; keeping user-context process (graceful degradation, no purge -- avoids the old kill-before 'no app' state)."
         }
         Write-DebugLog -FunctionName "Invoke-HybridElevation" -Action "EXIT" -Message "Phase 2 succeeded for $procName"
         return $true

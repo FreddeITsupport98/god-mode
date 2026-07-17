@@ -275,4 +275,27 @@ Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 routes sched
 Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 refuses ownerless when gmproxy missing (graceful degradation)" ($gm -match 'refusing Session-0 scheduled-task launch to avoid ownerless birth') "Invoke-HybridElevation Phase 2 does not refuse ownerless birth when gmproxy is missing -- would spawn an unusable Session-0 copy"
 Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 no longer launches the target directly as the task action (ownerless path removed)" ($gm -notmatch 'New-ScheduledTaskAction\s+-Execute\s+\$Path\s+-Argument\s+\$Arguments') "Invoke-HybridElevation Phase 2 still launches the target directly as the scheduled-task action -- ownerless Session-0 birth path not removed"
 
+# --- 18. Invoke-HybridElevation Phase 2 kill-AFTER-success + gmproxy test seam ---
+# Suggestion 1: Phase 2 no longer kills existing instances BEFORE launching the
+# scheduled task (the old kill-before-launch + 800ms settle left the user with
+# NO app if gmproxy-as-task refused or the SYSTEM child lost the single-instance
+# race). It now mirrors Monitor-ElevateProcess: wait for the SYSTEM child to
+# surface AFTER the task enters Running, then purge non-SYSTEM duplicates ONLY
+# if a SYSTEM instance is confirmed -- otherwise keep the existing user-context
+# process (graceful degradation, no purge). Suggestion 2: gmproxy.c has a
+# compile-time test seam (#ifdef GMPROXY_TEST_FORCE_SESSION0) so the ownerless-
+# birth REFUSE branch can be exercised at runtime under wine (which does not
+# model Session 0); the PRODUCTION build (driver/build.ps1) must NOT define it.
+$build = $null
+$buildPath = Join-Path $ProjectRoot "driver/build.ps1"
+if (Test-Path $buildPath) { $build = Get-Content -Raw $buildPath }
+Add-Assertion "God-Mode-Windows.ps1: Invoke-HybridElevation Phase 2 kill-after-success uses `$systemAlive gate" ($gm -match 'systemAlive') "Phase 2 kill-after-success `$systemAlive marker missing -- kill-before-launch may still be in place"
+Add-Assertion "God-Mode-Windows.ps1: Phase 2 waits for the SYSTEM child via Test-SystemProcessExists before purging" ($gm -match 'Test-SystemProcessExists\s+-ProcessName\s+"\$procName\.exe"[\s\S]{0,40}?\$systemAlive\s*=\s*\$true') "Phase 2 does not wait for a SYSTEM child via Test-SystemProcessExists before deciding to purge -- could purge with no SYSTEM child alive"
+Add-Assertion "God-Mode-Windows.ps1: Phase 2 purge is gated on `$systemAlive (Stop-NonSystemInstances only when SYSTEM alive)" ($gm -match 'if\s+\(\$systemAlive\)\s*\{[\s\S]{0,200}?Stop-NonSystemInstances\s+-ProcessName\s+"\$procName\.exe"') "Phase 2 purge is not gated on `$systemAlive -- would purge non-SYSTEM instances even when no SYSTEM child was born (old kill-before 'no app' state)"
+Add-Assertion "God-Mode-Windows.ps1: Phase 2 keeps the user-context process when no SYSTEM child surfaces (graceful degradation)" ($gm -match 'no SYSTEM instance detected[\s\S]{0,200}?keeping user-context process') "Phase 2 does not keep the user-context process when no SYSTEM child surfaces -- would leave the user with no app"
+Add-Assertion "God-Mode-Windows.ps1: Phase 2 old kill-before-launch comment removed" ($gm -notmatch 'Kill existing instances first so single-instance apps') "Phase 2 still has the old kill-before-launch comment -- kill-before-launch may not have been removed"
+Add-Assertion "gmproxy.c: compile-time test seam #ifdef GMPROXY_TEST_FORCE_SESSION0 present (wine REFUSE runtime proof)" ($proxy -match '#ifdef\s+GMPROXY_TEST_FORCE_SESSION0') "gmproxy.c compile-time test seam missing -- ownerless-birth REFUSE cannot be exercised at runtime under wine (which does not model Session 0)"
+Add-Assertion "gmproxy.c: test seam forces mySession=0 / mySessionIsZero=TRUE (exercises the REFUSE branch)" ($proxy -match 'GMPROXY_TEST_FORCE_SESSION0[\s\S]{0,1200}?mySession\s*=\s*0') "gmproxy.c test seam does not force mySession=0 -- the FORCED build would not reach the REFUSE branch"
+Add-Assertion "driver/build.ps1: PRODUCTION build does NOT define the test seam (shipped gmproxy.exe unaffected)" ($null -ne $build -and $build -notmatch 'GMPROXY_TEST_FORCE_SESSION0') "driver/build.ps1 references GMPROXY_TEST_FORCE_SESSION0 -- the production build would force-refuse ownerless birth in the field"
+
 Write-Summary

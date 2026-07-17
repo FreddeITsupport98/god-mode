@@ -65,6 +65,21 @@ grep -qF '__TIME__' "$SRC" && record "src: __TIME__ build-stamp present" 1 || re
 grep -qF 'GmWidenAscii' "$SRC" && record "src: GmWidenAscii helper present" 1 || record "src: GmWidenAscii helper present" 0 "not found"
 grep -qF '[GM-PROXY] BUILD' "$SRC" && record "src: [GM-PROXY] BUILD stamp present" 1 || record "src: [GM-PROXY] BUILD stamp present" 0 "not found"
 
+# Ownerless-birth REFUSE + compile-time test seam (wine runtime proof in
+# test-gmproxy-refuse.sh). The seam lets the REFUSE branch be exercised under
+# wine (which does not model Session 0); the PRODUCTION build must NOT define it.
+grep -qF '#ifdef GMPROXY_TEST_FORCE_SESSION0' "$SRC" && record "src: GMPROXY_TEST_FORCE_SESSION0 compile-time seam present (#ifdef, wine REFUSE runtime proof)" 1 || record "src: GMPROXY_TEST_FORCE_SESSION0 compile-time seam present (#ifdef, wine REFUSE runtime proof)" 0 "not found -- ownerless-birth REFUSE cannot be exercised under wine"
+grep -qF 'mySessionIsZero' "$SRC" && record "src: mySessionIsZero ownerless-birth guard present" 1 || record "src: mySessionIsZero ownerless-birth guard present" 0 "not found"
+grep -qF '[GM-PROXY] REFUSE' "$SRC" && record "src: [GM-PROXY] REFUSE ownerless-birth refusal diag present" 1 || record "src: [GM-PROXY] REFUSE ownerless-birth refusal diag present" 0 "not found"
+BUILD_PS1="$(cd "$SCRIPT_DIR/.." && pwd)/driver/build.ps1"
+if [ -f "$BUILD_PS1" ] && grep -qF 'GMPROXY_TEST_FORCE_SESSION0' "$BUILD_PS1"; then
+    record "build.ps1 does NOT define the test seam (production binary unaffected)" 0 "driver/build.ps1 references GMPROXY_TEST_FORCE_SESSION0 -- production build would force-refuse in the field"
+elif [ -f "$BUILD_PS1" ]; then
+    record "build.ps1 does NOT define the test seam (production binary unaffected)" 1
+else
+    record "build.ps1 does NOT define the test seam (production binary unaffected)" 0 "driver/build.ps1 missing"
+fi
+
 # GetTempPathW trailing-backslash hardening: wine smoke tests can return a temp
 # path WITHOUT a trailing '\', which would concatenate tempDir+filename
 # (Cgmhook.log artifact). GmEnsureTrailingBackslash normalizes it.

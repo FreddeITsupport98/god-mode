@@ -356,6 +356,21 @@ int wmain(int argc, wchar_t* argv[]) {
     if (ProcessIdToSessionId(GetCurrentProcessId(), &mySession)) {
         mySessionIsZero = (mySession == 0);
     }
+#ifdef GMPROXY_TEST_FORCE_SESSION0
+    /* Test-only COMPILE-TIME seam (see tests/test-gmproxy-refuse.sh): wine does
+       NOT model Windows Session 0 isolation -- ProcessIdToSessionId returns the
+       interactive session (1) there, so the ownerless-birth REFUSE branch below
+       is never exercised at runtime under wine. Defining
+       GMPROXY_TEST_FORCE_SESSION0 at compile time forces mySession=0 /
+       mySessionIsZero=TRUE so the REFUSE path is deterministically exercised by
+       the wine smoke test. The PRODUCTION build (driver/build.ps1) does NOT
+       define this macro, so this block is compiled out and the shipped
+       gmproxy.exe is byte-for-byte unaffected -- this is a compile-time test
+       double, NOT a runtime env-var hook (no behavior change unless the macro
+       is defined at build time). */
+    mySession = 0;
+    mySessionIsZero = TRUE;
+#endif
 
     /* Prefer a SYSTEM token that ALREADY lives in the active interactive
        session (winlogon/dwm/fontdrvhost, or any session-correct SYSTEM process).
