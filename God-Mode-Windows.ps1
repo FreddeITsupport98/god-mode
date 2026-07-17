@@ -4583,6 +4583,97 @@ function Elevate-Process {
     $null = Invoke-HybridElevation -Path $Path -Arguments $Arguments
 }
 
+function Add-IfeoElevationForApp {
+    <#
+    .SYNOPSIS
+        Idempotent single-app IFEO hook (Debugger -> gmproxy.exe) for the instant
+        new-app watcher. Returns $true ONLY when a genuinely-new app was hooked;
+        $false (no-op, NO retrigger) when the app is already hooked, denied, or
+        unsafe -- so the watcher never fires twice for the same app and never
+        fires at all when there is nothing new to add.
+    .DESCRIPTION
+        Mirrors Install-IfeoElevation's per-key logic for ONE app path with the
+        SAME triple safety net as Get-IfeoElevationCandidates (canonical name
+        denylist = union of every critical/shell/OS list, Windows/System32/
+        SysWOW64 path-exclusion, .exe-only). The denylist is intentionally
+        duplicated from Get-IfeoElevationCandidates (kept inline there so
+        Test-IfeoElevation.ps1 section 6b denylist assertions stay green); keep
+        the two lists in sync. Uninstall-IfeoElevation already enumerates every
+        IFEO key by Debugger-contains-gmproxy, so keys added here are cleaned up
+        automatically on Disable-GodMode (no uninstaller change needed).
+    #>
+    param([string]$AppExePath)
+    if (-not $AppExePath) { return $false }
+    $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+    if (-not (Test-Path $GmProxyExe)) { return $false }
+    try {
+        if ($AppExePath -notmatch '\.exe\s*$') { return $false }
+        $fullPath = $AppExePath.Trim()
+        $baseName = [System.IO.Path]::GetFileName($fullPath)
+        if ([string]::IsNullOrWhiteSpace($baseName)) { return $false }
+        $baseKey = $baseName.ToLower()
+        $bare = [System.IO.Path]::GetFileNameWithoutExtension($baseName).ToLower()
+
+        # Safety net #1: canonical name denylist (same content as
+        # Get-IfeoElevationCandidates -> keep the two lists in sync).
+        $deny = @(
+            "csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost",
+            "System","Registry","Memory Compression","Secure System","Idle",
+            "cmd","powershell","pwsh","wt","conhost","OpenConsole","WindowsTerminal","wsl","wslhost",
+            "RuntimeBroker","ApplicationFrameHost","ShellExperienceHost","SearchUI","SearchIndexer",
+            "SearchProtocolHost","SearchFilterHost","SearchHost","StartMenuExperienceHost","TextInputHost",
+            "SystemSettingsBroker","SystemSettings","ShellHost","sihost","taskhostw","ctfmon","LockApp",
+            "LogonUI","SecurityHealthSystray","SecurityHealthService","MsMpEng","MsMpEngCP",
+            "MpDefenderCoreService","MsSense","MpCmdRun","NisSrv","SgrmBroker","TiWorker","CompatTelRunner",
+            "WUDFHost","WmiPrvSE","unsecapp","dllhost","rundll32","regsvr32","WmiApSrv",
+            "sc","schtasks","wmic","reg","wscript","cscript","mshta","bcdedit","reagentc","wevtutil",
+            "netsh","ipconfig","net","taskkill","whoami",
+            "explorer","taskmgr",
+            "gmproxy","gmhook"
+        )
+        $denySet = @{}
+        foreach ($n in $deny) {
+            $denySet[$n.ToLower()] = $true
+            if ($n -notmatch '\.exe$') { $denySet[("$n.exe").ToLower()] = $true }
+        }
+        if ($denySet.ContainsKey($baseKey)) { return $false }
+        if ($denySet.ContainsKey($bare)) { return $false }
+
+        # Safety net #2: path hard-exclusion (Windows/System32/SysWOW64) + never
+        # hook gmproxy's own image.
+        $norm = $fullPath.Replace('/', '\').ToLower()
+        $gmProxyNorm = $GmProxyExe.Replace('/', '\').ToLower()
+        if ($norm -eq $gmProxyNorm) { return $false }
+        if ($norm -like "*\windows\system32\*" -or $norm -like "*\windows\syswow64\*" -or $norm -match '\\windows\\[^\\]+\.exe$') { return $false }
+
+        $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $appKey = Join-Path $IfeoBase $baseName
+
+        # Idempotent gate (no retrigger): already pointing at gmproxy -> do nothing.
+        $existing = $null
+        if (Test-Path $appKey) {
+            $existing = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+        }
+        if ($existing -and $existing -like "*gmproxy*") { return $false }
+
+        # Genuinely new -> create/restore + set Debugger + harden (mirrors Install-IfeoElevation).
+        if (Test-Path $appKey) {
+            $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$baseName"
+        } else {
+            New-Item -Path $appKey -Force -ErrorAction SilentlyContinue | Out-Null
+        }
+        Set-ItemProperty -Path $appKey -Name "Debugger" -Value $GmProxyExe -Force -ErrorAction SilentlyContinue
+        $null = Harden-RegistryKey -Path "$IfeoBaseSubKey\$baseName"
+        Write-Log -Message "IFEO instant auto-add: hooked $baseName (newly installed program now born as SYSTEM via gmproxy on every future launch)." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Add-IfeoElevationForApp" -Action "ADD" -Message "hooked $baseName from $fullPath"
+        return $true
+    } catch {
+        Write-DebugLog -FunctionName "Add-IfeoElevationForApp" -Action "WARN" -Message "Failed for $AppExePath`: $_"
+        return $false
+    }
+}
+
 function Test-SystemProcessExists {
     param([string]$ProcessName)
     try {
@@ -5023,6 +5114,104 @@ function Stop-GmProxyFeedbackListener {
     }
 }
 
+# --- Instant IFEO new-app watcher: FileSystemWatcher on the install dirs fires
+#     the moment a new .exe is Created/Renamed, enqueues the path, and the
+#     Start-Monitoring loop drains it into Add-IfeoElevationForApp (idempotent --
+#     only adds genuinely-new apps, never retrigger). Purely event-driven (NO
+#     Start-Sleep polling); if no new .exe appears, zero events fire and nothing
+#     happens. Buffer overflow -> catch-up rescan via Install-IfeoElevation. ---
+$script:IfeoNewAppQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+$script:IfeoNewAppDebounce = [hashtable]::Synchronized(@{})
+$script:IfeoNewAppWatchers = @()
+$script:IfeoNewAppWatcherActive = $false
+
+function Start-IfeoNewAppWatcher {
+    <#
+    .SYNOPSIS
+        Instant, event-driven IFEO auto-add for newly installed programs.
+    .DESCRIPTION
+        Creates System.IO.FileSystemWatcher instances on C:\Program Files,
+        C:\Program Files (x86), and each real user's AppData\Local\Programs (the
+        same sources Get-IfeoElevationCandidates scans). The instant a new .exe
+        is Created or Renamed in those trees, the path is enqueued into
+        $script:IfeoNewAppQueue; the Start-Monitoring loop drains it into
+        Add-IfeoElevationForApp (idempotent -- only genuinely-new apps, never
+        retrigger). Purely event-driven: NO polling, NO Start-Sleep waits; if
+        nothing new is installed, no events fire and the watcher does nothing.
+        Per-base-name debounce (500ms) + the idempotent Add gate guarantee each
+        new app is added at most once. On buffer overflow (Error event) a
+        sentinel is enqueued so the drain runs an idempotent Install-IfeoElevation
+        catch-up rescan. Best-effort throughout; any watcher error is swallowed
+        so it never affects the monitor loop.
+    #>
+    if ($script:IfeoNewAppWatcherActive) { return $true }
+    try {
+        $watchDirs = @()
+        $pf1 = "C:\Program Files"
+        $pf2 = "C:\Program Files (x86)"
+        if (Test-Path $pf1) { $watchDirs += $pf1 }
+        if (Test-Path $pf2) { $watchDirs += $pf2 }
+        # Per-user installs: enumerate real user profiles (exclude system/Public).
+        try {
+            Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notin @('Public','Default','Default User','All Users') -and
+                (Test-Path (Join-Path $_.FullName 'AppData\Local\Programs'))
+            } | ForEach-Object { $watchDirs += (Join-Path $_.FullName 'AppData\Local\Programs') }
+        } catch {}
+
+        $script:IfeoNewAppWatchers = @()
+        foreach ($dir in $watchDirs) {
+            try {
+                $w = New-Object System.IO.FileSystemWatcher($dir, "*.exe")
+                $w.IncludeSubdirectories = $true
+                $w.InternalBufferSize = 65536
+                $w.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::DirectoryName
+                $w.Created += {
+                    param($sender, $e)
+                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
+                        [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                    }
+                }
+                $w.Renamed += {
+                    param($sender, $e)
+                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
+                        [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                    }
+                }
+                $w.Error += {
+                    # Buffer overflow / watcher error -> sentinel for an idempotent catch-up rescan.
+                    [void]$script:IfeoNewAppQueue.Add('__GMIFEO_RESCAN__')
+                }
+                $w.EnableRaisingEvents = $true
+                $script:IfeoNewAppWatchers += $w
+            } catch {
+                Write-DebugLog -FunctionName "Start-IfeoNewAppWatcher" -Action "WARN" -Message "Could not watch $dir`: $_"
+            }
+        }
+        $script:IfeoNewAppWatcherActive = $true
+        Write-Log -Message "Instant IFEO new-app watcher started on $($watchDirs.Count) install dir(s). Newly installed programs are auto-hooked (born as SYSTEM) the moment their .exe lands -- no polling, no retrigger when nothing new." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Start-IfeoNewAppWatcher" -Action "EXIT" -Message "watchers=$($script:IfeoNewAppWatchers.Count) dirs=$($watchDirs.Count)"
+        return $true
+    } catch {
+        Write-Log -Message "Instant IFEO new-app watcher failed to start: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Start-IfeoNewAppWatcher" -Action "ERROR" -Message "Outer catch: $_"
+        $script:IfeoNewAppWatcherActive = $false
+        return $false
+    }
+}
+
+function Stop-IfeoNewAppWatcher {
+    foreach ($w in $script:IfeoNewAppWatchers) {
+        try { $w.EnableRaisingEvents = $false } catch {}
+        try { $w.Dispose() } catch {}
+    }
+    $script:IfeoNewAppWatchers = @()
+    $script:IfeoNewAppWatcherActive = $false
+    if ($script:IfeoNewAppQueue) { $script:IfeoNewAppQueue.Clear() }
+    if ($script:IfeoNewAppDebounce) { $script:IfeoNewAppDebounce.Clear() }
+    Write-DebugLog -FunctionName "Stop-IfeoNewAppWatcher" -Action "EXIT" -Message "watchers stopped + queue cleared"
+}
+
 function Invoke-ExistingProcessElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
@@ -5261,6 +5450,7 @@ function Start-Monitoring {
     #     15s periodic scan kill+relaunch duplicate. Only meaningful as SYSTEM. ---
     if ($isSystem) {
         $null = Start-GmProxyFeedbackListener
+        $null = Start-IfeoNewAppWatcher
     }
 
     # --- One-time elevation of all existing user-session processes at startup ---
@@ -5293,6 +5483,32 @@ function Start-Monitoring {
                         $lastElevatedPid[$fbPid] = Get-Date
                         Invoke-GmProxyFeedbackElevation -ProcessId $fbPid
                     }
+                }
+            }
+            # --- Instant IFEO new-app watcher drain: FileSystemWatcher enqueues newly-
+            #     installed .exe paths; Add-IfeoElevationForApp hooks them idempotently
+            #     (only genuinely-new apps, never retrigger). Sentinel -> catch-up rescan. ---
+            if ($script:IfeoNewAppWatcherActive -and $script:IfeoNewAppQueue -and $script:IfeoNewAppQueue.Count -gt 0) {
+                while ($script:IfeoNewAppQueue.Count -gt 0) {
+                    $newPath = [string]$script:IfeoNewAppQueue[0]
+                    $script:IfeoNewAppQueue.RemoveAt(0)
+                    if (-not $newPath) { continue }
+                    if ($newPath -eq '__GMIFEO_RESCAN__') {
+                        $null = Install-IfeoElevation
+                        continue
+                    }
+                    $nb = [System.IO.Path]::GetFileName($newPath)
+                    if (-not $nb) { continue }
+                    $nbKey = $nb.ToLower()
+                    $now = [datetime]::Now
+                    if ($script:IfeoNewAppDebounce.ContainsKey($nbKey)) {
+                        try {
+                            $last = [datetime]$script:IfeoNewAppDebounce[$nbKey]
+                            if ($last -gt $now.AddMilliseconds(-500)) { continue }
+                        } catch {}
+                    }
+                    $script:IfeoNewAppDebounce[$nbKey] = $now
+                    $null = Add-IfeoElevationForApp -AppExePath $newPath
                 }
             }
             Start-Sleep -Milliseconds 500
@@ -5612,6 +5828,7 @@ function Disable-GodMode {
     Unregister-StealthTask
     Unregister-ProcessCreationWatcher
     Stop-GmProxyFeedbackListener
+    Stop-IfeoNewAppWatcher
     Unregister-SystemWatchdog
     Unblock-TaskManager
 

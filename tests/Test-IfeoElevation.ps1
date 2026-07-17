@@ -195,4 +195,50 @@ if (Test-Path $GmProxy) {
 # --- 9. Export-GodModeLogs diagnostic shows newly-hooked apps ---
 Add-Assertion "Export-GodModeLogs: IFEO diagnostic includes regedit.exe + mstsc.exe" ($gm -match '"regedit\.exe","mstsc\.exe"') "diagnostic app list not expanded to show hooked apps"
 
+# --- 10. Instant IFEO new-app watcher (event-driven auto-add, no polling, no retrigger) ---
+# Closes the "newly installed programs are never re-scanned into the IFEO set" gap.
+# System.IO.FileSystemWatcher on the install dirs fires the INSTANT a new .exe
+# lands on disk -> Add-IfeoElevationForApp hooks it idempotently (only genuinely-
+# new apps, never retrigger). No Start-Sleep polling; if nothing new is installed,
+# no events fire and nothing happens. Uninstall-IfeoElevation already enumerates
+# by Debugger-contains-gmproxy, so watcher-added keys are cleaned automatically.
+Add-Assertion "Add-IfeoElevationForApp function defined" ($gm -match 'function\s+Add-IfeoElevationForApp\s*\{') "Add-IfeoElevationForApp missing -- instant single-app IFEO add helper absent"
+$addMatch = [regex]::Match($gm, '(?s)function\s+Add-IfeoElevationForApp\s*\{(.*?)\nfunction\s+Test-SystemProcessExists\s*\{')
+$addBody = if ($addMatch.Success) { $addMatch.Groups[1].Value } else { "" }
+Add-Assertion "Add-IfeoElevationForApp body extractable (adjacent to Test-SystemProcessExists)" ($addMatch.Success) "could not isolate Add-IfeoElevationForApp body"
+if ($addMatch.Success) {
+    Add-Assertion "Add-IfeoElevationForApp: idempotent gate (already-hooked -> no retrigger)" ($addBody -match '\$existing\s*-and\s*\$existing\s*-like\s*"\*gmproxy\*"' -and $addBody -match 'return\s+\$false') "Add-IfeoElevationForApp does not skip already-hooked apps -- would retrigger for every event"
+    Add-Assertion "Add-IfeoElevationForApp: safety-net denylist present" ($addBody -match '\$deny' -and ($addBody -match '"svchost"' -or $addBody -match '"powershell"')) "Add-IfeoElevationForApp missing the canonical name denylist -- could hook a critical/shell process"
+    Add-Assertion "Add-IfeoElevationForApp: System32 path-exclusion" ($addBody -like '*windows*system32*') "Add-IfeoElevationForApp missing the System32 path-exclusion"
+    Add-Assertion "Add-IfeoElevationForApp: sets Debugger to gmproxy" ($addBody -match 'Set-ItemProperty.*Debugger.*\$GmProxyExe') "Add-IfeoElevationForApp does not set Debugger to gmproxy"
+    Add-Assertion "Add-IfeoElevationForApp: hardens the new key (Harden-RegistryKey)" ($addBody -match 'Harden-RegistryKey') "Add-IfeoElevationForApp does not harden the new IFEO key"
+    Add-Assertion "Add-IfeoElevationForApp: bails when gmproxy.exe missing" ($addBody -match 'Test-Path\s+\$GmProxyExe') "Add-IfeoElevationForApp missing the gmproxy-absent guard"
+}
+Add-Assertion "Start-IfeoNewAppWatcher function defined" ($gm -match 'function\s+Start-IfeoNewAppWatcher\s*\{') "Start-IfeoNewAppWatcher missing"
+Add-Assertion "Stop-IfeoNewAppWatcher function defined" ($gm -match 'function\s+Stop-IfeoNewAppWatcher\s*\{') "Stop-IfeoNewAppWatcher missing"
+$startMatch = [regex]::Match($gm, '(?s)function\s+Start-IfeoNewAppWatcher\s*\{(.*?)\nfunction\s+Stop-IfeoNewAppWatcher\s*\{')
+$startBody = if ($startMatch.Success) { $startMatch.Groups[1].Value } else { "" }
+Add-Assertion "Start-IfeoNewAppWatcher body extractable" ($startMatch.Success) "could not isolate Start-IfeoNewAppWatcher body"
+if ($startMatch.Success) {
+    Add-Assertion "Instant watcher: uses System.IO.FileSystemWatcher" ($startBody -match 'System\.IO\.FileSystemWatcher') "watcher is not FileSystemWatcher-based -- not event-driven/instant"
+    Add-Assertion "Instant watcher: watches Program Files" ($startBody -match 'Program Files') "watcher does not watch Program Files"
+    Add-Assertion "Instant watcher: enumerates per-user profiles (C:\\Users + AppData\\Local\\Programs)" ($startBody -match 'C:\\Users' -and $startBody -match 'AppData\\Local\\Programs') "watcher does not enumerate per-user Programs dirs"
+    Add-Assertion "Instant watcher: event-driven Created handler attached (+=)" ($startBody -match '\.Created\s*\+=') "watcher does not attach a Created event handler -- not event-driven"
+    Add-Assertion "Instant watcher: event-driven Renamed handler attached (catches .tmp->.exe installs)" ($startBody -match '\.Renamed\s*\+=') "watcher does not attach a Renamed event handler -- installs that rename .tmp->.exe would be missed"
+    Add-Assertion "Instant watcher: EnableRaisingEvents set" ($startBody -match 'EnableRaisingEvents\s*=\s*\$true') "watcher does not enable events"
+    Add-Assertion "Instant watcher: buffer-overflow hardening (InternalBufferSize)" ($startBody -match 'InternalBufferSize') "watcher does not raise InternalBufferSize -- large installs could overflow the event buffer"
+    Add-Assertion "Instant watcher: Error event -> catch-up rescan sentinel" ($startBody -match '\.Error\s*\+=' -and $startBody -match '__GMIFEO_RESCAN__') "watcher does not handle buffer-overflow Error -> catch-up rescan sentinel missing"
+    Add-Assertion "Instant watcher: synchronized event queue present (IfeoNewAppQueue)" ($gm -match 'IfeoNewAppQueue') "watcher missing the synchronized event queue -- events would be lost"
+    Add-Assertion "Instant watcher: per-base-name debounce table (IfeoNewAppDebounce)" ($gm -match 'IfeoNewAppDebounce') "watcher missing the debounce table -- one install burst could spam Add"
+    Add-Assertion "Instant watcher: idempotent start guard (no double-register)" ($startBody -match 'if\s+\(\$script:IfeoNewAppWatcherActive\)') "watcher missing the active-guard -- could register duplicate watchers on repeat start"
+    Add-Assertion "Instant watcher: NO polling (no Start-Sleep call in the watcher body)" ($startBody -notmatch 'Start-Sleep\s*-') "watcher uses Start-Sleep polling -- not instant/event-driven (a Start-Sleep -<param> call was found in the watcher body)"
+}
+# Wiring: Start-Monitoring starts the watcher; Disable-GodMode stops it.
+Add-Assertion "Start-Monitoring calls Start-IfeoNewAppWatcher" ($gm -match '\$null\s*=\s*Start-IfeoNewAppWatcher') "Start-Monitoring does not start the instant IFEO new-app watcher"
+Add-Assertion "Disable-GodMode calls Stop-IfeoNewAppWatcher (standalone call line)" ($gm -match '(?m)^\s+Stop-IfeoNewAppWatcher\s*$') "Disable-GodMode does not stop the instant IFEO new-app watcher"
+# Uninstaller stays current: Uninstall-IfeoElevation already enumerates by
+# Debugger-contains-gmproxy, so IFEO keys added by the watcher are removed
+# automatically on Disable-GodMode (no uninstaller change needed).
+Add-Assertion "Uninstaller covers watcher-added IFEO keys (enumerates by gmproxy Debugger)" ($uninstallBody -match 'Debugger.*gmproxy') "uninstaller would not clean watcher-added IFEO keys -- Disable-GodMode could leave dynamic keys behind"
+
 Write-Summary
