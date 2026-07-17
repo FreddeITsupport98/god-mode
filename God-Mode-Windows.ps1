@@ -2786,10 +2786,35 @@ function Start-ProcessWithService {
     $ServiceName = "ElevateProc_$TaskId"
     $BatchFile = Join-Path $env:TEMP "ElevateProc_Batch_$TaskId.cmd"
 
-    $windowOpt = if ($HideWindow) { "/b /min" } else { "" }
     $batchArgs = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
 
-    $BatchContent = "@echo off`r`nstart $windowOpt `"`" $batchArgs`r`necho ___DONE___"
+    # --- Session-correct launch via gmproxy (avoids ownerless Session-0 birth) ---
+    # A Windows service runs as SYSTEM in Session 0. Launching a GUI app directly
+    # from a Session-0 service (the old `start "" app` batch) births the child in
+    # Session 0 -> ownerless, blank User column, no visible window (the Firefox /
+    # Chrome "launches without user column" symptom). Routing the service through
+    # gmproxy.exe fixes it: gmproxy runs AS the SYSTEM service (so it holds
+    # SeTcbPrivilege), steals ANY SYSTEM token, and relocates it to the active
+    # interactive session via SetTokenInformation(TokenSessionId) before
+    # CreateProcessWithTokenW -> the child is born session-correct SYSTEM
+    # (visible, User column = SYSTEM). If gmproxy is NOT installed, REFUSE to
+    # birth an ownerless child: return $false so the caller (Monitor-ElevateProcess
+    # / Invoke-HybridElevation) keeps the existing user-context process (graceful
+    # degradation) instead of spawning an unusable Session-0 copy. Mirrors
+    # gmproxy's own current-user fallback in driver/gmproxy.c.
+    $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+    if (-not (Test-Path $GmProxyExe)) {
+        Write-DebugLog -FunctionName "Start-ProcessWithService" -Action "WARN" -Message "gmproxy.exe not found at $GmProxyExe; refusing Session-0 service launch to avoid ownerless birth (graceful degradation). Target: $Path"
+        return $false
+    }
+    # gmproxy takes argv[1]=target exe, argv[2+]=args; it reconstructs the child
+    # command line itself (driver/gmproxy.c wmain), so pass the quoted target +
+    # args verbatim. Direct invocation (no `start`) keeps the batch simple and
+    # avoids `start` quoting quirks; gmproxy returns ~immediately after birthing
+    # the child (it does not wait for the child to exit), so the 30s service poll
+    # still completes promptly.
+    $BatchContent = "@echo off`r`n`"$GmProxyExe`" $batchArgs`r`necho ___DONE___"
+    Write-DebugLog -FunctionName "Start-ProcessWithService" -Action "INFO" -Message "Session-0 service routed through gmproxy for session-correct SYSTEM launch: $GmProxyExe $batchArgs"
     Set-Content -Path $BatchFile -Value $BatchContent -Encoding ASCII -Force
 
     try {
