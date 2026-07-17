@@ -358,12 +358,21 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
         if (hJob) (void)GmProxyEnumerateJobTree(hJob, ppi->dwProcessId, &survivors, &firstPid, firstImg, MAX_PATH);
         if (survivors > 0) {
             /* The child exited cleanly but left a LIVING descendant: it was a
-               launcher/stub that DELEGATED to the real app (e.g. a Desktop Firefox
-               copy, the Win11 notepad stub). NOT a failure -- the real app opened. */
-            DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=DELEGATED exitcode=%lu treepids=%lu firstgchild=%ls gchildpid=%lu (mode=%ls)\n",
+               launcher/stub that DELEGATED. recur=yes means the survivor is
+               gmproxy.exe itself -- the stub spawned an IFEO-hooked image (e.g.
+               a Desktop Firefox copy spawning the real firefox.exe) and Windows
+               birthed a NESTED gmproxy as the grandchild (IFEO re-entry); the
+               real app's fate is logged by that nested gmproxy (running as SYSTEM
+               -> a different %TEMP%, which Export-GodModeLogs now also collects).
+               recur=no means the survivor IS the real app (genuine delegation --
+               NOT a failure). The exact base-name match avoids a false positive on
+               a gmproxy_<pid>_<app>.exe hardlink (which is the real app under a
+               bypass name, not the debugger). */
+            BOOL recur = (_wcsicmp(firstImg, L"gmproxy.exe") == 0);
+            DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=DELEGATED exitcode=%lu treepids=%lu firstgchild=%ls gchildpid=%lu recur=%ls (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code,
                     (unsigned long)survivors, firstImg[0] ? firstImg : L"(unknown)",
-                    (unsigned long)firstPid, mode);
+                    (unsigned long)firstPid, recur ? L"yes" : L"no", mode);
         } else if (hJob) {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls tree=0 (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);

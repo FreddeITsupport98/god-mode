@@ -147,6 +147,13 @@ grep -qF 'class=%ls' "$SRC" && record "src: class=CLEAN/CRASH classification pre
 grep -qF 'L"CLEAN"' "$SRC" && record "src: L\"CLEAN\" literal present (exitcode 0 = graceful)" 1 || record "src: L\"CLEAN\" literal present (exitcode 0 = graceful)" 0 "not found"
 grep -qF 'L"CRASH"' "$SRC" && record "src: L\"CRASH\" literal present (exitcode != 0 = crash)" 1 || record "src: L\"CRASH\" literal present (exitcode != 0 = crash)" 0 "not found"
 
+# IFEO re-entry recur tag (root-cause debug): a launcher/stub child that spawns an
+# IFEO-hooked image births a NESTED gmproxy.exe as the grandchild (recur=yes), not the
+# real app. recur=no = genuine delegation. The MinGW build below must still compile
+# with this new code.
+grep -qF 'recur=%ls' "$SRC" && record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 1 || record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 0 "not found"
+grep -qF '_wcsicmp(firstImg, L"gmproxy.exe")' "$SRC" && record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 1 || record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

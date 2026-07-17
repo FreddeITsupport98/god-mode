@@ -3393,6 +3393,30 @@ function Export-GodModeLogs {
         $GmProxyDiagLog = Join-Path $env:TEMP "gmproxy.log"
         $GmHookDiagLog = Join-Path $env:TEMP "gmhook.log"
 
+        # --- SYSTEM-temp gmproxy.log collection (root-cause for IFEO re-entry):
+        #     When a launcher/stub child (a Desktop Firefox copy) spawns an IFEO-
+        #     hooked image (the real firefox.exe), Windows births a NESTED
+        #     gmproxy.exe as the grandchild. That nested gmproxy runs AS SYSTEM
+        #     (inheriting the stub's token), so its GetTempPathW resolves to the
+        #     SYSTEM temp -- NOT the admin user's $env:TEMP above -- and its
+        #     [GM-PROXY] LAUNCH/CHILD-STATUS/ELEVATE lines land in a DIFFERENT
+        #     gmproxy.log that the single-path collection below used to miss. The
+        #     per-app DELEGATED verdict for the stub is then inconclusive (the
+        #     surviving grandchild is gmproxy.exe itself, not the real browser;
+        #     gmproxy now tags that recur=yes). Collect both SYSTEM-temp candidates
+        #     so the nested gmproxy's own CHILD-STATUS (real app ALIVE/EXITED/
+        #     DELEGATED) is aggregated into the per-app report + ELEVATION FAULTS,
+        #     resolving the re-entry blind spot. All reads are best-effort
+        #     (Test-Path guarded); missing paths are skipped. $GmProxyDiagPaths
+        #     holds existing logs only (admin temp first, then SYSTEM-temp).
+        $GmProxySystemDiagCandidates = @(
+            'C:\Windows\Temp\gmproxy.log',
+            'C:\Windows\System32\config\systemprofile\AppData\Local\Temp\gmproxy.log'
+        )
+        $GmProxyDiagPaths = @()
+        if (Test-Path $GmProxyDiagLog) { $GmProxyDiagPaths += $GmProxyDiagLog }
+        foreach ($p in $GmProxySystemDiagCandidates) { if (Test-Path $p) { $GmProxyDiagPaths += $p } }
+
         # --- GM BUILD VERSIONS: at-a-glance identification of the deployed
         #     gmproxy.exe / gmhook.dll build. The C binaries bake in a
         #     compile-time stamp via __DATE__/__TIME__ (changes every recompile)
@@ -3403,8 +3427,8 @@ function Export-GodModeLogs {
         $LogContent += "`r`n===== GM BUILD VERSIONS ====="
         # gmproxy.exe build stamp + deployed-file timestamp.
         $ProxyBuild = $null
-        if (Test-Path $GmProxyDiagLog) {
-            try { $ProxyBuild = (Select-String -Path $GmProxyDiagLog -Pattern 'GM-PROXY BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
+        if ($GmProxyDiagPaths.Count -gt 0) {
+            try { $ProxyBuild = (Select-String -Path $GmProxyDiagPaths -Pattern 'GM-PROXY BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
         }
         $LogContent += "`r`ngmproxy.exe build stamp: $(if ($ProxyBuild) { $ProxyBuild.Trim() } else { '[not yet logged -- gmproxy has not run since deploy]' })"
         if (Test-Path $ProxyDest) {
@@ -3436,6 +3460,18 @@ function Export-GodModeLogs {
         } else {
             $LogContent += "`r`n[No gmproxy log found] (expected at $GmProxyDiagLog)"
         }
+        # SYSTEM-temp gmproxy.log dumps (nested SYSTEM gmproxy instances from IFEO
+        # re-entry -- a stub spawning a hooked image births a gmproxy grandchild that
+        # runs as SYSTEM and logs here, not in the admin temp above). Each existing
+        # candidate is dumped under its own source header so the nested gmproxy's
+        # BUILD/ELEVATE/TOKEN/CMDLINE/ENV/CREATEPROC/CHILD-STATUS lines are visible
+        # and aggregated into the per-app report + ELEVATION FAULTS below.
+        foreach ($p in $GmProxySystemDiagCandidates) {
+            if (Test-Path $p) {
+                $LogContent += "`r`n`r`n--- (Source: $p) ---`r`n"
+                $LogContent += Get-Content -Raw -Path $p -ErrorAction SilentlyContinue
+            }
+        }
 
         # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
         #     gmproxy invocation into a per-app summary so the user can report
@@ -3445,19 +3481,25 @@ function Export-GodModeLogs {
         #     Parsed from the [GM-PROXY] LAUNCH: / [GM-PROXY] CHILD-STATUS:
         #     structured lines gmproxy.c writes to %TEMP%\gmproxy.log.
         $LogContent += "`r`n===== GM-PROXY PER-APP LAUNCH REPORT ====="
-        $LogContent += "`r`n(Source: $GmProxyDiagLog)"
-        if (Test-Path $GmProxyDiagLog) {
+        $LogContent += "`r`n(Source: admin-temp + SYSTEM-temp gmproxy.log -- see DIAGNOSTIC LOG section for paths)"
+        if ($GmProxyDiagPaths.Count -gt 0) {
             try {
-                $launchLines = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] LAUNCH: ' -ErrorAction SilentlyContinue)
-                $childLines  = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] CHILD-STATUS: ' -ErrorAction SilentlyContinue)
+                $launchLines = @(Select-String -Path $GmProxyDiagPaths -Pattern '^\[GM-PROXY\] LAUNCH: ' -ErrorAction SilentlyContinue)
+                $childLines  = @(Select-String -Path $GmProxyDiagPaths -Pattern '^\[GM-PROXY\] CHILD-STATUS: ' -ErrorAction SilentlyContinue)
                 # DELEGATED = the child exited cleanly (exitcode 0) but left a surviving
-                # grandchild (a launcher/stub delegated to the real app -- NOT a failure).
+                # grandchild whose image IS the real app (recur=no) -- a launcher/stub
+                # delegated and the REAL app opened (NOT a failure). DELEGATED-RECUR
+                # (recur=yes) = the surviving grandchild is gmproxy.exe itself: IFEO
+                # re-entry -- a stub spawned an IFEO-hooked image (e.g. a Desktop Firefox
+                # copy spawning the real firefox.exe) and Windows birthed a NESTED gmproxy
+                # as the grandchild; the real app's fate is in that nested gmproxy's log
+                # (running as SYSTEM -> a SYSTEM-temp gmproxy.log, now collected above).
                 $report = @{}
                 foreach ($l in $launchLines) {
                     if ($l.Line -match 'app=(.+?) pid=\d+ mode=(\w+) ') {
                         $app = $matches[1].Trim(); $mode = $matches[2]
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; UNKNOWN=0 }
                         }
                         $report[$app].Launches++
                         if ($report[$app].ContainsKey($mode)) { $report[$app][$mode]++ }
@@ -3466,28 +3508,44 @@ function Export-GodModeLogs {
                 foreach ($c in $childLines) {
                     if ($c.Line -match 'app=(.+?) pid=\d+ result=(\w+)') {
                         $app = $matches[1].Trim(); $res = $matches[2]
+                        $isRecur = $c.Line -match 'recur=yes'
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; UNKNOWN=0 }
                         }
-                        if ($report[$app].ContainsKey($res)) { $report[$app][$res]++ }
+                        if ($res -eq 'DELEGATED' -and $isRecur) {
+                            $report[$app].DELEGATEDRECUR++
+                        } elseif ($report[$app].ContainsKey($res)) {
+                            $report[$app][$res]++
+                        }
                     }
                 }
                 if ($report.Count -eq 0) {
                     $LogContent += "`r`n[No gmproxy LAUNCH/CHILD-STATUS entries yet -- no IFEO launches recorded]"
                 } else {
-                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)"
-                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------"
+                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)  DELEGATED-RECUR"
+                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------  -------------"
                     foreach ($app in ($report.Keys | Sort-Object)) {
                         $r = $report[$app]
-                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED)
+                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}  {9,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED, $r.DELEGATEDRECUR)
                     }
                     $LogContent += "`r`nNOTE: ALIVE = child still running after the grace window (healthy)."
                     $LogContent += "`r`n      DELEGATED = the child exited cleanly (exitcode 0) but left a surviving"
                     $LogContent += "`r`n      grandchild -- it was a launcher/stub (Desktop Firefox copy, Win11"
                     $LogContent += "`r`n      notepad stub) and the REAL app opened (NOT a failure)."
+                    $LogContent += "`r`n      DELEGATED-RECUR (recur=yes) = the surviving grandchild is gmproxy.exe"
+                    $LogContent += "`r`n      itself: IFEO re-entry -- a stub spawned an IFEO-hooked image (e.g. the"
+                    $LogContent += "`r`n      Desktop Firefox copy spawning the real firefox.exe) and Windows birthed a"
+                    $LogContent += "`r`n      NESTED gmproxy as the grandchild. The real app's fate is logged by that"
+                    $LogContent += "`r`n      nested gmproxy (running as SYSTEM -> a SYSTEM-temp gmproxy.log, now"
+                    $LogContent += "`r`n      collected above); read its CHILD-STATUS for the real verdict."
                     $LogContent += "`r`n      EXITED = the child process exited within ~1.5s with no surviving"
                     $LogContent += "`r`n      descendant. class=CLEAN (exitcode 0) = graceful refusal as SYSTEM;"
                     $LogContent += "`r`n      class=CRASH (exitcode != 0) = the app crashed as SYSTEM."
+                    $LogContent += "`r`n      CAVEAT: EXITED class=CLEAN tree=0 (real job, not job=disabled) may ALSO"
+                    $LogContent += "`r`n      be a stub that delegated to a grandchild which escaped the job tree"
+                    $LogContent += "`r`n      (breakaway / out-of-tree activation -- e.g. Win11 C:\Windows\notepad.exe"
+                    $LogContent += "`r`n      -> WinUI Notepad). For known stub apps, confirm visually before treating"
+                    $LogContent += "`r`n      CLEAN as a graceful refusal."
                     $LogContent += "`r`n      Report the per-app EXITED(class=CRASH) counts so the IFEO"
                     $LogContent += "`r`n      exclusion can be scoped to exactly the apps that break as SYSTEM."
                 }
@@ -3501,8 +3559,8 @@ function Export-GodModeLogs {
                 $LogContent += "`r`n----- ELEVATION FAULTS (root-cause) -----"
                 $gmFaultCount = 0
                 try {
-                    $createFailLines = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] CREATEPROC: .*result=FAIL' -ErrorAction SilentlyContinue)
-                    $noTokenLines   = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] ELEVATE: srckind=none' -ErrorAction SilentlyContinue)
+                    $createFailLines = @(Select-String -Path $GmProxyDiagPaths -Pattern '^\[GM-PROXY\] CREATEPROC: .*result=FAIL' -ErrorAction SilentlyContinue)
+                    $noTokenLines   = @(Select-String -Path $GmProxyDiagPaths -Pattern '^\[GM-PROXY\] ELEVATE: srckind=none' -ErrorAction SilentlyContinue)
                     foreach ($f in $createFailLines) {
                         $LogContent += "`r`n  $($f.Line.Trim())"
                         $gmFaultCount++
@@ -3521,7 +3579,7 @@ function Export-GodModeLogs {
                 $LogContent += "`r`n[Error building per-app launch report: $_]"
             }
         } else {
-            $LogContent += "`r`n[No gmproxy log found] (expected at $GmProxyDiagLog)"
+            $LogContent += "`r`n[No gmproxy log found] (checked: $GmProxyDiagLog + SYSTEM-temp: $($GmProxySystemDiagCandidates -join ', '))"
         }
 
         # Error summary from debug log

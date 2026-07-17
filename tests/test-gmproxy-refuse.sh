@@ -121,6 +121,15 @@ grep -qF '[GM-PROXY] ELEVATE:' "$SRC" && record "src: [GM-PROXY] ELEVATE: token-
 grep -qF '[GM-PROXY] CREATEPROC:' "$SRC" && record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present" 1 || record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present" 0 "not found"
 grep -qF 'result=DELEGATED' "$SRC" && record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 1 || record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 0 "not found"
 grep -qF 'class=%ls' "$SRC" && record "src: class=CLEAN/CRASH classification present (exit-code class)" 1 || record "src: class=CLEAN/CRASH classification present (exit-code class)" 0 "not found"
+# IFEO re-entry recur tag (root-cause debug): a launcher/stub child that spawns an
+# IFEO-hooked image (a Desktop Firefox copy spawning the real firefox.exe) births a
+# NESTED gmproxy.exe as the grandchild (recur=yes), NOT the real app. recur=no means
+# the surviving grandchild IS the real app (genuine delegation -- NOT a failure). The
+# exact base-name match avoids a false positive on a gmproxy_<pid>_<app>.exe hardlink
+# (the real app under a bypass name, not the debugger). The NORMAL build's dummy exits
+# before delegation, so recur only appears on the DELEGATED line -- wine unaffected.
+grep -qF 'recur=%ls' "$SRC" && record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 1 || record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 0 "not found"
+grep -qF '_wcsicmp(firstImg, L"gmproxy.exe")' "$SRC" && record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 1 || record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.

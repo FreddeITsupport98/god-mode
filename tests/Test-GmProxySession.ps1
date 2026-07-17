@@ -403,4 +403,51 @@ Add-Assertion "God-Mode-Windows.ps1: per-app report has an ELEVATION FAULTS sect
 Add-Assertion "God-Mode-Windows.ps1: ELEVATION FAULTS parses CREATEPROC result=FAIL lines" ($gm -match 'CREATEPROC:\s*\.\*result=FAIL') "Export-GodModeLogs ELEVATION FAULTS does not parse CREATEPROC result=FAIL lines -- failed CreateProcess attempts not surfaced"
 Add-Assertion "God-Mode-Windows.ps1: ELEVATION FAULTS parses ELEVATE srckind=none (no SYSTEM token)" ($gm -match 'ELEVATE:\s*srckind=none') "Export-GodModeLogs ELEVATION FAULTS does not parse the no-token ELEVATE line -- a missing SYSTEM token would not be flagged"
 
+# --- 22. gmproxy.c: IFEO re-entry recur tag + Export-GodModeLogs SYSTEM-temp collection (root-cause) ---
+# Live VM data (option [11] dump) revealed two observation blind spots, NOT elevation
+# faults (every CreateProcess succeeded, S-1-5-18 from winlogon, session 1, ELEVATION
+# FAULTS: none):
+#   (a) Desktop Firefox copy -> DELEGATED firstgchild=gmproxy.exe. The stub spawned
+#       the real firefox.exe (IFEO-hooked) -> Windows birthed a NESTED gmproxy.exe as
+#       the grandchild (IFEO re-entry), NOT the real app. That nested gmproxy runs as
+#       SYSTEM -> its %TEMP% is the SYSTEM temp (C:\Windows\Temp or systemprofile),
+#       NOT the admin user's $env:TEMP -> option [11] never collected it -> the stub's
+#       DELEGATED verdict was inconclusive (the real app's fate lived in an unread log).
+#   (b) C:\Windows\notepad.exe -> EXITED class=CLEAN tree=0. Win11's notepad.exe is a
+#       stub to the WinUI Notepad; the real app likely broke away / activated out-of-
+#       tree -> escaped the job -> tree=0 -> misclassified CLEAN (could be delegation,
+#       not a graceful refusal).
+# Fixes: gmproxy tags the DELEGATED survivor with recur=yes (gmproxy.exe itself = IFEO
+# re-entry) / recur=no (the real app = genuine delegation); Export-GodModeLogs collects
+# the SYSTEM-temp gmproxy.log candidates so the nested gmproxy's CHILD-STATUS is
+# aggregated into the per-app report; a DELEGATED-RECUR column + a CAVEAT note on
+# EXITED class=CLEAN tree=0 surface both blind spots so the user no longer mistakes
+# re-entry for "real app opened" or breakaway for "graceful refusal".
+Add-Assertion "gmproxy.c: DELEGATED CHILD-STATUS line carries recur=%ls (yes/no)" ($proxy -match 'result=DELEGATED\s+exitcode=%lu\s+treepids=%lu\s+firstgchild=%ls\s+gchildpid=%lu\s+recur=%ls') "gmproxy.c DELEGATED line lacks recur=%ls -- IFEO re-entry cannot be told from genuine delegation"
+Add-Assertion "gmproxy.c: recur detects the survivor is gmproxy.exe (_wcsicmp firstImg)" ($proxy -match 'BOOL\s+recur\s*=\s*\(\s*_wcsicmp\s*\(\s*firstImg\s*,\s*L"gmproxy\.exe"\s*\)\s*==\s*0\s*\)') "gmproxy.c recur detection missing -- a gmproxy.exe grandchild (IFEO re-entry) would be misreported as the real app"
+Add-Assertion "gmproxy.c: recur emits yes/no (not a numeric)" ($proxy -match 'recur\s*\?\s*L"yes"\s*:\s*L"no"') "gmproxy.c recur emits something other than yes/no -- the report cannot distinguish re-entry"
+Add-Assertion "gmproxy.c: existing DELEGATED regex substring preserved (result=DELEGATED ... firstgchild=%ls ... gchildpid=%lu)" ($proxy -match 'result=DELEGATED\s+exitcode=%lu\s+treepids=%lu\s+firstgchild=%ls\s+gchildpid=%lu') "gmproxy.c DELEGATED substring changed -- section-21 L396 assertion may regress"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs defines SYSTEM-temp gmproxy.log candidates" ($gm -match "GmProxySystemDiagCandidates") "Export-GodModeLogs does not define SYSTEM-temp gmproxy.log candidates -- nested SYSTEM gmproxy logs are never collected"
+Add-Assertion "God-Mode-Windows.ps1: SYSTEM-temp candidates include C:\\Windows\\Temp\\gmproxy.log" ($gm -match 'C:\\Windows\\Temp\\gmproxy\.log') "Export-GodModeLogs does not collect C:\Windows\Temp\gmproxy.log -- the primary SYSTEM-temp log is missed"
+Add-Assertion "God-Mode-Windows.ps1: SYSTEM-temp candidates include the systemprofile temp gmproxy.log" ($gm -match 'System32\\config\\systemprofile\\AppData\\Local\\Temp\\gmproxy\.log') "Export-GodModeLogs does not collect the systemprofile-temp gmproxy.log -- a nested SYSTEM gmproxy spawned under the SYSTEM profile would log here and be missed"
+Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths aggregates admin-temp + SYSTEM-temp logs" ($gm -match 'GmProxyDiagPaths') "Export-GodModeLogs does not aggregate admin-temp + SYSTEM-temp into GmProxyDiagPaths -- the nested gmproxy's lines are never scanned"
+Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths starts empty + appends existing admin-temp log" ($gm -match '\$GmProxyDiagPaths\s*=\s*@\(\)') "Export-GodModeLogs GmProxyDiagPaths is not initialized empty -- a stale or null array could corrupt the report"
+Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths appends existing SYSTEM-temp candidates (Test-Path guarded)" ($gm -match 'foreach\s*\(\$p\s+in\s*\$GmProxySystemDiagCandidates\)\s*\{\s*if\s*\(\s*Test-Path\s+\$p\s*\)\s*\{\s*\$GmProxyDiagPaths\s*\+=\s*\$p') "Export-GodModeLogs does not append existing SYSTEM-temp candidates to GmProxyDiagPaths -- missing paths would be scanned (error) or existing paths skipped"
+Add-Assertion "God-Mode-Windows.ps1: GM-PROXY BUILD extraction scans GmProxyDiagPaths (not just admin-temp)" ($gm -match 'Select-String\s*-Path\s+\$GmProxyDiagPaths[\s\S]{0,80}?GM-PROXY\s+BUILD') "Export-GodModeLogs GM-PROXY BUILD extraction does not scan GmProxyDiagPaths -- a nested SYSTEM gmproxy's newer BUILD stamp (different binary/deploy) would be invisible"
+Add-Assertion "God-Mode-Windows.ps1: DIAGNOSTIC LOG dumps each SYSTEM-temp candidate under its own source header" ($gm -match 'foreach\s*\(\$p\s+in\s*\$GmProxySystemDiagCandidates\)[\s\S]{0,160}?Source:\s*\$p') "Export-GodModeLogs does not dump SYSTEM-temp candidates under per-source headers -- nested gmproxy BUILD/ELEVATE/CHILD-STATUS lines would not be visible"
+Add-Assertion "God-Mode-Windows.ps1: PER-APP report scans GmProxyDiagPaths (nested gmproxy lines aggregated)" ($gm -match 'Select-String\s*-Path\s*\$GmProxyDiagPaths[\s\S]{0,80}?LAUNCH:') "Export-GodModeLogs PER-APP report does not scan GmProxyDiagPaths -- the nested gmproxy's LAUNCH lines are not aggregated"
+Add-Assertion "God-Mode-Windows.ps1: per-app report hashtable has a DELEGATEDRECUR key" ($gm -match 'DELEGATED=0;\s*DELEGATEDRECUR=0') "Export-GodModeLogs per-app hashtable lacks the DELEGATEDRECUR key -- recur=yes launches cannot be counted"
+Add-Assertion "God-Mode-Windows.ps1: per-app report routes recur=yes to DELEGATEDRECUR (not DELEGATED)" ($gm -match '\$res\s+-eq\s*''DELEGATED''\s*-and\s*\$isRecur') "Export-GodModeLogs does not route recur=yes to DELEGATEDRECUR -- IFEO re-entry would inflate the genuine-DELEGATED count"
+Add-Assertion "God-Mode-Windows.ps1: per-app report reads recur=yes from the CHILD-STATUS line" ($gm -match '\$isRecur\s*=\s*\$c\.Line\s*-match\s*''recur=yes''') "Export-GodModeLogs does not read recur=yes from the CHILD-STATUS line -- re-entry cannot be detected"
+Add-Assertion "God-Mode-Windows.ps1: per-app report table has a DELEGATED-RECUR column (header)" ($gm -match 'DELEGATED\s+EXITED\(crash\?\)\s+DELEGATED-RECUR') "Export-GodModeLogs per-app table lacks the DELEGATED-RECUR column header -- re-entry count not shown"
+Add-Assertion "God-Mode-Windows.ps1: per-app report row formats the DELEGATEDRECUR field" ($gm -match '\$r\.DELEGATEDRECUR') "Export-GodModeLogs per-app row does not format \$r.DELEGATEDRECUR -- the column would be blank"
+Add-Assertion "God-Mode-Windows.ps1: per-app report NOTE explains DELEGATED-RECUR = nested gmproxy (IFEO re-entry)" ($gm -match 'DELEGATED-RECUR\s*\(recur=yes\)\s*=\s*the\s+surviving\s+grandchild\s+is\s+gmproxy\.exe' -and $gm -match 'NESTED\s+gmproxy\s+as\s+the\s+grandchild') "Export-GodModeLogs NOTE does not explain DELEGATED-RECUR = nested gmproxy (IFEO re-entry) -- user would not know recur=yes means inconclusive, not success"
+Add-Assertion "God-Mode-Windows.ps1: per-app report NOTE has the EXITED class=CLEAN tree=0 breakaway CAVEAT" ($gm -match 'CAVEAT:\s*EXITED\s+class=CLEAN\s+tree=0' -and $gm -match 'breakaway') "Export-GodModeLogs NOTE lacks the EXITED class=CLEAN tree=0 breakaway CAVEAT -- a stub that delegated out-of-tree would be mistaken for a graceful refusal"
+Add-Assertion "God-Mode-Windows.ps1: ELEVATION FAULTS scans GmProxyDiagPaths (nested gmproxy faults surfaced)" ($gm -match 'Select-String\s*-Path\s+\$GmProxyDiagPaths[\s\S]{0,80}?CREATEPROC:\s*\.\*result=FAIL') "Export-GodModeLogs ELEVATION FAULTS does not scan GmProxyDiagPaths -- a nested SYSTEM gmproxy's CREATEPROC FAIL would be missed"
+Add-Assertion "God-Mode-Windows.ps1: missing-log else branch lists the SYSTEM-temp candidates checked" ($gm -match 'No gmproxy log found.*SYSTEM-temp') "Export-GodModeLogs missing-log branch does not list the SYSTEM-temp candidates -- the user would not know which paths were checked"
+# Regression guard: the kept substrings from section 20 MUST still be present (additive edit).
+Add-Assertion "God-Mode-Windows.ps1: NOTE keeps 'EXITED = the child process exited within' (additive edit guard)" ($gm -match 'EXITED = the child process exited within') "Export-GodModeLogs NOTE lost 'EXITED = the child process exited within' -- additive edit regressed section 20"
+Add-Assertion "God-Mode-Windows.ps1: NOTE keeps 'exclusion can be scoped' (additive edit guard)" ($gm -match 'exclusion can be scoped') "Export-GodModeLogs NOTE lost 'exclusion can be scoped' -- additive edit regressed section 20"
+Add-Assertion "God-Mode-Windows.ps1: table header keeps 'DELEGATED  EXITED(crash?)' (additive edit guard)" ($gm -match 'DELEGATED  EXITED\(crash\?\)') "Export-GodModeLogs table header lost 'DELEGATED  EXITED(crash?)' -- additive edit regressed section 21"
+
 Write-Summary
