@@ -1,5 +1,40 @@
 # God-Mode-Windows
 
+## Overview
+
+> **Intentional software -- not unintended/unwanted.** God Mode is a deliberate, purpose-built administration and security-research tool, authored for explicit, authorized deployment by the machine owner on systems under their control. It is **intentional by design**, not unintended, accidental, or unwanted software.
+
+**God Mode** is an aggressive, multi-layer SYSTEM persistence and process elevation framework with security feature suppression and anti-forensics capabilities.
+
+It is **significantly more powerful (and risky)** than a simple elevation tool.
+
+### What it actually does
+
+- Elevates processes to SYSTEM using token stealing and IFEO proxying (`gmproxy.exe`)
+- Applies multiple layers of persistence (Scheduled Tasks, WMI subscriptions, registry Run keys, deep persistence)
+- Suppresses and kills core Windows security components (Defender real-time protection, SmartScreen, UAC, ASR, AppLocker, etc.)
+- Includes anti-forensics features (shadow copy clearing, USN journal wiping, crash dump removal, PowerShell history clearing)
+- Hardens its own installation against tampering (SYSTEM-owned directories with restricted admin access)
+- Provides self-protection, integrity checking, and stealth mechanisms
+
+### Important Warning
+
+> **This tool is not a simple privilege escalation utility.**  
+> It is designed to gain and maintain deep SYSTEM-level control while actively suppressing Windows security features.  
+> Use with extreme caution. Misuse or accidental deployment can render a system unstable or difficult to recover.
+
+### Intended Audience
+
+This project is intended for:
+- Advanced system administrators
+- Security researchers
+- Red team / purple team exercises (on systems you own/control)
+- Users building sophisticated parental control or lockdown solutions who understand the risks
+
+It is **not** recommended for general use or as a casual elevation tool.
+
+---
+
 > ## 🔴 EXTREME DANGER NOTICE — READ THIS FIRST 🔴
 >
 > <span style="color:red">**STAGE 1 — AUTHORIZATION & SCOPE**</span>  
