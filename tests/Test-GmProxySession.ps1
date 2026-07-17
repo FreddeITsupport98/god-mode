@@ -298,4 +298,46 @@ Add-Assertion "gmproxy.c: compile-time test seam #ifdef GMPROXY_TEST_FORCE_SESSI
 Add-Assertion "gmproxy.c: test seam forces mySession=0 / mySessionIsZero=TRUE (exercises the REFUSE branch)" ($proxy -match 'GMPROXY_TEST_FORCE_SESSION0[\s\S]{0,1200}?mySession\s*=\s*0') "gmproxy.c test seam does not force mySession=0 -- the FORCED build would not reach the REFUSE branch"
 Add-Assertion "driver/build.ps1: PRODUCTION build does NOT define the test seam (shipped gmproxy.exe unaffected)" ($null -ne $build -and $build -notmatch 'GMPROXY_TEST_FORCE_SESSION0') "driver/build.ps1 references GMPROXY_TEST_FORCE_SESSION0 -- the production build would force-refuse ownerless birth in the field"
 
+# --- 19. gmproxy.c: token-consistent env block (Layer 1) + browser launch flags (Layer 2) ---
+# Root cause of "Chrome auto-exits / Firefox opens but cannot browse" when born as
+# SYSTEM: gmproxy launched the SYSTEM child with lpEnvironment=NULL, so the
+# SYSTEM-token process inherited the invoking USER's APPDATA/LOCALAPPDATA
+# (gmproxy's env) -> token/env mismatch. Single-instance + profile-lock apps
+# (Chrome, Firefox, Electron) then either IPC-exited to the user's running
+# instance or failed to init the content sandbox -> unusable as SYSTEM.
+# Layer 1: build the env block from the stolen SYSTEM token via
+#   CreateEnvironmentBlock(envBlock, hPrimary, TRUE) so USERPROFILE/APPDATA
+#   point at systemprofile\AppData (the SYSTEM child's own profile, no lock
+#   conflict). Passed on BOTH token launch sites. Three-tier fallback to NULL
+#   (previous behavior) if CreateEnvironmentBlock fails. The graceful
+#   current-user fallback (CreateProcessW, no token) stays NULL (correct -- no
+#   SYSTEM token to build an env from).
+# Layer 2: inject --no-sandbox (Chromium family + Electron) / -no-remote
+#   (Firefox) immediately after argv[1] so the SYSTEM child renders and does
+#   not IPC-exit. Scoped by exact base-name match; iexplore.exe is NOT
+#   Chromium and is excluded. Build links userenv (MinGW -luserenv / MSVC
+#   userenv.lib) for CreateEnvironmentBlock/DestroyEnvironmentBlock.
+Add-Assertion "gmproxy.c: #include <userenv.h> present (Layer 1 env block)" ($proxy -match '#include\s+<userenv\.h>') "gmproxy.c missing #include <userenv.h> -- CreateEnvironmentBlock undeclared"
+Add-Assertion "gmproxy.c: MSVC #pragma comment(lib, userenv.lib) present (auto-link)" ($proxy -match '#pragma\s+comment\s*\(\s*lib\s*,\s*"userenv\.lib"\s*\)') "gmproxy.c MSVC #pragma for userenv.lib missing -- MSVC build would not auto-link userenv"
+Add-Assertion "gmproxy.c: CreateEnvironmentBlock called with hPrimary (token-consistent env)" ($proxy -match 'CreateEnvironmentBlock\s*\(\s*&envBlock\s*,\s*hPrimary\s*,\s*TRUE\s*\)') "gmproxy.c does not build the env block from hPrimary -- SYSTEM child inherits the user's APPDATA (token/env mismatch)"
+Add-Assertion "gmproxy.c: DestroyEnvironmentBlock frees the env block" ($proxy -match 'DestroyEnvironmentBlock\s*\(\s*envBlock\s*\)') "gmproxy.c does not free the env block -- handle leak on every SYSTEM launch"
+Add-Assertion "gmproxy.c: env block freed on the REFUSE return path" ($proxy -match 'mySessionIsZero\s*\)\s*\{[\s\S]{0,400}?DestroyEnvironmentBlock') "env block not freed on the REFUSE path -- leak when gmproxy refuses ownerless Session-0 birth"
+Add-Assertion "gmproxy.c: env block freed on the launch-failure return path" ($proxy -match 'launch failed[\s\S]{0,250}?DestroyEnvironmentBlock') "env block not freed on the launch-failure path -- leak when both token + fallback launches fail"
+Add-Assertion "gmproxy.c: env block freed on the success return path" ($proxy -match 'CloseHandle\s*\(\s*pi\.hThread\s*\)[\s\S]{0,200}?DestroyEnvironmentBlock') "env block not freed on the success path -- leak on every successful SYSTEM launch"
+Add-Assertion "gmproxy.c: env block passed to CreateProcessWithTokenW (not NULL)" ($proxy -match 'cpwt\s*\(\s*hPrimary\s*,\s*LOGON_WITH_PROFILE\s*,\s*hardlinkPath\s*,\s*cmdLine\s*,\s*CREATE_UNICODE_ENVIRONMENT\s*,\s*envBlock\s*,') "CreateProcessWithTokenW still passed NULL env -- SYSTEM child inherits user APPDATA"
+Add-Assertion "gmproxy.c: env block passed to CreateProcessAsUserW (not NULL)" ($proxy -match 'CreateProcessAsUserW\s*\(\s*hPrimary\s*,\s*hardlinkPath[\s\S]{0,120}?CREATE_UNICODE_ENVIRONMENT\s*,\s*envBlock\s*,') "CreateProcessAsUserW still passed NULL env -- fallback token path inherits user APPDATA"
+Add-Assertion "gmproxy.c: three-tier fallback (CreateEnvironmentBlock failure -> NULL, no regression)" ($proxy -match 'CreateEnvironmentBlock\s*\(\s*&envBlock[\s\S]{0,120}?envBlock\s*=\s*NULL') "gmproxy.c does not fall back to NULL when CreateEnvironmentBlock fails -- a failed env build would abort the launch"
+Add-Assertion "gmproxy.c: graceful current-user fallback CreateProcessW still passes NULL env (no token -> no env block)" ($proxy -match 'CreateProcessW\s*\(\s*hardlinkPath\s*,\s*cmdLine\s*,\s*NULL\s*,\s*NULL\s*,\s*FALSE\s*,\s*CREATE_UNICODE_ENVIRONMENT\s*,\s*NULL\s*,') "graceful-fallback CreateProcessW passes envBlock instead of NULL -- would build an env for a non-SYSTEM current-user launch (wrong)"
+Add-Assertion "gmproxy.c: GmProxyLaunchFlagForTarget helper defined (Layer 2 flag injection)" ($proxy -match 'static\s+const\s+wchar_t\*\s+GmProxyLaunchFlagForTarget\s*\(') "GmProxyLaunchFlagForTarget helper missing -- browser launch flags cannot be injected"
+Add-Assertion "gmproxy.c: --no-sandbox injected for Chromium family + Electron" ($proxy -match 'L"--no-sandbox"') "gmproxy.c does not inject --no-sandbox -- Chromium/Electron SYSTEM children would fail to render (sandbox cannot init under SYSTEM)"
+Add-Assertion "gmproxy.c: -no-remote injected for Firefox (no IPC to user instance)" ($proxy -match 'L"-no-remote"') "gmproxy.c does not inject -no-remote for Firefox -- SYSTEM Firefox would IPC-exit to the user's running Firefox"
+Add-Assertion "gmproxy.c: chrome.exe in the --no-sandbox set" ($proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?_wcsicmp\s*\(\s*base\s*,\s*L"chrome\.exe"\s*\)') "chrome.exe not in the --no-sandbox set -- Chrome would still auto-exit as SYSTEM"
+Add-Assertion "gmproxy.c: firefox.exe in the -no-remote set" ($proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?_wcsicmp\s*\(\s*base\s*,\s*L"firefox\.exe"\s*\)') "firefox.exe not in the -no-remote set -- Firefox would still IPC-exit as SYSTEM"
+Add-Assertion "gmproxy.c: msedge/discord/teams/code in the --no-sandbox set (Electron/Chromium)" ($proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?L"msedge\.exe"' -and $proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?L"discord\.exe"' -and $proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?L"teams\.exe"' -and $proxy -match 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?L"code\.exe"') "one or more of msedge/discord/teams/code missing from the --no-sandbox set -- Electron/Chromium SYSTEM children would fail to render"
+Add-Assertion "gmproxy.c: iexplore.exe EXCLUDED from --no-sandbox (not Chromium)" ($proxy -notmatch 'GmProxyLaunchFlagForTarget[\s\S]{0,1500}?L"iexplore\.exe"') "iexplore.exe is in the --no-sandbox set -- it is NOT Chromium and --no-sandbox would be wrong"
+Add-Assertion "gmproxy.c: injectFlag inserted after argv[1] in the rebuilt command line" ($proxy -match 'i\s*==\s*1\s*&&\s*injectFlag') "injectFlag not inserted after argv[1] -- flag would appear in the wrong position or not at all"
+Add-Assertion "driver/build.ps1: MinGW gmproxy links -luserenv (CreateEnvironmentBlock)" ($null -ne $build -and $build -match '-luserenv') "driver/build.ps1 MinGW gmproxy line does not link -luserenv -- CreateEnvironmentBlock would not resolve at link time"
+Add-Assertion "driver/build.ps1: MSVC gmproxy links userenv.lib" ($null -ne $build -and $build -match 'userenv\.lib') "driver/build.ps1 MSVC gmproxy line does not link userenv.lib -- MSVC build would fail at link time"
+Add-Assertion "driver/build.ps1: gmhook line UNCHANGED (no userenv -- gmhook has no env block)" ($null -ne $build -and $build -match '-shared\s+-o\s+"\$hookOut"\s+"\$hookSrc"\s*-ladvapi32\s*-lkernel32\s*-lntdll\s*-luser32') "driver/build.ps1 gmhook line changed -- gmhook does not use CreateEnvironmentBlock and should not link userenv"
+
 Write-Summary

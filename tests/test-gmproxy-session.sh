@@ -91,13 +91,27 @@ grep -qF 'GmEnsureTrailingBackslash' "$SRC" && record "src: GmEnsureTrailingBack
 # %ls (wide) is consistent across MSVC and MinGW.
 grep -qF '%lsgmproxy.log' "$SRC" && record "src: %ls wide-format log path present (MinGW %s truncation fix)" 1 || record "src: %ls wide-format log path present (MinGW %s truncation fix)" 0 "not found"
 
+# Layer 1 (token-consistent env block) + Layer 2 (browser launch flags) fix:
+# gmproxy now builds the SYSTEM child's env from the stolen token via
+# CreateEnvironmentBlock (so USERPROFILE/APPDATA point at systemprofile, not
+# the invoking user's AppData -> no profile-lock conflict / sandbox failure),
+# and injects --no-sandbox (Chromium/Electron) / -no-remote (Firefox) so the
+# SYSTEM child renders and doesn't IPC-exit. userenv is linked for the env API.
+grep -qF 'userenv.h' "$SRC" && record "src: #include <userenv.h> present (Layer 1 env block)" 1 || record "src: #include <userenv.h> present (Layer 1 env block)" 0 "not found -- CreateEnvironmentBlock undeclared"
+grep -qF 'CreateEnvironmentBlock' "$SRC" && record "src: CreateEnvironmentBlock present (token-consistent env)" 1 || record "src: CreateEnvironmentBlock present (token-consistent env)" 0 "not found -- SYSTEM child inherits user APPDATA"
+grep -qF 'DestroyEnvironmentBlock' "$SRC" && record "src: DestroyEnvironmentBlock present (env block freed)" 1 || record "src: DestroyEnvironmentBlock present (env block freed)" 0 "not found -- env block leak"
+grep -qF 'GmProxyLaunchFlagForTarget' "$SRC" && record "src: GmProxyLaunchFlagForTarget helper present (Layer 2 flag injection)" 1 || record "src: GmProxyLaunchFlagForTarget helper present (Layer 2 flag injection)" 0 "not found"
+grep -qF -- '--no-sandbox' "$SRC" && record "src: --no-sandbox flag present (Chromium/Electron render under SYSTEM)" 1 || record "src: --no-sandbox flag present (Chromium/Electron render under SYSTEM)" 0 "not found"
+grep -qF -- '-no-remote' "$SRC" && record "src: -no-remote flag present (Firefox no IPC-exit)" 1 || record "src: -no-remote flag present (Firefox no IPC-exit)" 0 "not found"
+grep -qF 'envBlock' "$SRC" && record "src: envBlock variable present (passed to token launch sites)" 1 || record "src: envBlock variable present (passed to token launch sites)" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"
 else
     out="$SCRIPT_DIR/gmproxy_session_test.exe"
     build_log="$(mktemp)"
-    if x86_64-w64-mingw32-gcc -O2 -Wall -municode -o "$out" "$SRC" -ladvapi32 -lkernel32 -lntdll >"$build_log" 2>&1; then
+    if x86_64-w64-mingw32-gcc -O2 -Wall -municode -o "$out" "$SRC" -ladvapi32 -lkernel32 -lntdll -luserenv >"$build_log" 2>&1; then
         record "gmproxy.c compiles (MinGW, session-fix)" 1
         # Verify the output is a valid PE binary.
         if command -v file >/dev/null 2>&1; then

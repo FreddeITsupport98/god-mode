@@ -85,6 +85,14 @@ grep -q 'ProcessIdToSessionId' "$SRC" && record "src: ProcessIdToSessionId own-s
 grep -q 'mySessionIsZero' "$SRC" && record "src: mySessionIsZero guard present" 1 || record "src: mySessionIsZero guard present" 0 "not found"
 grep -qF '[GM-PROXY] REFUSE' "$SRC" && record "src: [GM-PROXY] REFUSE diag present" 1 || record "src: [GM-PROXY] REFUSE diag present" 0 "not found"
 grep -qF '#ifdef GMPROXY_TEST_FORCE_SESSION0' "$SRC" && record "src: GMPROXY_TEST_FORCE_SESSION0 compile-time seam present (#ifdef)" 1 || record "src: GMPROXY_TEST_FORCE_SESSION0 compile-time seam present (#ifdef)" 0 "not found -- forced REFUSE run cannot be exercised under wine"
+# Layer 1 (env block) + Layer 2 (launch flags) fix invariants: gmproxy now
+# builds the SYSTEM child's env from the stolen token (CreateEnvironmentBlock)
+# and injects --no-sandbox / -no-remote for browser/Electron targets. The
+# NORMAL + FORCED builds below must link -luserenv for CreateEnvironmentBlock.
+grep -qF 'userenv.h' "$SRC" && record "src: #include <userenv.h> present (Layer 1 env block)" 1 || record "src: #include <userenv.h> present (Layer 1 env block)" 0 "not found"
+grep -qF 'CreateEnvironmentBlock' "$SRC" && record "src: CreateEnvironmentBlock present (token-consistent env)" 1 || record "src: CreateEnvironmentBlock present (token-consistent env)" 0 "not found"
+grep -qF -- '--no-sandbox' "$SRC" && record "src: --no-sandbox flag present (Chromium/Electron)" 1 || record "src: --no-sandbox flag present (Chromium/Electron)" 0 "not found"
+grep -qF -- '-no-remote' "$SRC" && record "src: -no-remote flag present (Firefox)" 1 || record "src: -no-remote flag present (Firefox)" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.
@@ -118,7 +126,7 @@ fi
 
 # --- Build gmproxy.exe: NORMAL (production-equivalent, no test macro). ---
 NORMAL="$WORK/gmproxy_normal.exe"
-if "$GCC" -O2 -Wall -municode -o "$NORMAL" "$SRC" -ladvapi32 -lkernel32 -lntdll >/dev/null 2>&1; then
+if "$GCC" -O2 -Wall -municode -o "$NORMAL" "$SRC" -ladvapi32 -lkernel32 -lntdll -luserenv >/dev/null 2>&1; then
     record "build gmproxy.exe NORMAL (MinGW, production-equivalent)" 1
 else
     record "build gmproxy.exe NORMAL (MinGW, production-equivalent)" 0 "gcc failed"
@@ -127,7 +135,7 @@ fi
 
 # --- Build gmproxy.exe: FORCED (-DGMPROXY_TEST_FORCE_SESSION0=1 -> mySession=0). ---
 FORCED="$WORK/gmproxy_forced.exe"
-if "$GCC" -O2 -Wall -municode -DGMPROXY_TEST_FORCE_SESSION0=1 -o "$FORCED" "$SRC" -ladvapi32 -lkernel32 -lntdll >/dev/null 2>&1; then
+if "$GCC" -O2 -Wall -municode -DGMPROXY_TEST_FORCE_SESSION0=1 -o "$FORCED" "$SRC" -ladvapi32 -lkernel32 -lntdll -luserenv >/dev/null 2>&1; then
     record "build gmproxy.exe FORCED (MinGW, -DGMPROXY_TEST_FORCE_SESSION0=1)" 1
 else
     record "build gmproxy.exe FORCED (MinGW, -DGMPROXY_TEST_FORCE_SESSION0=1)" 0 "gcc failed"

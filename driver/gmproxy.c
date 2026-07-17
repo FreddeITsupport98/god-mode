@@ -14,9 +14,11 @@
 #include <psapi.h>
 #include <tchar.h>
 #include <stdarg.h>   /* va_list for DiagLog() */
+#include <userenv.h>  /* CreateEnvironmentBlock/DestroyEnvironmentBlock (Layer 1 env fix) */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "userenv.lib")
 #endif
 
 /* TOKEN_ALL_ACCESS, TOKEN_DUPLICATE, TOKEN_QUERY, SecurityImpersonation,
@@ -240,6 +242,44 @@ static HANDLE StealSystemToken(DWORD pid) {
     return hPrimary;
 }
 
+/* Layer 2: return a launch flag to inject for sandboxed/single-instance apps
+   so they render and don't IPC-exit when born as SYSTEM. Returns NULL (no
+   injection) for apps that Layer 1's env block alone fixes. The flag is
+   inserted immediately AFTER argv[1] in the rebuilt command line, preserving
+   any existing caller arguments. Scoped by exact base-name match (case-
+   insensitive) so non-matching apps are unaffected. iexplore.exe is NOT
+   Chromium and is deliberately excluded from the --no-sandbox set. */
+static const wchar_t* GmProxyLaunchFlagForTarget(const wchar_t* targetPath) {
+    if (!targetPath) return NULL;
+    const wchar_t* base = wcsrchr(targetPath, L'\\');
+    if (base) base++; else base = targetPath;
+    /* Chromium family + Electron (all share the Chromium sandbox + single-
+       instance lock). --no-sandbox is the standard, reliable way to make
+       Chromium render under SYSTEM; in a red-team tool whose purpose is "run
+       as SYSTEM" the sandbox threat model is already moot (process IS SYSTEM). */
+    if (_wcsicmp(base, L"chrome.exe") == 0 ||
+        _wcsicmp(base, L"msedge.exe") == 0 ||
+        _wcsicmp(base, L"brave.exe") == 0 ||
+        _wcsicmp(base, L"opera.exe") == 0 ||
+        _wcsicmp(base, L"vivaldi.exe") == 0 ||
+        _wcsicmp(base, L"discord.exe") == 0 ||
+        _wcsicmp(base, L"slack.exe") == 0 ||
+        _wcsicmp(base, L"teams.exe") == 0 ||
+        _wcsicmp(base, L"code.exe") == 0 ||
+        _wcsicmp(base, L"zoom.exe") == 0 ||
+        _wcsicmp(base, L"telegram.exe") == 0 ||
+        _wcsicmp(base, L"spotify.exe") == 0) {
+        return L"--no-sandbox";
+    }
+    /* Firefox: -no-remote so the SYSTEM Firefox doesn't IPC to an existing
+       user Firefox and exit (belt-and-suspenders on Layer 1's separate
+       systemprofile). */
+    if (_wcsicmp(base, L"firefox.exe") == 0) {
+        return L"-no-remote";
+    }
+    return NULL;
+}
+
 /* Find a SYSTEM process whose token ALREADY lives in the active interactive
    session (wantSession). Named interactive SYSTEM processes (winlogon / dwm /
    fontdrvhost) are preferred and returned immediately; if none is openable
@@ -418,10 +458,19 @@ int wmain(int argc, wchar_t* argv[]) {
         DiagLog(L"[GM-PROXY] WARN: no usable SYSTEM token in session %lu; will launch target as current user (not SYSTEM).\n", activeSession);
     }
 
+    // Layer 2: detect sandboxed/single-instance apps and inject a launch flag
+    // (Chromium/Electron --no-sandbox, Firefox -no-remote) immediately after
+    // argv[1] so the SYSTEM child renders and doesn't IPC-exit. NULL = no
+    // injection (Layer 1's env block alone fixes that app).
+    const wchar_t* injectFlag = GmProxyLaunchFlagForTarget(argv[1]);
+
     // Build command line from argv
     size_t cmdLen = 0;
     for (int i = 1; i < argc; i++) {
         cmdLen += wcslen(argv[i]) + 3; // quotes + space
+    }
+    if (injectFlag) {
+        cmdLen += wcslen(injectFlag) + 3; // injected flag + space
     }
     wchar_t* cmdLine = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (cmdLen + 1) * sizeof(wchar_t));
     if (!cmdLine) {
@@ -438,6 +487,12 @@ int wmain(int argc, wchar_t* argv[]) {
             wcscat(cmdLine, L"\"");
         } else {
             wcscat(cmdLine, argv[i]);
+        }
+        // Inject the launch flag right after argv[1] (before argv[2..]).
+        // The flag has no spaces (--no-sandbox / -no-remote) so no quoting.
+        if (i == 1 && injectFlag) {
+            wcscat(cmdLine, L" ");
+            wcscat(cmdLine, injectFlag);
         }
     }
 
@@ -486,16 +541,35 @@ int wmain(int argc, wchar_t* argv[]) {
         cpwt = (CreateProcessWithTokenW_t)GetProcAddress(hAdv, "CreateProcessWithTokenW");
     }
 
+    // Layer 1: build a token-consistent environment block from the stolen
+    // SYSTEM token so the SYSTEM child gets systemprofile\AppData (its own
+    // profile dir) instead of inheriting the invoking user's APPDATA via
+    // gmproxy's env. Without this, single-instance + profile-lock apps
+    // (Chrome, Firefox, Electron) either IPC-exit to the user's running
+    // instance or fail to init the content sandbox -> unusable as SYSTEM.
+    // bInheritExistingEnvironment=TRUE inherits the current process's system
+    // vars (PATH, SystemRoot, ...) and replaces the user-specific vars
+    // (USERPROFILE, APPDATA, LOCALAPPDATA) with the SYSTEM token's values.
+    // Three-tier: if CreateEnvironmentBlock fails, fall back to NULL (the
+    // previous behavior) so this never regresses the launch.
+    LPVOID envBlock = NULL;
+    if (haveToken) {
+        if (!CreateEnvironmentBlock(&envBlock, hPrimary, TRUE)) {
+            envBlock = NULL;
+            DiagLog(L"[GM-PROXY] WARN: CreateEnvironmentBlock failed (GLE=%lu); inheriting gmproxy env.\n", GetLastError());
+        }
+    }
+
     BOOL ok = FALSE;
 #ifdef _MSC_VER
     __try {
 #endif
         if (haveToken && cpwt) {
-            ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+            ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, envBlock, NULL, &si, &pi);
         }
         /* Fallback with the same (session-correct) SYSTEM token. */
         if (!ok && haveToken) {
-            ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+            ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, envBlock, NULL, &si, &pi);
         }
 #ifdef _MSC_VER
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -526,6 +600,7 @@ int wmain(int argc, wchar_t* argv[]) {
             DiagLog(L"[GM-PROXY] REFUSE: gmproxy is in Session %lu with no session-correct SYSTEM token; aborting to avoid ownerless Session-0 birth (would inherit Session 0, blank User column).\n", mySession);
             DeleteFileW(hardlinkPath);
             HeapFree(GetProcessHeap(), 0, cmdLine);
+            if (envBlock) DestroyEnvironmentBlock(envBlock);
             if (hPrimary) CloseHandle(hPrimary);
             return 1;
         }
@@ -547,6 +622,7 @@ int wmain(int argc, wchar_t* argv[]) {
     if (!ok) {
         DiagLog(L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
         HeapFree(GetProcessHeap(), 0, cmdLine);
+        if (envBlock) DestroyEnvironmentBlock(envBlock);
         if (hPrimary) CloseHandle(hPrimary);
         return 1;
     }
@@ -558,6 +634,7 @@ int wmain(int argc, wchar_t* argv[]) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     HeapFree(GetProcessHeap(), 0, cmdLine);
+    if (envBlock) DestroyEnvironmentBlock(envBlock);
     if (hPrimary) CloseHandle(hPrimary);
     return 0;
 }

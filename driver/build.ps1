@@ -36,7 +36,7 @@ function Build-WithMSVC {
     # gmproxy.exe -- IFEO proxy
     $proxySrc = Join-Path $DriverDir "gmproxy.c"
     $proxyOut = Join-Path $OutDir "gmproxy.exe"
-    cl /nologo /O2 /W3 /Fe:"$proxyOut" "$proxySrc" kernel32.lib advapi32.lib ntdll.lib
+    cl /nologo /O2 /W3 /Fe:"$proxyOut" "$proxySrc" kernel32.lib advapi32.lib ntdll.lib userenv.lib
     if ($LASTEXITCODE -ne 0) { throw "gmproxy.exe build failed" }
     Write-Host "[BUILD] gmproxy.exe -> $proxyOut" -ForegroundColor Green
 
@@ -54,7 +54,7 @@ function Build-WithMinGW {
 
     $proxySrc = Join-Path $DriverDir "gmproxy.c"
     $proxyOut = Join-Path $OutDir "gmproxy.exe"
-    & $Prefix -O2 -Wall -municode -o "$proxyOut" "$proxySrc" -ladvapi32 -lkernel32 -lntdll
+    & $Prefix -O2 -Wall -municode -o "$proxyOut" "$proxySrc" -ladvapi32 -lkernel32 -lntdll -luserenv
     if ($LASTEXITCODE -ne 0) { throw "gmproxy.exe build failed" }
     Write-Host "[BUILD] gmproxy.exe -> $proxyOut" -ForegroundColor Green
 
