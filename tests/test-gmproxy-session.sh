@@ -105,6 +105,17 @@ grep -qF -- '--no-sandbox' "$SRC" && record "src: --no-sandbox flag present (Chr
 grep -qF -- '-no-remote' "$SRC" && record "src: -no-remote flag present (Firefox no IPC-exit)" 1 || record "src: -no-remote flag present (Firefox no IPC-exit)" 0 "not found"
 grep -qF 'envBlock' "$SRC" && record "src: envBlock variable present (passed to token launch sites)" 1 || record "src: envBlock variable present (passed to token launch sites)" 0 "not found"
 
+# Per-app launch telemetry (big debug): gmproxy emits structured [GM-PROXY]
+# LAUNCH: / [GM-PROXY] CHILD-STATUS: lines per invocation so Export-GodModeLogs
+# (option [11]) can aggregate a PER-APP LAUNCH REPORT (which apps launched as
+# SYSTEM vs fell back vs refused vs failed, and which EXITED within the grace
+# window = the "launched but instantly died / won't render" crash signal). The
+# MinGW build below must still compile with this new code.
+grep -qF 'GmProxyLogLaunchReport' "$SRC" && record "src: GmProxyLogLaunchReport per-app telemetry helper present" 1 || record "src: GmProxyLogLaunchReport per-app telemetry helper present" 0 "not found"
+grep -qF '[GM-PROXY] LAUNCH:' "$SRC" && record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 1 || record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 0 "not found"
+grep -qF '[GM-PROXY] CHILD-STATUS:' "$SRC" && record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 1 || record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 0 "not found"
+grep -qF 'WaitForSingleObject' "$SRC" && record "src: WaitForSingleObject child-survival wait present" 1 || record "src: WaitForSingleObject child-survival wait present" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

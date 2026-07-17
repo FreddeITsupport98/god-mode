@@ -93,6 +93,14 @@ grep -qF 'userenv.h' "$SRC" && record "src: #include <userenv.h> present (Layer 
 grep -qF 'CreateEnvironmentBlock' "$SRC" && record "src: CreateEnvironmentBlock present (token-consistent env)" 1 || record "src: CreateEnvironmentBlock present (token-consistent env)" 0 "not found"
 grep -qF -- '--no-sandbox' "$SRC" && record "src: --no-sandbox flag present (Chromium/Electron)" 1 || record "src: --no-sandbox flag present (Chromium/Electron)" 0 "not found"
 grep -qF -- '-no-remote' "$SRC" && record "src: -no-remote flag present (Firefox)" 1 || record "src: -no-remote flag present (Firefox)" 0 "not found"
+# Per-app launch telemetry (big debug): gmproxy emits structured [GM-PROXY]
+# LAUNCH: / [GM-PROXY] CHILD-STATUS: lines per invocation (app, pid, mode, flag,
+# env) + a child-survival observation, so Export-GodModeLogs (option [11]) can
+# aggregate a PER-APP LAUNCH REPORT (which apps EXITED within the grace window
+# = the "launched but instantly died / won't render" crash signal).
+grep -qF 'GmProxyLogLaunchReport' "$SRC" && record "src: GmProxyLogLaunchReport per-app telemetry helper present" 1 || record "src: GmProxyLogLaunchReport per-app telemetry helper present" 0 "not found"
+grep -qF '[GM-PROXY] LAUNCH:' "$SRC" && record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 1 || record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 0 "not found"
+grep -qF '[GM-PROXY] CHILD-STATUS:' "$SRC" && record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 1 || record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.
@@ -185,6 +193,22 @@ if [ -n "$NORMAL" ] && [ -n "$DUMMY" ]; then
         *"[GM-PROXY] REFUSE"*) record "NORMAL: gmproxy.log does NOT REFUSE (non-Session-0 path preserved)" 0 "REFUSE appeared in the NORMAL build log -- graceful fallback regressed" ;;
         *) record "NORMAL: gmproxy.log does NOT REFUSE (non-Session-0 path preserved)" 1 ;;
     esac
+    # Per-app launch telemetry (big debug): the NORMAL build takes the graceful
+    # fallback and launches the dummy, which exits immediately -> gmproxy's
+    # child-survival observation must fire and report result=EXITED. Proves the
+    # new telemetry actually emits at runtime under wine, not just in source.
+    case "$RUN_LOG" in
+        *"[GM-PROXY] LAUNCH:"*) record "NORMAL: gmproxy.log shows [GM-PROXY] LAUNCH: telemetry line" 1 ;;
+        *) record "NORMAL: gmproxy.log shows [GM-PROXY] LAUNCH: telemetry line" 0 "gmproxy.log missing the LAUNCH telemetry line" ;;
+    esac
+    case "$RUN_LOG" in
+        *"[GM-PROXY] CHILD-STATUS:"*) record "NORMAL: gmproxy.log shows [GM-PROXY] CHILD-STATUS: child-survival observation" 1 ;;
+        *) record "NORMAL: gmproxy.log shows [GM-PROXY] CHILD-STATUS: child-survival observation" 0 "gmproxy.log missing the CHILD-STATUS line -- child observation did not fire" ;;
+    esac
+    case "$RUN_LOG" in
+        *"result=EXITED"*) record "NORMAL: gmproxy.log shows result=EXITED (dummy exited fast, crash-signal path exercised)" 1 ;;
+        *) record "NORMAL: gmproxy.log shows result=EXITED (dummy exited fast, crash-signal path exercised)" 0 "gmproxy.log missing result=EXITED" ;;
+    esac
 fi
 
 # --- Run 2: FORCED build -> ownerless-birth REFUSE (forced Session 0). ---
@@ -199,6 +223,16 @@ if [ -n "$FORCED" ] && [ -n "$DUMMY" ]; then
     case "$RUN_LOG" in
         *"graceful fallback"*) record "FORCED: gmproxy.log does NOT reach the graceful-fallback launch (REFUSE short-circuited)" 0 "graceful-fallback launch line appeared in the FORCED build -- REFUSE did not short-circuit" ;;
         *) record "FORCED: gmproxy.log does NOT reach the graceful-fallback launch (REFUSE short-circuited)" 1 ;;
+    esac
+    # The FORCED build REFUSEs before any child is born -> it emits a LAUNCH
+    # telemetry line (mode=REFUSE) but NO CHILD-STATUS (no child to observe).
+    case "$RUN_LOG" in
+        *"[GM-PROXY] LAUNCH:"*) record "FORCED: gmproxy.log shows [GM-PROXY] LAUNCH: telemetry line (mode=REFUSE)" 1 ;;
+        *) record "FORCED: gmproxy.log shows [GM-PROXY] LAUNCH: telemetry line (mode=REFUSE)" 0 "gmproxy.log missing the LAUNCH telemetry line" ;;
+    esac
+    case "$RUN_LOG" in
+        *"[GM-PROXY] CHILD-STATUS:"*) record "FORCED: gmproxy.log does NOT show CHILD-STATUS (REFUSE short-circuited, no child)" 0 "CHILD-STATUS appeared in the FORCED build -- REFUSE did not short-circuit before the child observation" ;;
+        *) record "FORCED: gmproxy.log does NOT show CHILD-STATUS (REFUSE short-circuited, no child)" 1 ;;
     esac
 fi
 

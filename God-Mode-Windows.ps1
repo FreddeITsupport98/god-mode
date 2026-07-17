@@ -3437,6 +3437,60 @@ function Export-GodModeLogs {
             $LogContent += "`r`n[No gmproxy log found] (expected at $GmProxyDiagLog)"
         }
 
+        # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
+        #     gmproxy invocation into a per-app summary so the user can report
+        #     exactly which apps launched as SYSTEM vs fell back vs refused vs
+        #     failed, and -- crucially -- which apps EXITED within the grace
+        #     window (the "launched but instantly died / won't render" signal).
+        #     Parsed from the [GM-PROXY] LAUNCH: / [GM-PROXY] CHILD-STATUS:
+        #     structured lines gmproxy.c writes to %TEMP%\gmproxy.log.
+        $LogContent += "`r`n===== GM-PROXY PER-APP LAUNCH REPORT ====="
+        $LogContent += "`r`n(Source: $GmProxyDiagLog)"
+        if (Test-Path $GmProxyDiagLog) {
+            try {
+                $launchLines = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] LAUNCH: ' -ErrorAction SilentlyContinue)
+                $childLines  = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] CHILD-STATUS: ' -ErrorAction SilentlyContinue)
+                $report = @{}
+                foreach ($l in $launchLines) {
+                    if ($l.Line -match 'app=(.+?) pid=\d+ mode=(\w+) ') {
+                        $app = $matches[1].Trim(); $mode = $matches[2]
+                        if (-not $report.ContainsKey($app)) {
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; EXITED=0; UNKNOWN=0 }
+                        }
+                        $report[$app].Launches++
+                        if ($report[$app].ContainsKey($mode)) { $report[$app][$mode]++ }
+                    }
+                }
+                foreach ($c in $childLines) {
+                    if ($c.Line -match 'app=(.+?) pid=\d+ result=(\w+)') {
+                        $app = $matches[1].Trim(); $res = $matches[2]
+                        if (-not $report.ContainsKey($app)) {
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; EXITED=0; UNKNOWN=0 }
+                        }
+                        if ($report[$app].ContainsKey($res)) { $report[$app][$res]++ }
+                    }
+                }
+                if ($report.Count -eq 0) {
+                    $LogContent += "`r`n[No gmproxy LAUNCH/CHILD-STATUS entries yet -- no IFEO launches recorded]"
+                } else {
+                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  EXITED(crash?)"
+                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  -------------"
+                    foreach ($app in ($report.Keys | Sort-Object)) {
+                        $r = $report[$app]
+                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.EXITED)
+                    }
+                    $LogContent += "`r`nNOTE: EXITED = the child process exited within ~1.5s of launch (early exit /"
+                    $LogContent += "`r`n      possible crash / won't render). ALIVE = still running after the grace"
+                    $LogContent += "`r`n      window (healthy launch). Report the per-app EXITED counts so the IFEO"
+                    $LogContent += "`r`n      exclusion can be scoped to exactly the apps that break as SYSTEM."
+                }
+            } catch {
+                $LogContent += "`r`n[Error building per-app launch report: $_]"
+            }
+        } else {
+            $LogContent += "`r`n[No gmproxy log found] (expected at $GmProxyDiagLog)"
+        }
+
         # Error summary from debug log
         $ErrorCount = 0
         if (Test-Path $DebugLogFile) {

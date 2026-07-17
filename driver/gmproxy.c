@@ -169,6 +169,52 @@ static void SignalGmProxyFeedback(DWORD pid) {
     CloseHandle(hPipe);
 }
 
+#define GM_CHILD_OBSERVE_MS 1500  /* child-survival grace window for the per-app launch report */
+
+/* ------------------------------------------------------------------ */
+/* Per-app launch telemetry ("big debug"): emit a structured LAUNCH    */
+/* line for every gmproxy invocation (app, pid, mode, session, token-  */
+/* source pid, injected launch flag, env-block state) so Export-       */
+/* GodModeLogs (menu option [11]) can aggregate a PER-APP LAUNCH       */
+/* REPORT. When a child was actually born (childOk), also observe      */
+/* whether it survived a short grace window via WaitForSingleObject -- */
+/* a child that EXITED within the window is the "launched but          */
+/* instantly died / won't render" signal the user reports per app.     */
+/* The wait returns immediately when the child exits (crash), so a     */
+/* fast-dying app adds ~0 latency; a healthy app keeps gmproxy alive   */
+/* for the window (acceptable for a diagnostic phase). Never blocks    */
+/* the child (the child runs independently; we only hold its handle).  */
+/* Best-effort: logging/observation never affects the launch outcome.  */
+/* ------------------------------------------------------------------ */
+static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mode,
+                                   const wchar_t* injectFlag, BOOL childOk,
+                                   LPPROCESS_INFORMATION ppi, LPVOID envBlock,
+                                   DWORD srcPid, DWORD activeSession) {
+    if (!targetPath) return;
+    const wchar_t* base = wcsrchr(targetPath, L'\\');
+    if (base) base++; else base = targetPath;
+    const wchar_t* flag = injectFlag ? injectFlag : L"none";
+    const wchar_t* env  = envBlock ? L"built" : L"null";
+    DWORD pid = (childOk && ppi) ? ppi->dwProcessId : 0;
+    DiagLog(L"[GM-PROXY] LAUNCH: app=%ls pid=%lu mode=%ls session=%lu srcpid=%lu flag=%ls env=%ls\n",
+            base, (unsigned long)pid, mode, (unsigned long)activeSession,
+            (unsigned long)srcPid, flag, env);
+    if (!childOk || !ppi || !ppi->hProcess) return;  /* no child to observe (REFUSE / FAILED) */
+    DWORD w = WaitForSingleObject(ppi->hProcess, GM_CHILD_OBSERVE_MS);
+    if (w == WAIT_TIMEOUT) {
+        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=ALIVE waited_ms=%lu (mode=%ls)\n",
+                base, (unsigned long)ppi->dwProcessId, (unsigned long)GM_CHILD_OBSERVE_MS, mode);
+    } else if (w == WAIT_OBJECT_0) {
+        DWORD code = 0;
+        GetExitCodeProcess(ppi->hProcess, &code);
+        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu (mode=%ls) -- early exit / possible crash\n",
+                base, (unsigned long)ppi->dwProcessId, (unsigned long)code, mode);
+    } else {
+        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=UNKNOWN waiterr=%lu (mode=%ls)\n",
+                base, (unsigned long)ppi->dwProcessId, (unsigned long)GetLastError(), mode);
+    }
+}
+
 /* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
    lives in wtsapi32.dll; load it dynamically so no extra link dependency is added
    and the build stays identical across MSVC/MinGW. Returns 1 (the typical
@@ -598,6 +644,7 @@ int wmain(int argc, wchar_t* argv[]) {
            available there. */
         if (mySessionIsZero) {
             DiagLog(L"[GM-PROXY] REFUSE: gmproxy is in Session %lu with no session-correct SYSTEM token; aborting to avoid ownerless Session-0 birth (would inherit Session 0, blank User column).\n", mySession);
+            GmProxyLogLaunchReport(argv[1], L"REFUSE", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession);
             DeleteFileW(hardlinkPath);
             HeapFree(GetProcessHeap(), 0, cmdLine);
             if (envBlock) DestroyEnvironmentBlock(envBlock);
@@ -621,6 +668,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (!ok) {
         DiagLog(L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
+        GmProxyLogLaunchReport(argv[1], L"FAILED", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession);
         HeapFree(GetProcessHeap(), 0, cmdLine);
         if (envBlock) DestroyEnvironmentBlock(envBlock);
         if (hPrimary) CloseHandle(hPrimary);
@@ -630,6 +678,14 @@ int wmain(int argc, wchar_t* argv[]) {
     if (haveToken) {
         DiagLog(L"[GM-PROXY] SUCCESS: Launched %ls as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
     }
+
+    /* Per-app launch telemetry + child-survival observation (big debug for the
+       Export-GodModeLogs option [11] PER-APP LAUNCH REPORT). Must run BEFORE
+       CloseHandle(pi.hProcess) -- the observation WaitForSingleObject's the
+       child handle. The wait returns immediately when the child exits (crash),
+       so a fast-dying app adds ~0 latency; a healthy app keeps gmproxy alive
+       for the grace window (acceptable for a diagnostic phase). */
+    GmProxyLogLaunchReport(argv[1], haveToken ? L"SYSTEM" : L"FALLBACK", injectFlag, TRUE, &pi, envBlock, srcPid, activeSession);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
