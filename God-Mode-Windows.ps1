@@ -4674,6 +4674,91 @@ function Add-IfeoElevationForApp {
     }
 }
 
+function Remove-IfeoElevationForApp {
+    <#
+    .SYNOPSIS
+        Idempotent single-app IFEO unhook for the deferred stale-prune watcher.
+        Returns $true ONLY when a gmproxy-hooked key was removed; $false (no-op,
+        NO retrigger) when the key is absent, already clean, or belongs to a
+        non-gmproxy debugger -- so the prune never touches unrelated IFEO keys
+        and never fires twice for the same app.
+    .DESCRIPTION
+        Mirrors Uninstall-IfeoElevation's per-key cleanup (Restore-RegistryKey
+        removes the hardened deny ACL + re-enables inheritance with a SYSTEM
+        fallback, after which an admin can delete the Debugger value and the
+        key itself) for ONE base name. Guarded by Debugger -like '*gmproxy*'
+        so an app that was hooked by another tool, or re-pointed at a different
+        debugger, is left untouched. Used by the Start-IfeoNewAppWatcher Deleted
+        drain after the grace-period re-scan confirms the app is gone everywhere.
+    #>
+    param([string]$BaseName)
+    if (-not $BaseName) { return $false }
+    try {
+        $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        $appKey = Join-Path $IfeoBase $BaseName
+        # No key -> nothing to prune (no retrigger).
+        if (-not (Test-Path $appKey)) { return $false }
+        $debugger = $null
+        try {
+            $debugger = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger
+        } catch {}
+        # Only ever touch keys WE set (Debugger -> gmproxy). Never touch an
+        # unrelated IFEO key, and never retrigger when already clean.
+        if (-not $debugger -or $debugger -notlike "*gmproxy*") { return $false }
+        $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$BaseName"
+        Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
+        Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
+        $removed = (-not (Test-Path $appKey))
+        Write-Log -Message "IFEO stale-prune: removed hook for $BaseName (program uninstalled -- no .exe anywhere, key was dormant)." -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Remove-IfeoElevationForApp" -Action "REMOVE" -Message "removed=$removed for $BaseName"
+        return $removed
+    } catch {
+        Write-DebugLog -FunctionName "Remove-IfeoElevationForApp" -Action "WARN" -Message "Failed for $BaseName`: $_"
+        return $false
+    }
+}
+
+function Test-BaseNameGoneEverywhere {
+    <#
+    .SYNOPSIS
+        Re-scans the IFEO watcher install dirs for a base name; returns $true
+        only when the .exe is absent everywhere (truly uninstalled).
+    .DESCRIPTION
+        Searches C:\Program Files, C:\Program Files (x86), and each real user's
+        AppData\Local\Programs (the same sources Start-IfeoNewAppWatcher watches)
+        recursively for any file matching the base name. Used by the deferred
+        stale-prune drain AFTER the grace period to decide whether a gmproxy
+        IFEO key should be removed: an updater that deleted the old .exe but has
+        already written the new one will still be found here, so the key is kept
+        (no retrigger). Conservative: on any error returns $false (do NOT prune).
+    #>
+    param([string]$BaseName)
+    if (-not $BaseName) { return $false }
+    try {
+        $searchDirs = @()
+        $pf1 = "C:\Program Files"
+        $pf2 = "C:\Program Files (x86)"
+        if (Test-Path $pf1) { $searchDirs += $pf1 }
+        if (Test-Path $pf2) { $searchDirs += $pf2 }
+        try {
+            Get-ChildItem "C:\Users" -Directory -ErrorAction SilentlyContinue | Where-Object {
+                $_.Name -notin @('Public','Default','Default User','All Users') -and
+                (Test-Path (Join-Path $_.FullName 'AppData\Local\Programs'))
+            } | ForEach-Object { $searchDirs += (Join-Path $_.FullName 'AppData\Local\Programs') }
+        } catch {}
+        foreach ($dir in $searchDirs) {
+            try {
+                $hits = Get-ChildItem -Path $dir -Filter $BaseName -Recurse -File -ErrorAction SilentlyContinue
+                if ($hits) { return $false }
+            } catch {}
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Test-SystemProcessExists {
     param([string]$ProcessName)
     try {
@@ -5124,6 +5209,7 @@ $script:IfeoNewAppQueue = [System.Collections.ArrayList]::Synchronized([System.C
 $script:IfeoNewAppDebounce = [hashtable]::Synchronized(@{})
 $script:IfeoNewAppWatchers = @()
 $script:IfeoNewAppWatcherActive = $false
+$script:IfeoPruneQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 
 function Start-IfeoNewAppWatcher {
     <#
@@ -5143,6 +5229,11 @@ function Start-IfeoNewAppWatcher {
         sentinel is enqueued so the drain runs an idempotent Install-IfeoElevation
         catch-up rescan. Best-effort throughout; any watcher error is swallowed
         so it never affects the monitor loop.
+        The Deleted event enqueues a DEFERRED stale-prune entry (grace period
+        ~3s) so an updater's new .exe lands first; the Start-Monitoring drain
+        then re-scans and removes the gmproxy IFEO key only if the .exe is gone
+        everywhere -- never touching unrelated keys, never retriggering on
+        updater swaps (the new .exe's Created event re-hooks it).
     #>
     if ($script:IfeoNewAppWatcherActive) { return $true }
     try {
@@ -5182,6 +5273,25 @@ function Start-IfeoNewAppWatcher {
                     # Buffer overflow / watcher error -> sentinel for an idempotent catch-up rescan.
                     [void]$script:IfeoNewAppQueue.Add('__GMIFEO_RESCAN__')
                 }
+                $w.Deleted += {
+                    # A watched .exe was deleted (uninstall, or updater swapping the
+                    # binary). Enqueue a DEFERRED stale-prune entry with a ~3s grace
+                    # period so an updater's new .exe lands before we decide; the
+                    # Start-Monitoring drain re-scans and removes the gmproxy IFEO key
+                    # only if the base name is gone everywhere (never touches unrelated
+                    # keys, never retriggers on updater swaps).
+                    param($sender, $e)
+                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
+                        $bn = [System.IO.Path]::GetFileName($e.FullPath)
+                        if (-not [string]::IsNullOrWhiteSpace($bn)) {
+                            [void]$script:IfeoPruneQueue.Add([PSCustomObject]@{
+                                BaseName = $bn
+                                FullPath = $e.FullPath
+                                DueTime  = (Get-Date).AddSeconds(3)
+                            })
+                        }
+                    }
+                }
                 $w.EnableRaisingEvents = $true
                 $script:IfeoNewAppWatchers += $w
             } catch {
@@ -5209,6 +5319,7 @@ function Stop-IfeoNewAppWatcher {
     $script:IfeoNewAppWatcherActive = $false
     if ($script:IfeoNewAppQueue) { $script:IfeoNewAppQueue.Clear() }
     if ($script:IfeoNewAppDebounce) { $script:IfeoNewAppDebounce.Clear() }
+    if ($script:IfeoPruneQueue) { $script:IfeoPruneQueue.Clear() }
     Write-DebugLog -FunctionName "Stop-IfeoNewAppWatcher" -Action "EXIT" -Message "watchers stopped + queue cleared"
 }
 
@@ -5509,6 +5620,49 @@ function Start-Monitoring {
                     }
                     $script:IfeoNewAppDebounce[$nbKey] = $now
                     $null = Add-IfeoElevationForApp -AppExePath $newPath
+                }
+            }
+            # --- Deferred IFEO stale-prune drain: when a watched .exe is Deleted,
+            #     the watcher enqueues a prune entry with a ~3s grace period (so an
+            #     updater's new .exe lands first). After the grace period we re-scan
+            #     the watched dirs for that base name; the gmproxy IFEO key is removed
+            #     ONLY if the .exe is gone everywhere (gmproxy-guarded, never touches
+            #     unrelated keys). If the .exe reappeared (update), drop the entry --
+            #     the new .exe's Created event re-hooked it; no retrigger. ---
+            if ($script:IfeoNewAppWatcherActive -and $script:IfeoPruneQueue -and $script:IfeoPruneQueue.Count -gt 0) {
+                $nowPrune = [datetime]::Now
+                $processedBases = @{}
+                for ($pi = $script:IfeoPruneQueue.Count - 1; $pi -ge 0; $pi--) {
+                    $entry = $null
+                    try { $entry = $script:IfeoPruneQueue[$pi] } catch {}
+                    if (-not $entry) { continue }
+                    # Not yet due -> leave for a future tick (grace period still running).
+                    if ($entry.DueTime -gt $nowPrune) { continue }
+                    $pBase = $entry.BaseName
+                    if (-not $pBase) { $script:IfeoPruneQueue.RemoveAt($pi); continue }
+                    # Dedupe per base name this tick (multiple Deleted events for the
+                    # same app collapse into one prune check).
+                    $pKey = $pBase.ToLower()
+                    if ($processedBases.ContainsKey($pKey)) { $script:IfeoPruneQueue.RemoveAt($pi); continue }
+                    $processedBases[$pKey] = $true
+                    $script:IfeoPruneQueue.RemoveAt($pi)
+                    # Cheap pre-check: only the expensive re-scan if a gmproxy IFEO
+                    # key actually exists for this base name. No key / non-gmproxy
+                    # debugger -> nothing to prune (no retrigger, never touches
+                    # unrelated IFEO keys).
+                    $pIfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+                    $pAppKey = Join-Path $pIfeoBase $pBase
+                    $pDebugger = $null
+                    if (Test-Path $pAppKey) {
+                        try { $pDebugger = (Get-ItemProperty -Path $pAppKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger } catch {}
+                    }
+                    if (-not $pDebugger -or $pDebugger -notlike "*gmproxy*") { continue }
+                    # Re-scan: is the .exe truly gone everywhere?
+                    if (Test-BaseNameGoneEverywhere -BaseName $pBase) {
+                        $null = Remove-IfeoElevationForApp -BaseName $pBase
+                    }
+                    # Else: .exe reappeared (updater wrote the new copy) -> no-op,
+                    # the Created event already re-hooked it. No retrigger.
                 }
             }
             Start-Sleep -Milliseconds 500

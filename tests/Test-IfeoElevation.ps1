@@ -203,9 +203,9 @@ Add-Assertion "Export-GodModeLogs: IFEO diagnostic includes regedit.exe + mstsc.
 # no events fire and nothing happens. Uninstall-IfeoElevation already enumerates
 # by Debugger-contains-gmproxy, so watcher-added keys are cleaned automatically.
 Add-Assertion "Add-IfeoElevationForApp function defined" ($gm -match 'function\s+Add-IfeoElevationForApp\s*\{') "Add-IfeoElevationForApp missing -- instant single-app IFEO add helper absent"
-$addMatch = [regex]::Match($gm, '(?s)function\s+Add-IfeoElevationForApp\s*\{(.*?)\nfunction\s+Test-SystemProcessExists\s*\{')
+$addMatch = [regex]::Match($gm, '(?s)function\s+Add-IfeoElevationForApp\s*\{(.*?)\nfunction\s+Remove-IfeoElevationForApp\s*\{')
 $addBody = if ($addMatch.Success) { $addMatch.Groups[1].Value } else { "" }
-Add-Assertion "Add-IfeoElevationForApp body extractable (adjacent to Test-SystemProcessExists)" ($addMatch.Success) "could not isolate Add-IfeoElevationForApp body"
+Add-Assertion "Add-IfeoElevationForApp body extractable (adjacent to Remove-IfeoElevationForApp)" ($addMatch.Success) "could not isolate Add-IfeoElevationForApp body"
 if ($addMatch.Success) {
     Add-Assertion "Add-IfeoElevationForApp: idempotent gate (already-hooked -> no retrigger)" ($addBody -match '\$existing\s*-and\s*\$existing\s*-like\s*"\*gmproxy\*"' -and $addBody -match 'return\s+\$false') "Add-IfeoElevationForApp does not skip already-hooked apps -- would retrigger for every event"
     Add-Assertion "Add-IfeoElevationForApp: safety-net denylist present" ($addBody -match '\$deny' -and ($addBody -match '"svchost"' -or $addBody -match '"powershell"')) "Add-IfeoElevationForApp missing the canonical name denylist -- could hook a critical/shell process"
@@ -240,5 +240,44 @@ Add-Assertion "Disable-GodMode calls Stop-IfeoNewAppWatcher (standalone call lin
 # Debugger-contains-gmproxy, so IFEO keys added by the watcher are removed
 # automatically on Disable-GodMode (no uninstaller change needed).
 Add-Assertion "Uninstaller covers watcher-added IFEO keys (enumerates by gmproxy Debugger)" ($uninstallBody -match 'Debugger.*gmproxy') "uninstaller would not clean watcher-added IFEO keys -- Disable-GodMode could leave dynamic keys behind"
+
+# --- 11. Deferred IFEO stale-prune for uninstalled programs (event-driven, no retrigger) ---
+# Closes the "uninstalled program leaves a dormant gmproxy IFEO key" gap. The
+# FileSystemWatcher Deleted event enqueues a DEFERRED prune entry with a ~3s
+# grace period (so an updater's new .exe lands first); after the grace period
+# the Start-Monitoring drain re-scans the watched dirs and removes the gmproxy
+# IFEO key ONLY if the .exe is gone everywhere. Updater swaps (delete then
+# create) are NOT pruned -- the new .exe's Created event re-hooks it. Never
+# touches a non-gmproxy IFEO key; never retriggers (idempotent remove gate).
+Add-Assertion "Remove-IfeoElevationForApp function defined" ($gm -match 'function\s+Remove-IfeoElevationForApp\s*\{') "Remove-IfeoElevationForApp missing -- deferred single-app IFEO unhook helper absent"
+$removeMatch = [regex]::Match($gm, '(?s)function\s+Remove-IfeoElevationForApp\s*\{(.*?)\nfunction\s+Test-BaseNameGoneEverywhere\s*\{')
+$removeBody = if ($removeMatch.Success) { $removeMatch.Groups[1].Value } else { "" }
+Add-Assertion "Remove-IfeoElevationForApp body extractable (adjacent to Test-BaseNameGoneEverywhere)" ($removeMatch.Success) "could not isolate Remove-IfeoElevationForApp body"
+if ($removeMatch.Success) {
+    Add-Assertion "Remove-IfeoElevationForApp: gmproxy-guarded (only touches gmproxy Debugger keys)" ($removeBody -match 'Debugger.*-notlike.*gmproxy|gmproxy.*-notlike') "Remove-IfeoElevationForApp does not guard on gmproxy Debugger -- could remove an unrelated IFEO key"
+    Add-Assertion "Remove-IfeoElevationForApp: restores ACL (Restore-RegistryKey) before delete" ($removeBody -match 'Restore-RegistryKey') "Remove-IfeoElevationForApp does not restore the hardened ACL -- key could not be deleted"
+    Add-Assertion "Remove-IfeoElevationForApp: removes Debugger value" ($removeBody -match 'Remove-ItemProperty.*Debugger') "Remove-IfeoElevationForApp does not remove the Debugger value"
+    Add-Assertion "Remove-IfeoElevationForApp: removes IFEO key" ($removeBody -match 'Remove-Item.*appKey') "Remove-IfeoElevationForApp does not remove the IFEO key"
+    Add-Assertion "Remove-IfeoElevationForApp: no retrigger when key absent" ($removeBody -match 'Test-Path.*appKey' -and $removeBody -match 'return\s+\$false') "Remove-IfeoElevationForApp does not bail when the key is absent -- would retrigger"
+}
+Add-Assertion "Test-BaseNameGoneEverywhere function defined" ($gm -match 'function\s+Test-BaseNameGoneEverywhere\s*\{') "Test-BaseNameGoneEverywhere missing -- base-name re-scan helper absent"
+$goneMatch = [regex]::Match($gm, '(?s)function\s+Test-BaseNameGoneEverywhere\s*\{(.*?)\nfunction\s+Test-SystemProcessExists\s*\{')
+$goneBody = if ($goneMatch.Success) { $goneMatch.Groups[1].Value } else { "" }
+Add-Assertion "Test-BaseNameGoneEverywhere body extractable" ($goneMatch.Success) "could not isolate Test-BaseNameGoneEverywhere body"
+if ($goneMatch.Success) {
+    Add-Assertion "Test-BaseNameGoneEverywhere: re-scans Program Files" ($goneBody -match 'Program Files') "re-scan does not check Program Files"
+    Add-Assertion "Test-BaseNameGoneEverywhere: re-scans per-user Programs (C:\\Users + AppData\\Local\\Programs)" ($goneBody -match 'C:\\Users' -and $goneBody -match 'AppData\\Local\\Programs') "re-scan does not check per-user Programs dirs"
+    Add-Assertion "Test-BaseNameGoneEverywhere: recursive base-name search (Get-ChildItem -Recurse)" ($goneBody -match 'Get-ChildItem.*-Recurse') "re-scan is not recursive -- would miss the .exe in a versioned subfolder"
+}
+Add-Assertion "Instant watcher: Deleted handler attached (catches uninstalls)" ($startBody -match '\.Deleted\s*\+=') "watcher does not attach a Deleted event handler -- uninstalled programs would leave stale IFEO keys"
+Add-Assertion "Instant watcher: deferred prune queue present (IfeoPruneQueue)" ($gm -match 'IfeoPruneQueue') "deferred prune queue missing -- Deleted events would have nowhere to enqueue"
+Add-Assertion "Instant watcher: grace-period scheduling (AddSeconds in Deleted handler)" ($startBody -match 'AddSeconds') "Deleted handler does not schedule a grace period -- updater swaps could be pruned mid-swap"
+Add-Assertion "Instant watcher: Deleted handler enqueues prune entry (BaseName + DueTime)" ($startBody -match 'BaseName' -and $startBody -match 'DueTime') "Deleted handler does not enqueue a structured prune entry -- drain cannot tell what to prune or when"
+Add-Assertion "Start-Monitoring: prune drain processes due entries (IfeoPruneQueue + DueTime)" ($gm -match 'IfeoPruneQueue.*Count' -and $gm -match 'DueTime') "Start-Monitoring does not drain the prune queue -- deferred stale-prune entries would never be processed"
+Add-Assertion "Start-Monitoring: prune drain re-scans via Test-BaseNameGoneEverywhere" ($gm -match 'Test-BaseNameGoneEverywhere\s+-BaseName') "Start-Monitoring prune drain does not re-scan -- could remove a key mid-updater-swap"
+Add-Assertion "Start-Monitoring: prune drain removes via Remove-IfeoElevationForApp" ($gm -match 'Remove-IfeoElevationForApp\s+-BaseName') "Start-Monitoring prune drain does not call the gmproxy-guarded remover -- cleanup not wired"
+Add-Assertion "Start-Monitoring: prune drain gated on watcher active (no work when stopped)" ($gm -match 'IfeoNewAppWatcherActive.*IfeoPruneQueue' -or $gm -match 'IfeoPruneQueue.*IfeoNewAppWatcherActive') "prune drain is not gated on the watcher being active -- could run after Disable"
+Add-Assertion "Stop-IfeoNewAppWatcher clears IfeoPruneQueue" ($gm -match 'IfeoPruneQueue\.Clear\(\)') "Stop-IfeoNewAppWatcher does not clear the prune queue -- entries could survive across enable/disable cycles"
+Add-Assertion "Instant watcher: still NO polling after prune feature (no Start-Sleep call in watcher body)" ($startBody -notmatch 'Start-Sleep\s*-') "watcher body now contains a Start-Sleep call -- the prune feature must stay event-driven, not poll"
 
 Write-Summary
