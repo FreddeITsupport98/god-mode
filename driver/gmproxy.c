@@ -15,6 +15,7 @@
 #include <tchar.h>
 #include <stdarg.h>   /* va_list for DiagLog() */
 #include <userenv.h>  /* CreateEnvironmentBlock/DestroyEnvironmentBlock (Layer 1 env fix) */
+#include <sddl.h>    /* ConvertSidToStringSidW (elevation-context token SID logging) */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
@@ -169,6 +170,133 @@ static void SignalGmProxyFeedback(DWORD pid) {
     CloseHandle(hPipe);
 }
 
+/* Resolve the full image path of a PID into buf (wide), then truncate to the
+   base name. Used by the elevation-context log (which SYSTEM process donated
+   the token) and the grandchild-delegation log (what a launcher stub spawned).
+   QueryFullProcessImageNameW is loaded dynamically (kernel32, already linked)
+   so the build stays identical across MSVC/MinGW header versions. Best-effort:
+   returns FALSE + buf="" on any failure (never affects the launch). */
+static BOOL GmProxyImageNameForPid(DWORD pid, wchar_t* buf, size_t cap) {
+    if (!buf || cap == 0) return FALSE;
+    buf[0] = 0;
+    typedef BOOL (WINAPI *QueryFullProcessImageNameW_t)(HANDLE, DWORD, LPWSTR, PDWORD);
+    static QueryFullProcessImageNameW_t pfn = NULL;
+    if (!pfn) {
+        HMODULE hk = GetModuleHandleW(L"kernel32.dll");
+        if (hk) pfn = (QueryFullProcessImageNameW_t)GetProcAddress(hk, "QueryFullProcessImageNameW");
+    }
+    if (!pfn) return FALSE;
+    HANDLE hp = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!hp) return FALSE;
+    DWORD len = (DWORD)cap;
+    BOOL ok = pfn(hp, 0, buf, &len);
+    CloseHandle(hp);
+    if (ok) {
+        const wchar_t* b = wcsrchr(buf, L'\\');
+        if (b && b != buf) {
+            memmove(buf, b + 1, (wcslen(b + 1) + 1) * sizeof(wchar_t));  /* base name only */
+        }
+    } else {
+        buf[0] = 0;
+    }
+    return ok;
+}
+
+/* Enumerate the processes currently in a Job Object (the child + any descendants
+   it spawned). Used after the child-survival wait to distinguish a launcher/stub
+   that DELEGATED to a surviving grandchild (the real app -- NOT a failure) from a
+   genuine EXIT with no descendant (graceful refusal as SYSTEM, or a crash if the
+   exit code is non-zero). Returns the total process count in the job; *outSurvivors
+   excludes childPid (so after the child exits, *outSurvivors = living grandchildren).
+   *outFirstPid / firstImg capture the first surviving descendant's PID + base name.
+   Best-effort: returns 0 on any failure (caller falls back to exit-code-only class). */
+static DWORD GmProxyEnumerateJobTree(HANDLE hJob, DWORD childPid,
+                                     DWORD* outSurvivors, DWORD* outFirstPid,
+                                     wchar_t* firstImg, size_t imgCap) {
+    if (outSurvivors) *outSurvivors = 0;
+    if (outFirstPid) *outFirstPid = 0;
+    if (firstImg && imgCap) firstImg[0] = 0;
+    if (!hJob) return 0;
+    enum { GM_JOB_MAX_PIDS = 512 };
+    BYTE buf[sizeof(JOBOBJECT_BASIC_PROCESS_ID_LIST) + GM_JOB_MAX_PIDS * sizeof(ULONG_PTR)];
+    ZeroMemory(&buf, sizeof(buf));
+    JOBOBJECT_BASIC_PROCESS_ID_LIST* plist = (JOBOBJECT_BASIC_PROCESS_ID_LIST*)buf;
+    DWORD retLen = 0;
+    BOOL ok = QueryInformationJobObject(hJob, JobObjectBasicProcessIdList, plist, (DWORD)sizeof(buf), &retLen);
+    if (!ok && plist->NumberOfAssignedProcesses == 0) return 0;  /* query failed, no info */
+    DWORD total = plist->NumberOfProcessIdsInList;
+    DWORD survivors = 0;
+    DWORD firstPid = 0;
+    for (DWORD i = 0; i < total; i++) {
+        DWORD pid = (DWORD)plist->ProcessIdList[i];
+        if (pid == 0 || pid == childPid) continue;
+        survivors++;
+        if (firstPid == 0) firstPid = pid;
+    }
+    if (outSurvivors) *outSurvivors = survivors;
+    if (outFirstPid) *outFirstPid = firstPid;
+    if (firstPid && firstImg && imgCap) GmProxyImageNameForPid(firstPid, firstImg, imgCap);
+    return total;
+}
+
+/* Elevation-context logging ("big debug" for the elevator): emit the token
+   source identity (which SYSTEM process donated the token + its session), the
+   token's user SID (confirm S-1-5-18 Local System), token type (primary vs
+   impersonation), elevation, and session, plus the rebuilt command line, the
+   env-block state + byte size, and the IFEO-bypass hardlink target. This catches
+   the ELEVATION-side root cause (wrong token source, non-SYSTEM SID, missing env,
+   bad cmdline) that the child-survival observation alone cannot. Best-effort:
+   every sub-query is guarded so a missing API/permission never affects the
+   launch. Called once after the env block is built, before the CreateProcess
+   attempts. */
+static void GmProxyLogElevationContext(HANDLE hPrimary, DWORD srcPid, DWORD activeSession,
+                                       const wchar_t* cmdLine, const wchar_t* hardlinkPath,
+                                       LPVOID envBlock) {
+    wchar_t srcImg[MAX_PATH] = {0};
+    DWORD srcSess = 0;
+    const wchar_t* srckind = L"none";
+    if (srcPid != 0) {
+        srckind = L"system";
+        GmProxyImageNameForPid(srcPid, srcImg, MAX_PATH);
+        if (!ProcessIdToSessionId(srcPid, &srcSess)) srcSess = 0xFFFFFFFF;
+    }
+    DiagLog(L"[GM-PROXY] ELEVATE: srckind=%ls srcpid=%lu srcsess=%lu srcimg=%ls tgtsess=%lu\n",
+            srckind, (unsigned long)srcPid, (unsigned long)srcSess,
+            srcImg[0] ? srcImg : L"(unknown)", (unsigned long)activeSession);
+    if (hPrimary) {
+        wchar_t sidStr[128] = {0};
+        BYTE tub[256]; DWORD tlen = 0;
+        if (GetTokenInformation(hPrimary, TokenUser, tub, sizeof(tub), &tlen)) {
+            TOKEN_USER* tu = (TOKEN_USER*)tub;
+            LPWSTR sidAlloc = NULL;
+            if (ConvertSidToStringSidW(tu->User.Sid, &sidAlloc) && sidAlloc) {
+                wcsncpy(sidStr, sidAlloc, 127); sidStr[127] = 0;
+                LocalFree(sidAlloc);
+            }
+        }
+        DWORD ttype = 0; DWORD tlen2 = sizeof(ttype);
+        BOOL isPrimary = GetTokenInformation(hPrimary, TokenType, &ttype, sizeof(ttype), &tlen2) && ttype == TokenPrimary;
+        TOKEN_ELEVATION elev = {0}; DWORD elen = sizeof(elev);
+        BOOL isElevated = GetTokenInformation(hPrimary, TokenElevation, &elev, sizeof(elev), &elen) && elev.TokenIsElevated;
+        DWORD tksess = 0; DWORD slen = sizeof(tksess);
+        BOOL tokSessOk = GetTokenInformation(hPrimary, TokenSessionId, &tksess, sizeof(tksess), &slen);
+        DiagLog(L"[GM-PROXY] TOKEN: sid=%ls type=%ls elevated=%lu tksess=%lu\n",
+                sidStr[0] ? sidStr : L"(?)", isPrimary ? L"primary" : L"impersonation",
+                (unsigned long)(isElevated ? 1 : 0), (unsigned long)(tokSessOk ? tksess : 0xFFFFFFFF));
+    } else {
+        DiagLog(L"[GM-PROXY] TOKEN: sid=(none) no SYSTEM token acquired (will degrade to current-user launch)\n");
+    }
+    DiagLog(L"[GM-PROXY] CMDLINE: %ls\n", cmdLine ? cmdLine : L"(null)");
+    DWORD envBytes = 0;
+    if (envBlock) {
+        const wchar_t* p = (const wchar_t*)envBlock;
+        while (*p) { p += wcslen(p) + 1; }
+        envBytes = (DWORD)((p - (const wchar_t*)envBlock + 1) * sizeof(wchar_t));
+    }
+    DiagLog(L"[GM-PROXY] ENV: block=%ls bytes=%lu\n", envBlock ? L"built" : L"null", (unsigned long)envBytes);
+    DiagLog(L"[GM-PROXY] TARGET: hardlink=%ls\n", hardlinkPath ? hardlinkPath : L"(null)");
+}
+
 #define GM_CHILD_OBSERVE_MS 1500  /* child-survival grace window for the per-app launch report */
 
 /* ------------------------------------------------------------------ */
@@ -177,20 +305,30 @@ static void SignalGmProxyFeedback(DWORD pid) {
 /* source pid, injected launch flag, env-block state) so Export-       */
 /* GodModeLogs (menu option [11]) can aggregate a PER-APP LAUNCH       */
 /* REPORT. When a child was actually born (childOk), also observe      */
-/* whether it survived a short grace window via WaitForSingleObject -- */
-/* a child that EXITED within the window is the "launched but          */
-/* instantly died / won't render" signal the user reports per app.     */
-/* The wait returns immediately when the child exits (crash), so a     */
-/* fast-dying app adds ~0 latency; a healthy app keeps gmproxy alive   */
-/* for the window (acceptable for a diagnostic phase). Never blocks    */
-/* the child (the child runs independently; we only hold its handle).  */
+/* whether it survived a short grace window via WaitForSingleObject +  */
+/* a Job-Object tree walk: a child that exits within the window is     */
+/* classified as DELEGATED (it spawned a surviving grandchild -- a     */
+/* launcher/stub like a Desktop Firefox copy or the Win11 notepad      */
+/* stub; the real app opened, NOT a failure) vs EXITED (no surviving   */
+/* descendant -- genuine early exit: exitcode 0 = graceful refusal as  */
+/* SYSTEM, non-zero = class CRASH). ALIVE = the child itself is still  */
+/* running after the window (healthy; tree= counts its descendants).   */
+/* The wait returns immediately when the child exits, so a fast-dying  */
+/* app adds ~0 latency; a healthy app keeps gmproxy alive for the      */
+/* window (acceptable for a diagnostic phase). Never blocks the child  */
+/* (the child runs independently; we only hold its handle + job).      */
 /* Best-effort: logging/observation never affects the launch outcome.  */
+/* hJob is NULL on the REFUSE/FAILED paths (no child) and when the job */
+/* could not be created/assigned (e.g. wine stubs jobs) -- in that     */
+/* case classification falls back to exit-code-only (job=disabled).    */
+/* The caller transfers hJob ownership to this helper on the success   */
+/* path; it is closed exactly once here.                               */
 /* ------------------------------------------------------------------ */
 static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mode,
                                    const wchar_t* injectFlag, BOOL childOk,
                                    LPPROCESS_INFORMATION ppi, LPVOID envBlock,
-                                   DWORD srcPid, DWORD activeSession) {
-    if (!targetPath) return;
+                                   DWORD srcPid, DWORD activeSession, HANDLE hJob) {
+    if (!targetPath) { if (hJob) CloseHandle(hJob); return; }
     const wchar_t* base = wcsrchr(targetPath, L'\\');
     if (base) base++; else base = targetPath;
     const wchar_t* flag = injectFlag ? injectFlag : L"none";
@@ -199,20 +337,45 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
     DiagLog(L"[GM-PROXY] LAUNCH: app=%ls pid=%lu mode=%ls session=%lu srcpid=%lu flag=%ls env=%ls\n",
             base, (unsigned long)pid, mode, (unsigned long)activeSession,
             (unsigned long)srcPid, flag, env);
-    if (!childOk || !ppi || !ppi->hProcess) return;  /* no child to observe (REFUSE / FAILED) */
+    if (!childOk || !ppi || !ppi->hProcess) {  /* no child to observe (REFUSE / FAILED) */
+        if (hJob) CloseHandle(hJob);
+        return;
+    }
     DWORD w = WaitForSingleObject(ppi->hProcess, GM_CHILD_OBSERVE_MS);
     if (w == WAIT_TIMEOUT) {
-        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=ALIVE waited_ms=%lu (mode=%ls)\n",
-                base, (unsigned long)ppi->dwProcessId, (unsigned long)GM_CHILD_OBSERVE_MS, mode);
+        DWORD total = 0, survivors = 0, firstPid = 0;
+        wchar_t firstImg[MAX_PATH] = {0};
+        if (hJob) total = GmProxyEnumerateJobTree(hJob, ppi->dwProcessId, &survivors, &firstPid, firstImg, MAX_PATH);
+        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=ALIVE waited_ms=%lu tree=%lu (mode=%ls)\n",
+                base, (unsigned long)ppi->dwProcessId, (unsigned long)GM_CHILD_OBSERVE_MS,
+                (unsigned long)total, mode);
     } else if (w == WAIT_OBJECT_0) {
         DWORD code = 0;
         GetExitCodeProcess(ppi->hProcess, &code);
-        DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu (mode=%ls) -- early exit / possible crash\n",
-                base, (unsigned long)ppi->dwProcessId, (unsigned long)code, mode);
+        const wchar_t* cls = (code == 0) ? L"CLEAN" : L"CRASH";  /* exitcode 0 = graceful; non-zero = crash */
+        DWORD survivors = 0, firstPid = 0;
+        wchar_t firstImg[MAX_PATH] = {0};
+        if (hJob) (void)GmProxyEnumerateJobTree(hJob, ppi->dwProcessId, &survivors, &firstPid, firstImg, MAX_PATH);
+        if (survivors > 0) {
+            /* The child exited cleanly but left a LIVING descendant: it was a
+               launcher/stub that DELEGATED to the real app (e.g. a Desktop Firefox
+               copy, the Win11 notepad stub). NOT a failure -- the real app opened. */
+            DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=DELEGATED exitcode=%lu treepids=%lu firstgchild=%ls gchildpid=%lu (mode=%ls)\n",
+                    base, (unsigned long)ppi->dwProcessId, (unsigned long)code,
+                    (unsigned long)survivors, firstImg[0] ? firstImg : L"(unknown)",
+                    (unsigned long)firstPid, mode);
+        } else if (hJob) {
+            DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls tree=0 (mode=%ls)\n",
+                    base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
+        } else {
+            DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls job=disabled (mode=%ls)\n",
+                    base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
+        }
     } else {
         DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=UNKNOWN waiterr=%lu (mode=%ls)\n",
                 base, (unsigned long)ppi->dwProcessId, (unsigned long)GetLastError(), mode);
     }
+    if (hJob) CloseHandle(hJob);
 }
 
 /* Resolve the active interactive (console) session id. WTSGetActiveConsoleSessionId
@@ -606,16 +769,26 @@ int wmain(int argc, wchar_t* argv[]) {
         }
     }
 
+    /* Elevation-context logging (big debug for the elevator): token source
+       identity, token SID/type/elevation/session, rebuilt command line, env
+       block state+size, and the IFEO-bypass hardlink target. Catches the
+       ELEVATION-side root cause the child-survival observation cannot. */
+    GmProxyLogElevationContext(hPrimary, srcPid, activeSession, cmdLine, hardlinkPath, envBlock);
+
     BOOL ok = FALSE;
 #ifdef _MSC_VER
     __try {
 #endif
         if (haveToken && cpwt) {
-            ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT, envBlock, NULL, &si, &pi);
+            ok = cpwt(hPrimary, LOGON_WITH_PROFILE, hardlinkPath, cmdLine, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, envBlock, NULL, &si, &pi);
+            if (ok) DiagLog(L"[GM-PROXY] CREATEPROC: method=cpwt result=OK pid=%lu\n", (unsigned long)pi.dwProcessId);
+            else { DWORD e = GetLastError(); DiagLog(L"[GM-PROXY] CREATEPROC: method=cpwt result=FAIL gle=%lu\n", (unsigned long)e); }
         }
         /* Fallback with the same (session-correct) SYSTEM token. */
         if (!ok && haveToken) {
-            ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, envBlock, NULL, &si, &pi);
+            ok = CreateProcessAsUserW(hPrimary, hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, envBlock, NULL, &si, &pi);
+            if (ok) DiagLog(L"[GM-PROXY] CREATEPROC: method=asuser result=OK pid=%lu\n", (unsigned long)pi.dwProcessId);
+            else { DWORD e = GetLastError(); DiagLog(L"[GM-PROXY] CREATEPROC: method=asuser result=FAIL gle=%lu\n", (unsigned long)e); }
         }
 #ifdef _MSC_VER
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -644,15 +817,16 @@ int wmain(int argc, wchar_t* argv[]) {
            available there. */
         if (mySessionIsZero) {
             DiagLog(L"[GM-PROXY] REFUSE: gmproxy is in Session %lu with no session-correct SYSTEM token; aborting to avoid ownerless Session-0 birth (would inherit Session 0, blank User column).\n", mySession);
-            GmProxyLogLaunchReport(argv[1], L"REFUSE", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession);
+            GmProxyLogLaunchReport(argv[1], L"REFUSE", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession, NULL);
             DeleteFileW(hardlinkPath);
             HeapFree(GetProcessHeap(), 0, cmdLine);
             if (envBlock) DestroyEnvironmentBlock(envBlock);
             if (hPrimary) CloseHandle(hPrimary);
             return 1;
         }
-        ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, NULL, &si, &pi);
+        ok = CreateProcessW(hardlinkPath, cmdLine, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED, NULL, NULL, &si, &pi);
         if (ok) {
+            DiagLog(L"[GM-PROXY] CREATEPROC: method=currentuser result=OK pid=%lu\n", (unsigned long)pi.dwProcessId);
             DiagLog(L"[GM-PROXY] Launched %ls as current user (graceful fallback, PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
             /* Hand the PID to the God Mode monitor so it can elevate this process
                IN PLACE (token replacement) instead of the 15s periodic scan
@@ -660,6 +834,9 @@ int wmain(int argc, wchar_t* argv[]) {
                if no monitor is listening, the periodic scan remains a fallback. */
             SignalGmProxyFeedback(pi.dwProcessId);
             DiagLog(L"[GM-PROXY] Handed PID %lu to monitor via GodMode-GmProxyFeedback for in-place elevation.\n", pi.dwProcessId);
+        } else {
+            DWORD e = GetLastError();
+            DiagLog(L"[GM-PROXY] CREATEPROC: method=currentuser result=FAIL gle=%lu\n", (unsigned long)e);
         }
     }
 
@@ -668,7 +845,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     if (!ok) {
         DiagLog(L"[GM-PROXY] ERROR: launch failed (token path + current-user fallback). GLE=%lu\n", GetLastError());
-        GmProxyLogLaunchReport(argv[1], L"FAILED", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession);
+        GmProxyLogLaunchReport(argv[1], L"FAILED", injectFlag, FALSE, NULL, envBlock, srcPid, activeSession, NULL);
         HeapFree(GetProcessHeap(), 0, cmdLine);
         if (envBlock) DestroyEnvironmentBlock(envBlock);
         if (hPrimary) CloseHandle(hPrimary);
@@ -679,13 +856,43 @@ int wmain(int argc, wchar_t* argv[]) {
         DiagLog(L"[GM-PROXY] SUCCESS: Launched %ls as SYSTEM (PID=%lu, session=%lu).\n", argv[1], pi.dwProcessId, activeSession);   /* %ls: wide argv[1] */
     }
 
+    /* Root-cause observation: capture the child's whole process tree in a Job
+       Object so that when a launcher/stub child (a Desktop Firefox copy, the
+       Win11 notepad stub) exits cleanly (exitcode 0) the launch report can tell
+       whether it DELEGATED to a surviving grandchild (the real app -- NOT a
+       failure) vs genuinely EXITED with no descendant (graceful refusal as
+       SYSTEM, or a crash if exitcode != 0). CREATE_SUSPENDED (set on every
+       CreateProcess above) lets us assign the child to the job BEFORE it runs so
+       no grandchild escapes the tree. JOB_OBJECT_LIMIT_BREAKAWAY_OK keeps the job
+       from breaking a child that spawns with CREATE_BREAKAWAY_FROM_JOB. No
+       KILL_ON_JOB_CLOSE: we NEVER want to kill the user's real app when gmproxy
+       exits -- the job is purely observational. If job creation/assignment fails
+       (e.g. wine stubs jobs, or gmproxy is already in a non-breakaway job),
+       hJob is set NULL and classification falls back to exit-code-only. The job
+       handle is transferred to GmProxyLogLaunchReport (closed exactly once
+       there). The child was CREATE_SUSPENDED, so resume its main thread now. */
+    HANDLE hJob = CreateJobObjectW(NULL, NULL);
+    if (hJob) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION eli = {0};
+        eli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        SetInformationJobObject(hJob, JobObjectExtendedLimitInformation, &eli, sizeof(eli));  /* best-effort */
+        if (!AssignProcessToJobObject(hJob, pi.hProcess)) {
+            DiagLog(L"[GM-PROXY] INFO: AssignProcessToJobObject failed (GLE=%lu); grandchild tree observation disabled (exit-code-only classification).\n", (unsigned long)GetLastError());
+            CloseHandle(hJob);
+            hJob = NULL;
+        }
+    } else {
+        DiagLog(L"[GM-PROXY] INFO: CreateJobObjectW failed (GLE=%lu); grandchild tree observation disabled.\n", (unsigned long)GetLastError());
+    }
+    ResumeThread(pi.hThread);  /* child was CREATE_SUSPENDED so the job captured it before it ran */
+
     /* Per-app launch telemetry + child-survival observation (big debug for the
        Export-GodModeLogs option [11] PER-APP LAUNCH REPORT). Must run BEFORE
        CloseHandle(pi.hProcess) -- the observation WaitForSingleObject's the
        child handle. The wait returns immediately when the child exits (crash),
        so a fast-dying app adds ~0 latency; a healthy app keeps gmproxy alive
        for the grace window (acceptable for a diagnostic phase). */
-    GmProxyLogLaunchReport(argv[1], haveToken ? L"SYSTEM" : L"FALLBACK", injectFlag, TRUE, &pi, envBlock, srcPid, activeSession);
+    GmProxyLogLaunchReport(argv[1], haveToken ? L"SYSTEM" : L"FALLBACK", injectFlag, TRUE, &pi, envBlock, srcPid, activeSession, hJob);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);

@@ -3450,12 +3450,14 @@ function Export-GodModeLogs {
             try {
                 $launchLines = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] LAUNCH: ' -ErrorAction SilentlyContinue)
                 $childLines  = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] CHILD-STATUS: ' -ErrorAction SilentlyContinue)
+                # DELEGATED = the child exited cleanly (exitcode 0) but left a surviving
+                # grandchild (a launcher/stub delegated to the real app -- NOT a failure).
                 $report = @{}
                 foreach ($l in $launchLines) {
                     if ($l.Line -match 'app=(.+?) pid=\d+ mode=(\w+) ') {
                         $app = $matches[1].Trim(); $mode = $matches[2]
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; EXITED=0; UNKNOWN=0 }
                         }
                         $report[$app].Launches++
                         if ($report[$app].ContainsKey($mode)) { $report[$app][$mode]++ }
@@ -3465,7 +3467,7 @@ function Export-GodModeLogs {
                     if ($c.Line -match 'app=(.+?) pid=\d+ result=(\w+)') {
                         $app = $matches[1].Trim(); $res = $matches[2]
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; EXITED=0; UNKNOWN=0 }
                         }
                         if ($report[$app].ContainsKey($res)) { $report[$app][$res]++ }
                     }
@@ -3473,16 +3475,47 @@ function Export-GodModeLogs {
                 if ($report.Count -eq 0) {
                     $LogContent += "`r`n[No gmproxy LAUNCH/CHILD-STATUS entries yet -- no IFEO launches recorded]"
                 } else {
-                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  EXITED(crash?)"
-                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  -------------"
+                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)"
+                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------"
                     foreach ($app in ($report.Keys | Sort-Object)) {
                         $r = $report[$app]
-                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.EXITED)
+                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED)
                     }
-                    $LogContent += "`r`nNOTE: EXITED = the child process exited within ~1.5s of launch (early exit /"
-                    $LogContent += "`r`n      possible crash / won't render). ALIVE = still running after the grace"
-                    $LogContent += "`r`n      window (healthy launch). Report the per-app EXITED counts so the IFEO"
+                    $LogContent += "`r`nNOTE: ALIVE = child still running after the grace window (healthy)."
+                    $LogContent += "`r`n      DELEGATED = the child exited cleanly (exitcode 0) but left a surviving"
+                    $LogContent += "`r`n      grandchild -- it was a launcher/stub (Desktop Firefox copy, Win11"
+                    $LogContent += "`r`n      notepad stub) and the REAL app opened (NOT a failure)."
+                    $LogContent += "`r`n      EXITED = the child process exited within ~1.5s with no surviving"
+                    $LogContent += "`r`n      descendant. class=CLEAN (exitcode 0) = graceful refusal as SYSTEM;"
+                    $LogContent += "`r`n      class=CRASH (exitcode != 0) = the app crashed as SYSTEM."
+                    $LogContent += "`r`n      Report the per-app EXITED(class=CRASH) counts so the IFEO"
                     $LogContent += "`r`n      exclusion can be scoped to exactly the apps that break as SYSTEM."
+                }
+                # --- ELEVATION FAULTS (root-cause): parse the [GM-PROXY] CREATEPROC:
+                #     result=FAIL lines (which CreateProcess method failed + gle) and the
+                #     ELEVATE: srckind=none line (no SYSTEM token acquired) so the user
+                #     can report the ELEVATION-side root cause alongside the per-app
+                #     launch report. The ELEVATE/TOKEN/CMDLINE/ENV/TARGET context lines
+                #     (logged once per gmproxy run) are in the raw GM-PROXY DIAGNOSTIC
+                #     LOG dump above; this section surfaces just the FAULTS for scanning.
+                $LogContent += "`r`n----- ELEVATION FAULTS (root-cause) -----"
+                $gmFaultCount = 0
+                try {
+                    $createFailLines = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] CREATEPROC: .*result=FAIL' -ErrorAction SilentlyContinue)
+                    $noTokenLines   = @(Select-String -Path $GmProxyDiagLog -Pattern '^\[GM-PROXY\] ELEVATE: srckind=none' -ErrorAction SilentlyContinue)
+                    foreach ($f in $createFailLines) {
+                        $LogContent += "`r`n  $($f.Line.Trim())"
+                        $gmFaultCount++
+                    }
+                    foreach ($n in $noTokenLines) {
+                        $LogContent += "`r`n  $($n.Line.Trim())"
+                        $gmFaultCount++
+                    }
+                } catch {
+                    $LogContent += "`r`n[Error parsing elevation faults: $_]"
+                }
+                if ($gmFaultCount -eq 0) {
+                    $LogContent += "`r`n  [No elevation faults recorded -- all CreateProcess attempts succeeded + a SYSTEM token was acquired]"
                 }
             } catch {
                 $LogContent += "`r`n[Error building per-app launch report: $_]"

@@ -116,6 +116,37 @@ grep -qF '[GM-PROXY] LAUNCH:' "$SRC" && record "src: [GM-PROXY] LAUNCH: structur
 grep -qF '[GM-PROXY] CHILD-STATUS:' "$SRC" && record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 1 || record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 0 "not found"
 grep -qF 'WaitForSingleObject' "$SRC" && record "src: WaitForSingleObject child-survival wait present" 1 || record "src: WaitForSingleObject child-survival wait present" 0 "not found"
 
+# Grandchild-tree Job observation + elevation-context logging (root-cause debug):
+# gmproxy now creates the child CREATE_SUSPENDED, assigns it to a Job Object
+# (BREAKAWAY_OK, NO KILL_ON_JOB_CLOSE so the user's real app is never killed),
+# resumes it, and walks the job tree after the wait to classify a launcher/stub
+# that DELEGATED to a surviving grandchild (NOT a failure) vs a genuine EXIT
+# (class=CLEAN exitcode 0 = graceful refusal as SYSTEM / class=CRASH non-zero).
+# Elevation-context logging (ELEVATE/TOKEN/CMDLINE/ENV + per-attempt CREATEPROC
+# result=OK/FAIL gle) catches the ELEVATION-side root cause. The MinGW build
+# below must still compile with all this new code.
+grep -qF 'sddl.h' "$SRC" && record "src: #include <sddl.h> present (ConvertSidToStringSidW token SID logging)" 1 || record "src: #include <sddl.h> present (ConvertSidToStringSidW token SID logging)" 0 "not found"
+grep -qF 'GmProxyImageNameForPid' "$SRC" && record "src: GmProxyImageNameForPid helper present (resolve a PID's image base name)" 1 || record "src: GmProxyImageNameForPid helper present (resolve a PID's image base name)" 0 "not found"
+grep -qF 'QueryFullProcessImageNameW' "$SRC" && record "src: QueryFullProcessImageNameW dynamic load present" 1 || record "src: QueryFullProcessImageNameW dynamic load present" 0 "not found"
+grep -qF 'GmProxyEnumerateJobTree' "$SRC" && record "src: GmProxyEnumerateJobTree helper present (walk the job process list)" 1 || record "src: GmProxyEnumerateJobTree helper present (walk the job process list)" 0 "not found"
+grep -qF 'JobObjectBasicProcessIdList' "$SRC" && record "src: JobObjectBasicProcessIdList query present (job tree enumeration)" 1 || record "src: JobObjectBasicProcessIdList query present (job tree enumeration)" 0 "not found"
+grep -qF 'GmProxyLogElevationContext' "$SRC" && record "src: GmProxyLogElevationContext helper present (token/cmdline/env context log)" 1 || record "src: GmProxyLogElevationContext helper present (token/cmdline/env context log)" 0 "not found"
+grep -qF 'ConvertSidToStringSidW' "$SRC" && record "src: ConvertSidToStringSidW present (token SID -> S-1-5-18 confirm)" 1 || record "src: ConvertSidToStringSidW present (token SID -> S-1-5-18 confirm)" 0 "not found"
+grep -qF '[GM-PROXY] ELEVATE:' "$SRC" && record "src: [GM-PROXY] ELEVATE: token-source context line present" 1 || record "src: [GM-PROXY] ELEVATE: token-source context line present" 0 "not found"
+grep -qF '[GM-PROXY] TOKEN:' "$SRC" && record "src: [GM-PROXY] TOKEN: sid/type/elevated/session context line present" 1 || record "src: [GM-PROXY] TOKEN: sid/type/elevated/session context line present" 0 "not found"
+grep -qF '[GM-PROXY] CMDLINE:' "$SRC" && record "src: [GM-PROXY] CMDLINE: rebuilt command line context line present" 1 || record "src: [GM-PROXY] CMDLINE: rebuilt command line context line present" 0 "not found"
+grep -qF '[GM-PROXY] ENV:' "$SRC" && record "src: [GM-PROXY] ENV: env-block state+bytes context line present" 1 || record "src: [GM-PROXY] ENV: env-block state+bytes context line present" 0 "not found"
+grep -qF '[GM-PROXY] CREATEPROC:' "$SRC" && record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present (method/result/gle)" 1 || record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present (method/result/gle)" 0 "not found"
+grep -qF 'CREATE_SUSPENDED' "$SRC" && record "src: CREATE_SUSPENDED present (child suspended before job assign)" 1 || record "src: CREATE_SUSPENDED present (child suspended before job assign)" 0 "not found"
+grep -qF 'CreateJobObjectW' "$SRC" && record "src: CreateJobObjectW present (observational job)" 1 || record "src: CreateJobObjectW present (observational job)" 0 "not found"
+grep -qF 'AssignProcessToJobObject' "$SRC" && record "src: AssignProcessToJobObject present (child -> job)" 1 || record "src: AssignProcessToJobObject present (child -> job)" 0 "not found"
+grep -qF 'JOB_OBJECT_LIMIT_BREAKAWAY_OK' "$SRC" && record "src: JOB_OBJECT_LIMIT_BREAKAWAY_OK present (no breakaway failure)" 1 || record "src: JOB_OBJECT_LIMIT_BREAKAWAY_OK present (no breakaway failure)" 0 "not found"
+grep -qF 'ResumeThread' "$SRC" && record "src: ResumeThread present (resume suspended child after job assign)" 1 || record "src: ResumeThread present (resume suspended child after job assign)" 0 "not found"
+grep -qF 'result=DELEGATED' "$SRC" && record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 1 || record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 0 "not found"
+grep -qF 'class=%ls' "$SRC" && record "src: class=CLEAN/CRASH classification present (exit-code class)" 1 || record "src: class=CLEAN/CRASH classification present (exit-code class)" 0 "not found"
+grep -qF 'L"CLEAN"' "$SRC" && record "src: L\"CLEAN\" literal present (exitcode 0 = graceful)" 1 || record "src: L\"CLEAN\" literal present (exitcode 0 = graceful)" 0 "not found"
+grep -qF 'L"CRASH"' "$SRC" && record "src: L\"CRASH\" literal present (exitcode != 0 = crash)" 1 || record "src: L\"CRASH\" literal present (exitcode != 0 = crash)" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

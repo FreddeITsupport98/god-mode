@@ -101,6 +101,26 @@ grep -qF -- '-no-remote' "$SRC" && record "src: -no-remote flag present (Firefox
 grep -qF 'GmProxyLogLaunchReport' "$SRC" && record "src: GmProxyLogLaunchReport per-app telemetry helper present" 1 || record "src: GmProxyLogLaunchReport per-app telemetry helper present" 0 "not found"
 grep -qF '[GM-PROXY] LAUNCH:' "$SRC" && record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 1 || record "src: [GM-PROXY] LAUNCH: structured telemetry line present" 0 "not found"
 grep -qF '[GM-PROXY] CHILD-STATUS:' "$SRC" && record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 1 || record "src: [GM-PROXY] CHILD-STATUS: child-survival observation line present" 0 "not found"
+# Grandchild-tree Job observation + elevation-context logging (root-cause debug):
+# gmproxy now captures the child's whole process tree in a Job Object (CREATE_
+# SUSPENDED -> AssignProcessToJobObject -> ResumeThread, BREAKAWAY_OK, NO
+# KILL_ON_JOB_CLOSE) and classifies a clean exit with a surviving grandchild as
+# result=DELEGATED (launcher/stub, NOT a failure) vs result=EXITED class=CLEAN
+# (exitcode 0, graceful refusal) / class=CRASH (non-zero). Elevation-context
+# logging (ELEVATE/TOKEN/CMDLINE/ENV + CREATEPROC result=OK/FAIL gle) catches the
+# ELEVATION-side root cause. The NORMAL + FORCED builds below must link + run.
+grep -qF 'sddl.h' "$SRC" && record "src: #include <sddl.h> present (token SID logging)" 1 || record "src: #include <sddl.h> present (token SID logging)" 0 "not found"
+grep -qF 'GmProxyImageNameForPid' "$SRC" && record "src: GmProxyImageNameForPid helper present" 1 || record "src: GmProxyImageNameForPid helper present" 0 "not found"
+grep -qF 'GmProxyEnumerateJobTree' "$SRC" && record "src: GmProxyEnumerateJobTree helper present (job tree walk)" 1 || record "src: GmProxyEnumerateJobTree helper present (job tree walk)" 0 "not found"
+grep -qF 'GmProxyLogElevationContext' "$SRC" && record "src: GmProxyLogElevationContext helper present (elevation context log)" 1 || record "src: GmProxyLogElevationContext helper present (elevation context log)" 0 "not found"
+grep -qF 'CreateJobObjectW' "$SRC" && record "src: CreateJobObjectW present (observational job)" 1 || record "src: CreateJobObjectW present (observational job)" 0 "not found"
+grep -qF 'AssignProcessToJobObject' "$SRC" && record "src: AssignProcessToJobObject present (child -> job)" 1 || record "src: AssignProcessToJobObject present (child -> job)" 0 "not found"
+grep -qF 'CREATE_SUSPENDED' "$SRC" && record "src: CREATE_SUSPENDED present (child suspended before job assign)" 1 || record "src: CREATE_SUSPENDED present (child suspended before job assign)" 0 "not found"
+grep -qF 'ResumeThread' "$SRC" && record "src: ResumeThread present (resume after job assign)" 1 || record "src: ResumeThread present (resume after job assign)" 0 "not found"
+grep -qF '[GM-PROXY] ELEVATE:' "$SRC" && record "src: [GM-PROXY] ELEVATE: token-source context line present" 1 || record "src: [GM-PROXY] ELEVATE: token-source context line present" 0 "not found"
+grep -qF '[GM-PROXY] CREATEPROC:' "$SRC" && record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present" 1 || record "src: [GM-PROXY] CREATEPROC: per-attempt outcome line present" 0 "not found"
+grep -qF 'result=DELEGATED' "$SRC" && record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 1 || record "src: result=DELEGATED classification present (launcher/stub -> grandchild)" 0 "not found"
+grep -qF 'class=%ls' "$SRC" && record "src: class=CLEAN/CRASH classification present (exit-code class)" 1 || record "src: class=CLEAN/CRASH classification present (exit-code class)" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.
@@ -208,6 +228,24 @@ if [ -n "$NORMAL" ] && [ -n "$DUMMY" ]; then
     case "$RUN_LOG" in
         *"result=EXITED"*) record "NORMAL: gmproxy.log shows result=EXITED (dummy exited fast, crash-signal path exercised)" 1 ;;
         *) record "NORMAL: gmproxy.log shows result=EXITED (dummy exited fast, crash-signal path exercised)" 0 "gmproxy.log missing result=EXITED" ;;
+    esac
+    # New root-cause classification: the dummy exits with exitcode 0 -> the
+    # CHILD-STATUS line must carry class=CLEAN (graceful, not a crash). Proves the
+    # new CLEAN/CRASH exit-code classification fires at runtime under wine.
+    case "$RUN_LOG" in
+        *"class=CLEAN"*) record "NORMAL: gmproxy.log shows class=CLEAN (exitcode 0 = graceful, not a crash)" 1 ;;
+        *) record "NORMAL: gmproxy.log shows class=CLEAN (exitcode 0 = graceful, not a crash)" 0 "gmproxy.log missing class=CLEAN -- new exit-code classification did not fire" ;;
+    esac
+    # Per-attempt CreateProcess outcome logging + elevation-context logging must
+    # fire at runtime (the NORMAL build takes the current-user fallback, so a
+    # CREATEPROC method=currentuser result=OK line + ELEVATE context line appear).
+    case "$RUN_LOG" in
+        *"[GM-PROXY] CREATEPROC:"*) record "NORMAL: gmproxy.log shows [GM-PROXY] CREATEPROC: per-attempt outcome line" 1 ;;
+        *) record "NORMAL: gmproxy.log shows [GM-PROXY] CREATEPROC: per-attempt outcome line" 0 "gmproxy.log missing the CREATEPROC line -- per-attempt outcome logging did not fire" ;;
+    esac
+    case "$RUN_LOG" in
+        *"[GM-PROXY] ELEVATE:"*) record "NORMAL: gmproxy.log shows [GM-PROXY] ELEVATE: elevation-context line" 1 ;;
+        *) record "NORMAL: gmproxy.log shows [GM-PROXY] ELEVATE: elevation-context line" 0 "gmproxy.log missing the ELEVATE context line -- elevation-context logging did not fire" ;;
     esac
 fi
 
