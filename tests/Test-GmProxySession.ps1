@@ -220,8 +220,8 @@ Add-Assertion "gmhook.c: build stamp mirrored to OutputDebugStringW (live DebugV
 Add-Assertion "gmhook.c: build stamp mutex-serialized (CreateMutexW + GodMode_GmHookLog, no DllMain block)" ($gmhook -match 'CreateMutexW' -and $gmhook -match 'GodMode_GmHookLog') "gmhook.c build stamp not mutex-serialized -- concurrent attaches could corrupt gmhook.log"
 Add-Assertion "gmhook.c: DllMain calls GmHookWriteBuildStamp on DLL_PROCESS_ATTACH" ($gmhook -match 'GmHookWriteBuildStamp\s*\(\s*\)') "DllMain does not call GmHookWriteBuildStamp on attach"
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs has GM BUILD VERSIONS section" ($gm -match 'GM BUILD VERSIONS') "Export-GodModeLogs does not have a GM BUILD VERSIONS section"
-Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-PROXY BUILD stamp" ($gm -match "Select-String[\s\S]{0,80}?GM-PROXY BUILD") "Export-GodModeLogs does not extract the last GM-PROXY BUILD stamp"
-Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last GM-HOOK BUILD stamp" ($gm -match "Select-String[\s\S]{0,80}?GM-HOOK BUILD") "Export-GodModeLogs does not extract the last GM-HOOK BUILD stamp"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last [GM-PROXY] BUILD stamp (escaped bracket)" ($gm -match 'Select-String[\s\S]{0,80}?\\\[GM-PROXY\\\]\s+BUILD') "Export-GodModeLogs does not extract the last [GM-PROXY] BUILD stamp -- the unescaped 'GM-PROXY BUILD' pattern never matches the real '[GM-PROXY] BUILD' log line (the ']' breaks it) -> always '[not yet logged]'"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs extracts last [GM-HOOK] BUILD stamp (escaped bracket)" ($gm -match 'Select-String[\s\S]{0,80}?\\\[GM-HOOK\\\]\s+BUILD') "Export-GodModeLogs does not extract the last [GM-HOOK] BUILD stamp -- the unescaped 'GM-HOOK BUILD' pattern never matches the real '[GM-HOOK] BUILD' log line (the ']' breaks it) -> always '[not yet logged]'"
 Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs reads gmhook.log from TEMP" ($gm -match 'Join-Path[\s\S]{0,40}?gmhook\.log') "Export-GodModeLogs does not read gmhook.log"
 Add-Assertion "God-Mode-Windows.ps1: Uninstall-ProcessHook removes gmhook.log (uninstaller kept current)" ($gm -match 'function\s+Uninstall-ProcessHook[\s\S]{0,4000}?gmhook\.log') "Uninstall-ProcessHook does not remove gmhook.log -- uninstaller not kept current with the new diagnostic log"
 
@@ -433,7 +433,7 @@ Add-Assertion "God-Mode-Windows.ps1: SYSTEM-temp candidates include the systempr
 Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths aggregates admin-temp + SYSTEM-temp logs" ($gm -match 'GmProxyDiagPaths') "Export-GodModeLogs does not aggregate admin-temp + SYSTEM-temp into GmProxyDiagPaths -- the nested gmproxy's lines are never scanned"
 Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths starts empty + appends existing admin-temp log" ($gm -match '\$GmProxyDiagPaths\s*=\s*@\(\)') "Export-GodModeLogs GmProxyDiagPaths is not initialized empty -- a stale or null array could corrupt the report"
 Add-Assertion "God-Mode-Windows.ps1: GmProxyDiagPaths appends existing SYSTEM-temp candidates (Test-Path guarded)" ($gm -match 'foreach\s*\(\$p\s+in\s*\$GmProxySystemDiagCandidates\)\s*\{\s*if\s*\(\s*Test-Path\s+\$p\s*\)\s*\{\s*\$GmProxyDiagPaths\s*\+=\s*\$p') "Export-GodModeLogs does not append existing SYSTEM-temp candidates to GmProxyDiagPaths -- missing paths would be scanned (error) or existing paths skipped"
-Add-Assertion "God-Mode-Windows.ps1: GM-PROXY BUILD extraction scans GmProxyDiagPaths (not just admin-temp)" ($gm -match 'Select-String\s*-Path\s+\$GmProxyDiagPaths[\s\S]{0,80}?GM-PROXY\s+BUILD') "Export-GodModeLogs GM-PROXY BUILD extraction does not scan GmProxyDiagPaths -- a nested SYSTEM gmproxy's newer BUILD stamp (different binary/deploy) would be invisible"
+Add-Assertion "God-Mode-Windows.ps1: GM-PROXY BUILD extraction scans GmProxyDiagPaths (not just admin-temp)" ($gm -match 'Select-String\s*-Path\s+\$GmProxyDiagPaths[\s\S]{0,80}?\\\[GM-PROXY\\\]\s+BUILD') "Export-GodModeLogs GM-PROXY BUILD extraction does not scan GmProxyDiagPaths -- a nested SYSTEM gmproxy's newer BUILD stamp (different binary/deploy) would be invisible"
 Add-Assertion "God-Mode-Windows.ps1: DIAGNOSTIC LOG dumps each SYSTEM-temp candidate under its own source header" ($gm -match 'foreach\s*\(\$p\s+in\s*\$GmProxySystemDiagCandidates\)[\s\S]{0,160}?Source:\s*\$p') "Export-GodModeLogs does not dump SYSTEM-temp candidates under per-source headers -- nested gmproxy BUILD/ELEVATE/CHILD-STATUS lines would not be visible"
 Add-Assertion "God-Mode-Windows.ps1: PER-APP report scans GmProxyDiagPaths (nested gmproxy lines aggregated)" ($gm -match 'Select-String\s*-Path\s*\$GmProxyDiagPaths[\s\S]{0,80}?LAUNCH:') "Export-GodModeLogs PER-APP report does not scan GmProxyDiagPaths -- the nested gmproxy's LAUNCH lines are not aggregated"
 Add-Assertion "God-Mode-Windows.ps1: per-app report hashtable has a DELEGATEDRECUR key" ($gm -match 'DELEGATED=0;\s*DELEGATEDRECUR=0') "Export-GodModeLogs per-app hashtable lacks the DELEGATEDRECUR key -- recur=yes launches cannot be counted"
@@ -449,5 +449,30 @@ Add-Assertion "God-Mode-Windows.ps1: missing-log else branch lists the SYSTEM-te
 Add-Assertion "God-Mode-Windows.ps1: NOTE keeps 'EXITED = the child process exited within' (additive edit guard)" ($gm -match 'EXITED = the child process exited within') "Export-GodModeLogs NOTE lost 'EXITED = the child process exited within' -- additive edit regressed section 20"
 Add-Assertion "God-Mode-Windows.ps1: NOTE keeps 'exclusion can be scoped' (additive edit guard)" ($gm -match 'exclusion can be scoped') "Export-GodModeLogs NOTE lost 'exclusion can be scoped' -- additive edit regressed section 20"
 Add-Assertion "God-Mode-Windows.ps1: table header keeps 'DELEGATED  EXITED(crash?)' (additive edit guard)" ($gm -match 'DELEGATED  EXITED\(crash\?\)') "Export-GodModeLogs table header lost 'DELEGATED  EXITED(crash?)' -- additive edit regressed section 21"
+
+# --- 23. gmproxy.c: cross-process gmproxy.log write serialization (concurrent-write corruption fix) ---
+# Live VM data (option [11] dump) revealed the SYSTEM-temp gmproxy.log was CORRUPTED with partial
+# lines ('dater.exe' / 'YSTEM session=...' / a lone 'system') whenever GoogleUpdater spawned many
+# updater.exe CONCURRENTLY as SYSTEM -- every nested gmproxy wrote the SAME log via _wfopen append
+# + vfwprintf + fflush, and the C runtime append mode is seek-then-write, so the seeks raced across
+# processes and overwrote each other mid-line. Fix: a Global named mutex (NULL DACL so the admin
+# user-session gmproxy AND the SYSTEM nested gmproxy can both open it -- a default-DACL mutex created
+# by one privilege level can deny the other, which would leave the SYSTEM-temp log un-serialized) is
+# acquired in DiagLog around GmProxyDiagLogOpen+vfwprintf+fflush and released after, so every line
+# lands atomically at the true end-of-file. Bounded 2000ms wait so a stuck holder never stalls a
+# launch; WAIT_ABANDONED (crashed holder) is tolerated (best-effort log). stderr is per-process and
+# stays outside the mutex; the mutex is never held across the ~1.5s child observation wait. Mirrors
+# gmhook.c's GodMode_GmHookLog try-lock but adds the NULL DACL + Global namespace for the cross-
+# privilege gmproxy case.
+Add-Assertion "gmproxy.c: g_GmProxyDiagMutex handle global present (cross-process log serializer)" ($proxy -match 'g_GmProxyDiagMutex') "gmproxy.c g_GmProxyDiagMutex missing -- concurrent gmproxy.log writes are not serialized"
+Add-Assertion "gmproxy.c: GmProxyDiagMutexAcquire helper defined" ($proxy -match 'static HANDLE GmProxyDiagMutexAcquire') "gmproxy.c GmProxyDiagMutexAcquire missing -- cannot take the log mutex"
+Add-Assertion "gmproxy.c: GmProxyDiagMutexRelease helper defined" ($proxy -match 'static void GmProxyDiagMutexRelease') "gmproxy.c GmProxyDiagMutexRelease missing -- cannot release the log mutex"
+Add-Assertion "gmproxy.c: Global named mutex GmProxyDiagLogMutex (shared admin + SYSTEM)" ($proxy -match 'GmProxyDiagLogMutex' -and $proxy -match 'Global named mutex') "gmproxy.c Global GmProxyDiagLogMutex missing -- admin + SYSTEM gmproxy would not share one mutex"
+Add-Assertion "gmproxy.c: NULL DACL via SetSecurityDescriptorDacl + InitializeSecurityDescriptor (admin + SYSTEM both open)" ($proxy -match 'SetSecurityDescriptorDacl' -and $proxy -match 'InitializeSecurityDescriptor') "gmproxy.c NULL DACL missing -- a default-DACL mutex could deny the other privilege level (SYSTEM-temp log un-serialized)"
+Add-Assertion "gmproxy.c: bounded wait GM_DIAG_LOG_MUTEX_TIMEOUT_MS (never stall a launch)" ($proxy -match 'GM_DIAG_LOG_MUTEX_TIMEOUT_MS') "gmproxy.c GM_DIAG_LOG_MUTEX_TIMEOUT_MS missing -- a stuck mutex holder could stall the launch path"
+Add-Assertion "gmproxy.c: DiagLog acquires the mutex around the file write (hMutex = GmProxyDiagMutexAcquire)" ($proxy -match 'hMutex = GmProxyDiagMutexAcquire') "gmproxy.c DiagLog does not acquire the mutex -- concurrent writes still race"
+Add-Assertion "gmproxy.c: DiagLog releases the mutex only when acquired (if hMutex GmProxyDiagMutexRelease)" ($proxy -match 'if \(hMutex\) GmProxyDiagMutexRelease') "gmproxy.c DiagLog does not guard the release on hMutex -- would release an un-acquired mutex (handle leak / error)"
+Add-Assertion "gmproxy.c: WAIT_ABANDONED tolerated (crashed holder does not block logging)" ($proxy -match 'WAIT_ABANDONED') "gmproxy.c WAIT_ABANDONED not handled -- a crashed gmproxy holding the mutex would block all other instances's logging"
+Add-Assertion "gmproxy.c: default-DACL fallback CreateMutexW (security-API failure never blocks logging)" ($proxy -match 'Fall back to default-DACL') "gmproxy.c default-DACL fallback missing -- an InitializeSecurityDescriptor/SetSecurityDescriptorDacl failure would leave no mutex at all"
 
 Write-Summary

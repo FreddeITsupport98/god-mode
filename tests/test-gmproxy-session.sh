@@ -154,6 +154,20 @@ grep -qF 'L"CRASH"' "$SRC" && record "src: L\"CRASH\" literal present (exitcode 
 grep -qF 'recur=%ls' "$SRC" && record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 1 || record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 0 "not found"
 grep -qF '_wcsicmp(firstImg, L"gmproxy.exe")' "$SRC" && record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 1 || record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 0 "not found"
 
+# Concurrent gmproxy.log write serialization (root-cause debug): concurrent gmproxy.exe instances
+# (GoogleUpdater spawning many updater.exe at once as SYSTEM) all write the SAME gmproxy.log via
+# _wfopen append + vfwprintf + fflush; the C runtime append mode is seek-then-write, which races
+# across processes and interleaves PARTIAL lines (the 'dater.exe' / 'YSTEM session=...' garbage in
+# the SYSTEM-temp log). A Global named mutex (NULL DACL so admin + SYSTEM both open it; bounded
+# 2000ms wait; WAIT_ABANDONED tolerated) serializes each write so every line lands atomically at
+# the true end-of-file. The MinGW build below must still compile with this new code.
+grep -qF 'GmProxyDiagMutexAcquire' "$SRC" && record "src: GmProxyDiagMutexAcquire helper present (cross-process log serializer)" 1 || record "src: GmProxyDiagMutexAcquire helper present (cross-process log serializer)" 0 "not found"
+grep -qF 'GmProxyDiagMutexRelease' "$SRC" && record "src: GmProxyDiagMutexRelease helper present" 1 || record "src: GmProxyDiagMutexRelease helper present" 0 "not found"
+grep -qF 'GmProxyDiagLogMutex' "$SRC" && record "src: Global GmProxyDiagLogMutex name present (shared admin + SYSTEM)" 1 || record "src: Global GmProxyDiagLogMutex name present (shared admin + SYSTEM)" 0 "not found"
+grep -qF 'SetSecurityDescriptorDacl' "$SRC" && record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 1 || record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 0 "not found"
+grep -qF 'GM_DIAG_LOG_MUTEX_TIMEOUT_MS' "$SRC" && record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 1 || record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 0 "not found"
+grep -qF 'WAIT_ABANDONED' "$SRC" && record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 1 || record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

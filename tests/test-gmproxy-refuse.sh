@@ -130,6 +130,20 @@ grep -qF 'class=%ls' "$SRC" && record "src: class=CLEAN/CRASH classification pre
 # before delegation, so recur only appears on the DELEGATED line -- wine unaffected.
 grep -qF 'recur=%ls' "$SRC" && record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 1 || record "src: recur=%ls tag present on DELEGATED line (IFEO re-entry detection)" 0 "not found"
 grep -qF '_wcsicmp(firstImg, L"gmproxy.exe")' "$SRC" && record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 1 || record "src: recur detects survivor is gmproxy.exe (exact base-name match)" 0 "not found"
+# Concurrent gmproxy.log write serialization (root-cause debug): concurrent gmproxy.exe instances
+# (GoogleUpdater spawning many updater.exe at once as SYSTEM) all write the SAME gmproxy.log via
+# _wfopen append + vfwprintf + fflush; the C runtime append mode is seek-then-write, which races
+# across processes and interleaves PARTIAL lines (the 'dater.exe' / 'YSTEM session=...' garbage in
+# the SYSTEM-temp log). A Global named mutex (NULL DACL so admin + SYSTEM both open it; bounded
+# 2000ms wait; WAIT_ABANDONED tolerated) serializes each write so every line lands atomically at
+# the true end-of-file. The NORMAL + FORCED builds below must still compile + run (the mutex is a
+# no-op under single-instance wine).
+grep -qF 'GmProxyDiagMutexAcquire' "$SRC" && record "src: GmProxyDiagMutexAcquire helper present (cross-process log serializer)" 1 || record "src: GmProxyDiagMutexAcquire helper present (cross-process log serializer)" 0 "not found"
+grep -qF 'GmProxyDiagMutexRelease' "$SRC" && record "src: GmProxyDiagMutexRelease helper present" 1 || record "src: GmProxyDiagMutexRelease helper present" 0 "not found"
+grep -qF 'GmProxyDiagLogMutex' "$SRC" && record "src: Global GmProxyDiagLogMutex name present (shared admin + SYSTEM)" 1 || record "src: Global GmProxyDiagLogMutex name present (shared admin + SYSTEM)" 0 "not found"
+grep -qF 'SetSecurityDescriptorDacl' "$SRC" && record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 1 || record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 0 "not found"
+grep -qF 'GM_DIAG_LOG_MUTEX_TIMEOUT_MS' "$SRC" && record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 1 || record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 0 "not found"
+grep -qF 'WAIT_ABANDONED' "$SRC" && record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 1 || record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.

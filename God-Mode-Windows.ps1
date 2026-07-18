@@ -3428,7 +3428,7 @@ function Export-GodModeLogs {
         # gmproxy.exe build stamp + deployed-file timestamp.
         $ProxyBuild = $null
         if ($GmProxyDiagPaths.Count -gt 0) {
-            try { $ProxyBuild = (Select-String -Path $GmProxyDiagPaths -Pattern 'GM-PROXY BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
+            try { $ProxyBuild = (Select-String -Path $GmProxyDiagPaths -Pattern '\[GM-PROXY\] BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
         }
         $LogContent += "`r`ngmproxy.exe build stamp: $(if ($ProxyBuild) { $ProxyBuild.Trim() } else { '[not yet logged -- gmproxy has not run since deploy]' })"
         if (Test-Path $ProxyDest) {
@@ -3439,7 +3439,7 @@ function Export-GodModeLogs {
         # gmhook.dll build stamp + deployed-file timestamp.
         $HookBuild = $null
         if (Test-Path $GmHookDiagLog) {
-            try { $HookBuild = (Select-String -Path $GmHookDiagLog -Pattern 'GM-HOOK BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
+            try { $HookBuild = (Select-String -Path $GmHookDiagLog -Pattern '\[GM-HOOK\] BUILD' -ErrorAction SilentlyContinue | Select-Object -Last 1).Line } catch {}
         }
         $LogContent += "`r`ngmhook.dll build stamp: $(if ($HookBuild) { $HookBuild.Trim() } else { '[not yet logged -- gmhook.dll has not been injected/loaded since deploy]' })"
         if (Test-Path $HookDest) {

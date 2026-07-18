@@ -107,6 +107,56 @@ static void GmEnsureTrailingBackslash(wchar_t* path, size_t cap) {
 
 static FILE* g_GmProxyDiagLog = NULL;
 
+/* Concurrent gmproxy.exe instances share ONE durable gmproxy.log per %TEMP%
+   (e.g. GoogleUpdater spawns many updater.exe at once as SYSTEM, all writing
+   C:\Windows\Temp\gmproxy.log). The C runtime's append mode is seek-then-
+   write, which races across processes and interleaves PARTIAL lines (observed
+   in the SYSTEM-temp log as garbage such as "dater.exe" / "YSTEM session=..."
+   / a lone "system"). A Global named mutex serializes each vfwprintf+fflush
+   so every line lands atomically at the true end-of-file. NULL DACL so both
+   the admin (user-session) gmproxy and the SYSTEM (nested) gmproxy can open
+   the same mutex -- a default-DACL mutex created by one privilege level can
+   deny the other, which would leave the SYSTEM-temp log (the corruption we
+   are fixing) un-serialized. Bounded wait: if a holder is stuck, skip the log
+   line rather than stall the launch (logging is best-effort and never affects
+   the child). Mirrors gmhook.c's GodMode_GmHookLog mutex pattern but adds the
+   NULL DACL + Global namespace for the cross-privilege gmproxy case. */
+static HANDLE g_GmProxyDiagMutex = NULL;
+#define GM_DIAG_LOG_MUTEX_TIMEOUT_MS 2000
+
+static HANDLE GmProxyDiagMutexAcquire(void) {
+    if (!g_GmProxyDiagMutex) {
+        /* Build a NULL DACL (everyone full) so admin + SYSTEM both can open it. */
+        SECURITY_DESCRIPTOR sd;
+        SECURITY_ATTRIBUTES sa;
+        ZeroMemory(&sd, sizeof(sd));
+        ZeroMemory(&sa, sizeof(sa));
+        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) &&
+            SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
+            sa.nLength = sizeof(sa);
+            sa.lpSecurityDescriptor = &sd;
+            sa.bInheritHandle = FALSE;
+            g_GmProxyDiagMutex = CreateMutexW(&sa, FALSE, L"Global\\GmProxyDiagLogMutex");
+        }
+        if (!g_GmProxyDiagMutex) {
+            /* Fall back to default-DACL creation (still serializes within one
+               privilege level) so a security-API failure never blocks logging. */
+            g_GmProxyDiagMutex = CreateMutexW(NULL, FALSE, L"Global\\GmProxyDiagLogMutex");
+        }
+    }
+    if (!g_GmProxyDiagMutex) return NULL;
+    DWORD wr = WaitForSingleObject(g_GmProxyDiagMutex, GM_DIAG_LOG_MUTEX_TIMEOUT_MS);
+    /* WAIT_ABANDONED: a previous holder crashed mid-write -- we still own the
+       mutex now; the log may have a partial last line, which is best-effort
+       acceptable. WAIT_TIMEOUT/WAIT_FAILED: skip this log line, keep moving. */
+    if (wr == WAIT_OBJECT_0 || wr == WAIT_ABANDONED) return g_GmProxyDiagMutex;
+    return NULL;
+}
+
+static void GmProxyDiagMutexRelease(void) {
+    if (g_GmProxyDiagMutex) ReleaseMutex(g_GmProxyDiagMutex);
+}
+
 static FILE* GmProxyDiagLogOpen(void) {
     if (g_GmProxyDiagLog) return g_GmProxyDiagLog;
     wchar_t tempDir[MAX_PATH] = {0};
@@ -137,6 +187,12 @@ static void DiagLog(const wchar_t* fmt, ...) {
     va_start(ap, fmt);
     vfwprintf(stderr, fmt, ap);
     va_end(ap);
+    /* Hold the cross-process mutex across the file write (and the one-shot
+       session-header open) so concurrent gmproxy instances don't interleave
+       partial lines into the shared gmproxy.log. stderr is per-process and
+       needs no serialization; the mutex is never held across the ~1.5s child
+       observation wait (only across the brief vfwprintf+fflush). */
+    HANDLE hMutex = GmProxyDiagMutexAcquire();
     FILE* f = GmProxyDiagLogOpen();
     if (f) {
         va_start(ap, fmt);
@@ -144,6 +200,7 @@ static void DiagLog(const wchar_t* fmt, ...) {
         va_end(ap);
         fflush(f);
     }
+    if (hMutex) GmProxyDiagMutexRelease();
 }
 
 /* ------------------------------------------------------------------ */
