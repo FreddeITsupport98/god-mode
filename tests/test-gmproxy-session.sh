@@ -168,6 +168,26 @@ grep -qF 'SetSecurityDescriptorDacl' "$SRC" && record "src: SetSecurityDescripto
 grep -qF 'GM_DIAG_LOG_MUTEX_TIMEOUT_MS' "$SRC" && record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 1 || record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 0 "not found"
 grep -qF 'WAIT_ABANDONED' "$SRC" && record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 1 || record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 0 "not found"
 
+# Runtime SYSTEM-crash auto-exclude store (Detector B): gmproxy records every base
+# name that CRASHED as SYSTEM (EXITED class=CRASH tree=0, SYSTEM mode) in a persistent
+# store; at >= threshold crashes the NEXT launch skips the SYSTEM token and reuses the
+# current-user fallback (MODE=USER-AUTOEXCLUDE). Fail-open; 256-cap + 30-day stale;
+# atomic temp+rename; Global NULL-DACL mutex; reset via --gm-reset-autoexclude.
+grep -qF 'GM_AUTOEXCLUDE_THRESHOLD' "$SRC" && record "src: GM_AUTOEXCLUDE_THRESHOLD present (crash threshold)" 1 || record "src: GM_AUTOEXCLUDE_THRESHOLD present (crash threshold)" 0 "not found"
+grep -qF 'GM_AUTOEXCLUDE_STALE_DAYS' "$SRC" && record "src: GM_AUTOEXCLUDE_STALE_DAYS present (30-day stale drop)" 1 || record "src: GM_AUTOEXCLUDE_STALE_DAYS present (30-day stale drop)" 0 "not found"
+grep -qF 'GM_AUTOEXCLUDE_MAX_ENTRIES' "$SRC" && record "src: GM_AUTOEXCLUDE_MAX_ENTRIES present (256 cap)" 1 || record "src: GM_AUTOEXCLUDE_MAX_ENTRIES present (256 cap)" 0 "not found"
+grep -qF 'GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS' "$SRC" && record "src: GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS present (bounded wait)" 1 || record "src: GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS present (bounded wait)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeLoad' "$SRC" && record "src: GmProxyAutoExcludeLoad present (store parse+prune)" 1 || record "src: GmProxyAutoExcludeLoad present (store parse+prune)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeQuery' "$SRC" && record "src: GmProxyAutoExcludeQuery present (excluded lookup)" 1 || record "src: GmProxyAutoExcludeQuery present (excluded lookup)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeRecord' "$SRC" && record "src: GmProxyAutoExcludeRecord present (increment+threshold)" 1 || record "src: GmProxyAutoExcludeRecord present (increment+threshold)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeReset' "$SRC" && record "src: GmProxyAutoExcludeReset present (delete store)" 1 || record "src: GmProxyAutoExcludeReset present (delete store)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeWrite' "$SRC" && record "src: GmProxyAutoExcludeWrite present (atomic write)" 1 || record "src: GmProxyAutoExcludeWrite present (atomic write)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeMutex' "$SRC" && record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 1 || record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 0 "not found"
+grep -qF 'USER-AUTOEXCLUDE' "$SRC" && record "src: USER-AUTOEXCLUDE launch mode present" 1 || record "src: USER-AUTOEXCLUDE launch mode present" 0 "not found"
+grep -qF 'MoveFileExW' "$SRC" && record "src: MoveFileExW present (atomic store write)" 1 || record "src: MoveFileExW present (atomic store write)" 0 "not found"
+grep -qF -- '--gm-reset-autoexclude' "$SRC" && record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 1 || record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 0 "not found"
+grep -qF 'GodModeAutoExclude' "$SRC" && record "src: GodModeAutoExclude store path present" 1 || record "src: GodModeAutoExclude store path present" 0 "not found"
+
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
     record "MinGW (x86_64-w64-mingw32-gcc) available" 0 "not installed; compile skipped"

@@ -145,7 +145,7 @@ if ($uninstallMatch.Success) {
 # --- 6b. Auto-populate: Get-IfeoElevationCandidates helper + triple safety net ---
 Add-Assertion "Get-IfeoElevationCandidates function defined" ($gm -match 'function\s+Get-IfeoElevationCandidates\s*\{') "Get-IfeoElevationCandidates helper missing"
 Add-Assertion "Install-IfeoElevation calls Get-IfeoElevationCandidates" ($installBody -match 'Get-IfeoElevationCandidates') "install does not call the auto-populate helper"
-Add-Assertion "Install-IfeoElevation merges seed + auto candidates (Select-Object -Unique)" ($installBody -match '\$IfeoElevationApps\s*\+\s*\$autoCandidates.*Select-Object\s+-Unique') "seed + auto candidates not merged/deduped"
+Add-Assertion "Install-IfeoElevation merges seed + auto candidates (Select-Object -Unique)" ($installBody.Contains('filteredSeed') -and $installBody.Contains('Select-Object -Unique')) "seed + auto candidates not merged/deduped"
 $candMatch = [regex]::Match($gm, '(?s)function\s+Get-IfeoElevationCandidates\s*\{(.*?)\nfunction\s+Install-IfeoElevation\s*\{')
 $candBody = if ($candMatch.Success) { $candMatch.Groups[1].Value } else { "" }
 Add-Assertion "Get-IfeoElevationCandidates body extractable" ($candMatch.Success) "could not isolate Get-IfeoElevationCandidates body"
@@ -291,5 +291,31 @@ Add-Assertion "Instant watcher: Created handler re-arms (cancels pending prune o
 $renamedHandlerMatch = [regex]::Match($startBody, '(?s)\$w\.Renamed\s*\+=\s*\{(.*?)\n\s+\}\s*\n\s+\$w\.Error')
 $renamedHandlerBody = if ($renamedHandlerMatch.Success) { $renamedHandlerMatch.Groups[1].Value } else { "" }
 Add-Assertion "Instant watcher: Renamed handler re-arms (cancels pending prune on .tmp->.exe update)" ($renamedHandlerBody -match 'IfeoPruneQueue' -and $renamedHandlerBody -match 'RemoveAt') "Renamed handler does not cancel a pending stale-prune -- updaters that land via .tmp->.exe rename could lose the hook mid-swap"
+
+
+# --- 12. Detector A: smart SYSTEM-incompatibility drop (AppX/packaged + registered browsers) ---
+# Install-IfeoElevation now builds Get-GmSystemCompatExclusions (AppX via WindowsApps
+# reparse aliases + Get-AppxPackage Executables; browsers via StartMenuInternet clients)
+# and DROPS matching seed + auto candidates so structurally SYSTEM-incompatible apps
+# (Win11 Notepad/calc Store stubs, Chrome/Firefox/Edge/Brave/... browsers) launch as the
+# normal user instead of via gmproxy->SYSTEM (where they crash / render blank / exit with
+# no window). No hardcoded app names; fail-open (empty sets -> no drop -> gmproxy.c
+# Detector B runtime crash store is the safety net). The curated seed still LISTS these
+# apps (additive) but they are filtered out before hooking.
+Add-Assertion "Detector A: Get-GmSystemCompatExclusions function defined" ($gm.Contains('function Get-GmSystemCompatExclusions')) "Get-GmSystemCompatExclusions missing -- no install-time SYSTEM-incompatibility detection"
+Add-Assertion "Detector A: scans WindowsApps reparse aliases (AppX/WinUI Store apps)" ($gm.Contains('WindowsApps') -and $gm.Contains('ReparsePoint')) "WindowsApps reparse-point AppX detection missing -- Win11 Notepad/calc Store stubs would be hooked"
+Add-Assertion "Detector A: scans Get-AppxPackage application Executables (Store apps without aliases)" ($gm.Contains('Get-AppxPackage') -and $gm.Contains('Executable="')) "Get-AppxPackage Executable detection missing -- Store apps without a WindowsApps alias would slip through"
+Add-Assertion "Detector A: scans registered StartMenuInternet clients (all installed browsers)" ($gm.Contains('StartMenuInternet')) "StartMenuInternet browser detection missing -- only a hardcoded name list would catch browsers"
+Add-Assertion "Detector A: Get-AppxPackage is fail-open (ErrorAction SilentlyContinue)" ($gm.Contains('Get-AppxPackage -ErrorAction SilentlyContinue')) "Get-AppxPackage not guarded -- a missing Appx module (Server Core) would throw instead of fail-open"
+Add-Assertion "Detector A: Get-IfeoElevationCandidates accepts a CompatExclusions param" ($candBody.Contains('$CompatExclusions')) "Get-IfeoElevationCandidates missing the CompatExclusions param -- candidates cannot be filtered"
+Add-Assertion "Detector A: candidates filter drops AppX (CompatExclusions.AppX.ContainsKey)" ($candBody.Contains('CompatExclusions.AppX.ContainsKey')) "candidates AppX filter missing -- Store apps in the auto-populate would be hooked"
+Add-Assertion "Detector A: candidates filter drops browsers (CompatExclusions.Browser.ContainsKey)" ($candBody.Contains('CompatExclusions.Browser.ContainsKey')) "candidates browser filter missing -- browsers in the auto-populate would be hooked"
+Add-Assertion "Detector A: Install-IfeoElevation builds the compat sets once (Get-GmSystemCompatExclusions)" ($installBody.Contains('Get-GmSystemCompatExclusions')) "Install-IfeoElevation does not build CompatExclusions -- no install-time drop"
+Add-Assertion "Detector A: Install-IfeoElevation filters the curated seed (filteredSeed)" ($installBody.Contains('filteredSeed')) "Install-IfeoElevation does not filter the seed -- AppX/browser names in the seed (notepad/chrome/firefox) would still be hooked unconditionally"
+Add-Assertion "Detector A: Install-IfeoElevation counts seed drops (seedDroppedAppx/seedDroppedBrowser)" ($installBody.Contains('seedDroppedAppx') -and $installBody.Contains('seedDroppedBrowser')) "Install-IfeoElevation does not count seed drops -- the IFEO log cannot report what Detector A removed"
+Add-Assertion "Detector A: passes CompatExclusions to Get-IfeoElevationCandidates" ($installBody.Contains('Get-IfeoElevationCandidates -GmProxyExe $GmProxyExe -CompatExclusions $CompatExclusions')) "Install-IfeoElevation does not pass CompatExclusions to the auto-populate -- auto candidates would not be filtered"
+Add-Assertion "Detector A: curated seed still lists chrome.exe (additive, filtered not removed)" ($arrText.Contains('chrome.exe')) "curated seed lost chrome.exe -- additive edit regressed the app list"
+Add-Assertion "Detector A: curated seed still lists notepad.exe (additive, filtered not removed)" ($arrText.Contains('notepad.exe')) "curated seed lost notepad.exe -- additive edit regressed the app list"
+Add-Assertion "Detector A: curated seed still lists firefox.exe (additive, filtered not removed)" ($arrText.Contains('firefox.exe')) "curated seed lost firefox.exe -- additive edit regressed the app list"
 
 Write-Summary

@@ -131,6 +131,12 @@ $GodModeTaskName       = "Windows-Update-Health-Monitor"
 $GodModeGuardianName   = "Windows-Update-Health-Check"
 $GodModeWatchdogName   = "Windows-Defender-Engine-Update"
 
+# Detector B (gmproxy.c) runtime SYSTEM-crash auto-exclude store. The dir is
+# created by Install-ProcessHook with a permissive ACL so both the admin
+# (user-session) gmproxy AND the SYSTEM (nested) gmproxy can read/write it.
+$GodModeAutoExcludeDir   = "C:\ProgramData\GodModeAutoExclude"
+$GodModeAutoExcludeFile  = Join-Path $GodModeAutoExcludeDir "gmproxy_autoexclude.dat"
+
 # Raw debug dump rotation settings
 $RawDumpDir = Join-Path $env:TEMP "GodMode_RawDumps"
 $MaxRawDumps = 5
@@ -3473,6 +3479,28 @@ function Export-GodModeLogs {
             }
         }
 
+        # --- GM-PROXY AUTO-EXCLUDE STORE (Detector B): dump the persistent
+        #     SYSTEM-crash auto-exclude store so the user can see which base
+        #     names gmproxy has learned to launch as the current user (after
+        #     >= threshold SYSTEM crashes) instead of as SYSTEM. Each line:
+        #     basename|crashCount|lastCrashUnixTs|excluded. Reset via menu [18].
+        $LogContent += "`r`n===== GM-PROXY AUTO-EXCLUDE STORE ====="
+        if (Test-Path $GodModeAutoExcludeFile) {
+            $LogContent += "`r`n(Source: $GodModeAutoExcludeFile)"
+            $storeContent = Get-Content -Raw -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+            if ($storeContent) {
+                $LogContent += "`r`n"
+                $LogContent += $storeContent
+            } else {
+                $LogContent += "`r`n[Store file exists but is empty]"
+            }
+        } else {
+            $LogContent += "`r`n[No auto-exclude store yet -- no app has crashed as SYSTEM >= threshold, or the store was reset]"
+        }
+        $LogContent += "`r`nNOTE: an entry with excluded=1 means gmproxy will launch that app as the"
+        $LogContent += "`r`n      current user (USER-AUTOEXCLUDE mode) instead of as SYSTEM on its next"
+        $LogContent += "`r`n      launch. Entries auto-drop after 30 days or via menu [18] RESET AUTO-EXCLUDE STORE."
+
         # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
         #     gmproxy invocation into a per-app summary so the user can report
         #     exactly which apps launched as SYSTEM vs fell back vs refused vs
@@ -3496,13 +3524,14 @@ function Export-GodModeLogs {
                 # (running as SYSTEM -> a SYSTEM-temp gmproxy.log, now collected above).
                 $report = @{}
                 foreach ($l in $launchLines) {
-                    if ($l.Line -match 'app=(.+?) pid=\d+ mode=(\w+) ') {
+                    if ($l.Line -match 'app=(.+?) pid=\d+ mode=([\w-]+) ') {
                         $app = $matches[1].Trim(); $mode = $matches[2]
+                        $modeKey = $mode -replace '-',''  # USER-AUTOEXCLUDE -> USERAUTOEXCLUDE dict key
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; USERAUTOEXCLUDE=0; UNKNOWN=0 }
                         }
                         $report[$app].Launches++
-                        if ($report[$app].ContainsKey($mode)) { $report[$app][$mode]++ }
+                        if ($report[$app].ContainsKey($modeKey)) { $report[$app][$modeKey]++ }
                     }
                 }
                 foreach ($c in $childLines) {
@@ -3510,7 +3539,7 @@ function Export-GodModeLogs {
                         $app = $matches[1].Trim(); $res = $matches[2]
                         $isRecur = $c.Line -match 'recur=yes'
                         if (-not $report.ContainsKey($app)) {
-                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; UNKNOWN=0 }
+                            $report[$app] = @{ Launches=0; SYSTEM=0; FALLBACK=0; REFUSE=0; FAILED=0; ALIVE=0; DELEGATED=0; DELEGATEDRECUR=0; EXITED=0; USERAUTOEXCLUDE=0; UNKNOWN=0 }
                         }
                         if ($res -eq 'DELEGATED' -and $isRecur) {
                             $report[$app].DELEGATEDRECUR++
@@ -3522,11 +3551,11 @@ function Export-GodModeLogs {
                 if ($report.Count -eq 0) {
                     $LogContent += "`r`n[No gmproxy LAUNCH/CHILD-STATUS entries yet -- no IFEO launches recorded]"
                 } else {
-                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)  DELEGATED-RECUR"
-                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------  -------------"
+                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)  DELEGATED-RECUR  USER-AUTOEXCLUDE"
+                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------  -------------  ---------------"
                     foreach ($app in ($report.Keys | Sort-Object)) {
                         $r = $report[$app]
-                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}  {9,13}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED, $r.DELEGATEDRECUR)
+                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}  {9,13}  {10,15}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED, $r.DELEGATEDRECUR, $r.USERAUTOEXCLUDE)
                     }
                     $LogContent += "`r`nNOTE: ALIVE = child still running after the grace window (healthy)."
                     $LogContent += "`r`n      DELEGATED = the child exited cleanly (exitcode 0) but left a surviving"
@@ -3602,6 +3631,49 @@ function Export-GodModeLogs {
         Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "ERROR" -Message "Failed to dump logs" -ErrorRecord $_
         Write-Host "[ERROR] Failed to dump logs: $_" -ForegroundColor Red
     }
+}
+
+function Reset-GmProxyAutoExcludeStore {
+    <#
+    .SYNOPSIS
+        Clear the Detector B runtime SYSTEM-crash auto-exclude store (menu [18]).
+        Calls gmproxy.exe --gm-reset-autoexclude (a mutex-safe reset that cannot
+        race a concurrent gmproxy launch mid-write) when the deployed binary is
+        available; falls back to deleting the store file directly. Best-effort.
+        Detector A (AppX/browser drop at install time) is unaffected -- only the
+        runtime crash learnings are cleared, so apps once again attempt SYSTEM
+        elevation on their next launch.
+    #>
+    Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "ENTRY"
+    try {
+        $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+        $reset = $false
+        if (Test-Path $GmProxyExe) {
+            try {
+                $proc = Start-Process -FilePath $GmProxyExe -ArgumentList "--gm-reset-autoexclude" -NoNewWindow -Wait -PassThru -ErrorAction SilentlyContinue
+                if ($proc -and $proc.ExitCode -eq 0) { $reset = $true }
+            } catch {
+                Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "WARN" -Message "gmproxy --gm-reset-autoexclude failed: $_"
+            }
+        }
+        if (-not $reset) {
+            # Fallback: delete the file directly (best-effort; gmproxy's atomic
+            # temp+rename means a concurrent write at worst re-creates it after).
+            if (Test-Path $GodModeAutoExcludeFile) {
+                Remove-Item -Path $GodModeAutoExcludeFile -Force -ErrorAction SilentlyContinue
+            }
+            $reset = $true
+        }
+        if (Test-Path $GodModeAutoExcludeFile) {
+            Write-Log -Message "Auto-exclude store reset FAILED (file still present at $GodModeAutoExcludeFile)." -Type "WARN" -Color Yellow
+        } else {
+            Write-Log -Message "Auto-exclude store reset. Apps will once again attempt SYSTEM elevation on their next launch (Detector A still drops AppX/browsers at install time)." -Type "INFO" -Color Green
+        }
+    } catch {
+        Write-Log -Message "Reset-GmProxyAutoExcludeStore failed: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "ERROR" -Message "Outer catch: $_"
+    }
+    Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "EXIT"
 }
 
 function Enable-DangerousMode {
@@ -4382,6 +4454,31 @@ public class GmHookGlobal {
         } else {
             Write-Log -Message "gmhook.dll not found at destination; skipping DLL injection." -Type "WARN" -Color Yellow
         }
+
+        # Detector B store dir: create C:\ProgramData\GodModeAutoExclude with a
+        # permissive ACL (Everyone:Modify) so both the admin (user-session)
+        # gmproxy AND the SYSTEM (nested) gmproxy can read/write the crash store.
+        # Best-effort: a failure here never blocks the process-hook install (the
+        # store is fail-open in gmproxy.c -- missing dir = no exclusions = normal
+        # SYSTEM elevation). gmproxy also tolerates a missing dir at runtime, so
+        # this is a belt-and-suspenders pre-create with the right cross-privilege
+        # ACL. The S-1-1-0 SID (Everyone/World) avoids localized account names.
+        try {
+            if (-not (Test-Path $GodModeAutoExcludeDir)) {
+                $null = New-Item -Path $GodModeAutoExcludeDir -ItemType Directory -Force -ErrorAction SilentlyContinue
+            }
+            if (Test-Path $GodModeAutoExcludeDir) {
+                $acl = Get-Acl $GodModeAutoExcludeDir -ErrorAction SilentlyContinue
+                if ($acl) {
+                    $everyone = New-Object System.Security.Principal.SecurityIdentifier("S-1-1-0")
+                    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($everyone, "Modify", "ContainerInherit,ObjectInherit", "None", "Allow")
+                    $acl.AddAccessRule($rule)
+                    Set-Acl -Path $GodModeAutoExcludeDir -AclObject $acl -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {
+            Write-DebugLog -FunctionName "Install-ProcessHook" -Action "WARN" -Message "Auto-exclude dir setup skipped: $_"
+        }
     } catch {
         Write-Log -Message "Install-ProcessHook failed: $_" -Type "WARN" -Color Yellow
         Write-DebugLog -FunctionName "Install-ProcessHook" -Action "ERROR" -Message "Outer catch: $_"
@@ -4429,11 +4526,104 @@ function Uninstall-ProcessHook {
         $GmHookDiagLog = Join-Path $env:TEMP "gmhook.log"
         if (Test-Path $GmHookDiagLog) { Remove-Item -Path $GmHookDiagLog -Force -ErrorAction SilentlyContinue }
 
+        # Detector B store: remove the auto-exclude crash store + its dir (keep
+        # the uninstaller current with the install path). Best-effort.
+        if (Test-Path $GodModeAutoExcludeDir) { Remove-Item -Path $GodModeAutoExcludeDir -Recurse -Force -ErrorAction SilentlyContinue }
+
         Write-Log -Message "Process hook uninstalled (IFEO keys and binaries removed)." -Type "INFO" -Color Gray
     } catch {
         Write-Log -Message "Uninstall-ProcessHook failed: $_" -Type "WARN" -Color Yellow
     }
     Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "EXIT" -Message "Complete"
+}
+
+function Get-GmSystemCompatExclusions {
+    <#
+    .SYNOPSIS
+        Detector A: build the set of base names that are structurally SYSTEM-
+        incompatible (AppX/WinUI packaged apps + registered browsers) so the
+        IFEO layer can DROP them from the hook set and let them launch as the
+        normal user instead of via gmproxy -> SYSTEM (where they crash / render
+        blank / exit with no window). Called ONCE per enable by
+        Install-IfeoElevation; the returned sets are checked against both the
+        curated seed and the auto-populated candidates.
+    .DESCRIPTION
+        No hardcoded app names. AppX is detected two ways: (1) the AppX
+        execution-alias reparse points in %LOCALAPPDATA%\Microsoft\WindowsApps
+        (Win11 Store aliases -- notepad/calc/photos/etc.); (2) Get-AppxPackage
+        application Executable attributes parsed from each AppXManifest.xml
+        (catches Store apps without an alias). Browsers are detected from the
+        registered StartMenuInternet clients (HKLM/HKCU \SOFTWARE\Clients\n        StartMenuInternet\<Client>\shell\open\command) -- every installed +
+        registered browser (Chrome, Firefox, Edge, Brave, Arc, ...) with no
+        name list. Fail-open: any error (missing Appx module on Server Core,
+        registry parse failure, ACL denial) -> that set is empty -> the app
+        stays hookable -> Detector B (gmproxy.c runtime crash store) catches
+        it as the safety net.
+    .OUTPUTS
+        @{ AppX = hashtable-of-lowercase-basenames; Browser = hashtable-of-lowercase-basenames }
+    #>
+    $appx = @{}
+    $browser = @{}
+
+    # --- AppX (1): execution-alias reparse points in WindowsApps ---
+    try {
+        $aliasDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
+        if (Test-Path $aliasDir) {
+            Get-ChildItem -Path $aliasDir -Filter "*.exe" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    if ($_.Attributes.ToString() -match "ReparsePoint") {
+                        $appx[$_.Name.ToLower()] = $true
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+
+    # --- AppX (2): Get-AppxPackage application Executable attributes ---
+    try {
+        $pkgs = Get-AppxPackage -ErrorAction SilentlyContinue
+        foreach ($pkg in $pkgs) {
+            try {
+                $manifestPath = Join-Path $pkg.InstallLocation "AppXManifest.xml"
+                if (-not (Test-Path $manifestPath)) { continue }
+                $manifest = Get-Content $manifestPath -Raw -ErrorAction SilentlyContinue
+                if (-not $manifest) { continue }
+                $exeMatches = [regex]::Matches($manifest, 'Executable="([^"]+\.exe)"', 'IgnoreCase')
+                foreach ($em in $exeMatches) {
+                    $b = [System.IO.Path]::GetFileName($em.Groups[1].Value)
+                    if ($b) { $appx[$b.ToLower()] = $true }
+                }
+            } catch {}
+        }
+    } catch {}
+
+    # --- Browsers: registered StartMenuInternet client executables ---
+    try {
+        $roots = @(
+            "HKLM:\SOFTWARE\Clients\StartMenuInternet",
+            "HKCU:\SOFTWARE\Clients\StartMenuInternet",
+            "HKLM:\SOFTWARE\WOW6432Node\Clients\StartMenuInternet"
+        )
+        foreach ($root in $roots) {
+            if (-not (Test-Path $root)) { continue }
+            try {
+                Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+                    try {
+                        $cmdKey = Join-Path $_.PSPath "shell\open\command"
+                        if (-not (Test-Path $cmdKey)) { return }
+                        $cmd = (Get-ItemProperty -Path $cmdKey -Name "(default)" -ErrorAction SilentlyContinue).'(default)'
+                        if (-not $cmd) { return }
+                        if ($cmd -match '"?([^"]+\.exe)') {
+                            $b = [System.IO.Path]::GetFileName($matches[1])
+                            if ($b) { $browser[$b.ToLower()] = $true }
+                        }
+                    } catch {}
+                }
+            } catch {}
+        }
+    } catch {}
+
+    return @{ AppX = $appx; Browser = $browser }
 }
 
 <#
@@ -4473,7 +4663,7 @@ function Get-IfeoElevationCandidates {
         Install-IfeoElevation is merged with these candidates; this function never
         returns critical/shell/OS processes.
     #>
-    param([string]$GmProxyExe)
+    param([string]$GmProxyExe, $CompatExclusions)
 
     # Safety net #1: canonical name denylist. UNION of every existing critical list
     # in the codebase so nothing already protected can regress.
@@ -4582,6 +4772,18 @@ function Get-IfeoElevationCandidates {
             $bare = [System.IO.Path]::GetFileNameWithoutExtension($baseName).ToLower()
             if ($excludeSet.ContainsKey($bare)) { $excluded++; continue }
 
+            # Safety net #3 (Detector A): drop structurally SYSTEM-incompatible
+            # classes -- AppX/WinUI packaged apps + registered browsers -- so
+            # they launch as the normal user instead of via gmproxy -> SYSTEM
+            # (where they crash / render blank / exit with no window). The set
+            # is built once by Get-GmSystemCompatExclusions (Install-IfeoElevation)
+            # and passed in. Fail-open: a null set -> no compat drop -> Detector B
+            # (gmproxy.c runtime crash store) is the safety net.
+            if ($CompatExclusions) {
+                if ($CompatExclusions.AppX.ContainsKey($baseKey)) { $excluded++; continue }
+                if ($CompatExclusions.Browser.ContainsKey($baseKey)) { $excluded++; continue }
+            }
+
             # Deduplicate by base name.
             if ($seen.ContainsKey($baseKey)) { continue }
             $seen[$baseKey] = $true
@@ -4620,9 +4822,30 @@ function Install-IfeoElevation {
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
 
-        # Auto-populate additional candidates from installed/running programs, then merge with the seed.
-        $autoCandidates = Get-IfeoElevationCandidates -GmProxyExe $GmProxyExe
-        $allApps = $IfeoElevationApps + $autoCandidates | Select-Object -Unique
+        # Detector A: build the SYSTEM-incompatible base-name sets (AppX +
+        # registered browsers) ONCE, then drop those from BOTH the curated seed
+        # and the auto-populated candidates so they launch as the normal user
+        # instead of via gmproxy -> SYSTEM. Fail-open (empty sets -> no drop ->
+        # Detector B in gmproxy.c is the runtime safety net).
+        $CompatExclusions = Get-GmSystemCompatExclusions
+
+        # Auto-populate additional candidates from installed/running programs,
+        # passing the compat sets so the same filter applies there. Then merge.
+        $autoCandidates = Get-IfeoElevationCandidates -GmProxyExe $GmProxyExe -CompatExclusions $CompatExclusions
+
+        # Filter the curated seed through the compat sets (the seed bypasses
+        # Get-IfeoElevationCandidates' path/denylist filters, so AppX/browser
+        # names like chrome.exe / firefox.exe / notepad.exe in the seed must be
+        # dropped here explicitly). Count drops for the log line below.
+        $seedDroppedAppx = 0; $seedDroppedBrowser = 0
+        $filteredSeed = @()
+        foreach ($app in $IfeoElevationApps) {
+            $bk = $app.ToLower()
+            if ($CompatExclusions.AppX.ContainsKey($bk)) { $seedDroppedAppx++; continue }
+            if ($CompatExclusions.Browser.ContainsKey($bk)) { $seedDroppedBrowser++; continue }
+            $filteredSeed += $app
+        }
+        $allApps = $filteredSeed + $autoCandidates | Select-Object -Unique
 
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
@@ -4660,12 +4883,12 @@ function Install-IfeoElevation {
             }
         }
         $autoCount = $autoCandidates.Count
-        $seedCount = $IfeoElevationApps.Count
+        $seedCount = $filteredSeed.Count
         $totalUnique = $allApps.Count
         $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
         if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique"
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedAppx AppX + $seedDroppedBrowser browser from the seed (launch as user, not SYSTEM). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedAppx=$seedDroppedAppx droppedBrowser=$seedDroppedBrowser"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
@@ -7121,8 +7344,10 @@ Write-Host "[14] INSTALL/ENABLE PROCESS HOOK (gmhook.dll)" -ForegroundColor Cyan
         Write-Host "[17] INSTALL SYSTEM DESKTOP SESSION (Run Explorer as SYSTEM)" -ForegroundColor Magenta
     }
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[18] RESET AUTO-EXCLUDE STORE (clear gmproxy SYSTEM-crash learnings)" -ForegroundColor Cyan
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-17)"
+    $Choice = Read-Host "Select an administrative action (1-18)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -7275,6 +7500,10 @@ Write-Host "[14] INSTALL/ENABLE PROCESS HOOK (gmhook.dll)" -ForegroundColor Cyan
                     Write-Host "Launch cancelled." -ForegroundColor Green
                 }
             }
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "18" {
+            Reset-GmProxyAutoExcludeStore
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "11" { Export-GodModeLogs; Start-Sleep -Seconds 2 }

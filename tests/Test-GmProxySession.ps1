@@ -395,7 +395,7 @@ Add-Assertion "gmproxy.c: ResumeThread resumes the suspended child after job ass
 Add-Assertion "gmproxy.c: CREATEPROC outcome line logged per CreateProcess attempt (method + result=OK/FAIL)" ($proxy -match '\[GM-PROXY\]\s*CREATEPROC:\s*method=\w+\s+result=\w+' -and $proxy -match 'result=FAIL\s+gle=%lu') "gmproxy.c CREATEPROC outcome line missing -- cannot tell which launch method failed and why (gle)"
 Add-Assertion "gmproxy.c: result=DELEGATED classification present (launcher/stub spawned a surviving grandchild)" ($proxy -match 'result=DELEGATED\s+exitcode=%lu\s+treepids=%lu\s+firstgchild=%ls') "gmproxy.c DELEGATED classification missing -- a launcher/stub that delegated to the real app would be misreported as a crash"
 Add-Assertion "gmproxy.c: EXITED classification includes class=CLEAN (exitcode 0, graceful) / class=CRASH (non-zero)" ($proxy -match 'class=%ls' -and $proxy -match 'L"CLEAN"' -and $proxy -match 'L"CRASH"') "gmproxy.c EXITED classification lacks the CLEAN/CRASH class -- a graceful exit (0) cannot be told from a crash (non-zero)"
-Add-Assertion "gmproxy.c: hJob passed to GmProxyLogLaunchReport on the success path (transferred ownership)" ($proxy -match 'GmProxyLogLaunchReport\s*\(\s*argv\[1\]\s*,\s*haveToken\s*\?\s*L"SYSTEM"\s*:\s*L"FALLBACK"[\s\S]{0,120}?hJob\s*\)') "gmproxy.c does not pass hJob to the launch report on the success path -- grandchild tree cannot be walked"
+Add-Assertion "gmproxy.c: hJob passed to GmProxyLogLaunchReport on the success path (transferred ownership)" ($proxy.Contains('GmProxyLogLaunchReport(argv[1], launchMode') -and $proxy.Contains('activeSession, hJob)')) "gmproxy.c does not pass hJob to the launch report on the success path -- grandchild tree cannot be walked"
 Add-Assertion "gmproxy.c: REFUSE/FAILED paths pass hJob=NULL (no child to observe, no job to close)" ($proxy -match 'L"REFUSE"[\s\S]{0,120}?activeSession\s*,\s*NULL\s*\)' -and $proxy -match 'L"FAILED"[\s\S]{0,120}?activeSession\s*,\s*NULL\s*\)') "gmproxy.c REFUSE/FAILED do not pass hJob=NULL -- would close a garbage handle or observe a non-existent child"
 Add-Assertion "gmproxy.c: job handle closed exactly once in GmProxyLogLaunchReport (no double-close / leak)" ($proxy -match 'if\s*\(\s*hJob\s*\)\s*CloseHandle\s*\(\s*hJob\s*\)') "gmproxy.c does not close hJob exactly once in the launch report -- handle leak or double-close"
 Add-Assertion "God-Mode-Windows.ps1: per-app report has a DELEGATED column" ($gm -match 'DELEGATED=0' -and $gm -match 'DELEGATED  EXITED\(crash\?\)') "Export-GodModeLogs per-app report does not have a DELEGATED column -- delegation would be invisible"
@@ -474,5 +474,72 @@ Add-Assertion "gmproxy.c: DiagLog acquires the mutex around the file write (hMut
 Add-Assertion "gmproxy.c: DiagLog releases the mutex only when acquired (if hMutex GmProxyDiagMutexRelease)" ($proxy -match 'if \(hMutex\) GmProxyDiagMutexRelease') "gmproxy.c DiagLog does not guard the release on hMutex -- would release an un-acquired mutex (handle leak / error)"
 Add-Assertion "gmproxy.c: WAIT_ABANDONED tolerated (crashed holder does not block logging)" ($proxy -match 'WAIT_ABANDONED') "gmproxy.c WAIT_ABANDONED not handled -- a crashed gmproxy holding the mutex would block all other instances's logging"
 Add-Assertion "gmproxy.c: default-DACL fallback CreateMutexW (security-API failure never blocks logging)" ($proxy -match 'Fall back to default-DACL') "gmproxy.c default-DACL fallback missing -- an InitializeSecurityDescriptor/SetSecurityDescriptorDacl failure would leave no mutex at all"
+
+
+# --- 24. Smart IFEO compatibility layer: Detector A (AppX/browser drop) + Detector B (runtime SYSTEM-crash auto-exclude) ---
+# Live VM data showed three apps die when IFEO-elevated to SYSTEM: Chrome crashes
+# (0xFFFF7001), Firefox renders blank (content sandbox breaks under a SYSTEM parent),
+# Win11 Notepad exits CLEAN with no window (WinUI stub cannot init under SYSTEM). Fix =
+# two DYNAMIC detectors, NO hardcoded app names:
+#   A (God-Mode-Windows.ps1, install-time): Get-GmSystemCompatExclusions builds the AppX
+#     set (WindowsApps reparse aliases + Get-AppxPackage Executables) + the registered-
+#     browser set (StartMenuInternet); Install-IfeoElevation + Get-IfeoElevationCandidates
+#     DROP matching seed+auto entries so they launch as the user, not via gmproxy->SYSTEM.
+#   B (gmproxy.c, launch-time): a persistent crash store records every base name that
+#     CRASHED as SYSTEM (EXITED class=CRASH tree=0, SYSTEM mode); at >= threshold crashes
+#     the NEXT launch skips the SYSTEM token -> current-user fallback (USER-AUTOEXCLUDE).
+#     Fail-open everywhere; Session-0 REFUSE still honored; CRASH-only (CLEAN tree=0 is
+#     ambiguous breakaway); 256-cap + 30-day stale; atomic temp+rename; Global NULL-DACL
+#     mutex; reset via menu [18] / gmproxy.exe --gm-reset-autoexclude.
+Add-Assertion "gmproxy.c: #include <time.h> present (auto-exclude timestamps)" ($proxy.Contains('#include <time.h>')) "gmproxy.c missing #include <time.h>"
+Add-Assertion "gmproxy.c: #include <stdlib.h> present (store line parsing)" ($proxy.Contains('#include <stdlib.h>')) "gmproxy.c missing #include <stdlib.h>"
+Add-Assertion "gmproxy.c: GM_AUTOEXCLUDE_THRESHOLD constant present" ($proxy.Contains('GM_AUTOEXCLUDE_THRESHOLD')) "GM_AUTOEXCLUDE_THRESHOLD missing"
+Add-Assertion "gmproxy.c: GM_AUTOEXCLUDE_STALE_DAYS constant present (30-day reset)" ($proxy.Contains('GM_AUTOEXCLUDE_STALE_DAYS')) "GM_AUTOEXCLUDE_STALE_DAYS missing"
+Add-Assertion "gmproxy.c: GM_AUTOEXCLUDE_MAX_ENTRIES constant present (256 cap)" ($proxy.Contains('GM_AUTOEXCLUDE_MAX_ENTRIES')) "GM_AUTOEXCLUDE_MAX_ENTRIES missing"
+Add-Assertion "gmproxy.c: GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS constant present (bounded wait)" ($proxy.Contains('GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS')) "GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS missing"
+Add-Assertion "gmproxy.c: GmAutoExcludeEntry struct present" ($proxy.Contains('GmAutoExcludeEntry')) "GmAutoExcludeEntry struct missing"
+Add-Assertion "gmproxy.c: g_GmProxyAutoExcludeMutex handle global present" ($proxy.Contains('g_GmProxyAutoExcludeMutex')) "g_GmProxyAutoExcludeMutex missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeMutexAcquire helper defined" ($proxy.Contains('GmProxyAutoExcludeMutexAcquire')) "GmProxyAutoExcludeMutexAcquire missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeMutexRelease helper defined" ($proxy.Contains('GmProxyAutoExcludeMutexRelease')) "GmProxyAutoExcludeMutexRelease missing"
+Add-Assertion "gmproxy.c: Global GmProxyAutoExcludeMutex name present (cross-privilege)" ($proxy.Contains('GmProxyAutoExcludeMutex')) "GmProxyAutoExcludeMutex name missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeLoad helper defined (parse + prune)" ($proxy.Contains('GmProxyAutoExcludeLoad')) "GmProxyAutoExcludeLoad missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeQuery helper defined (excluded lookup)" ($proxy.Contains('GmProxyAutoExcludeQuery')) "GmProxyAutoExcludeQuery missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeRecord helper defined (increment + threshold)" ($proxy.Contains('GmProxyAutoExcludeRecord')) "GmProxyAutoExcludeRecord missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeReset helper defined (delete store)" ($proxy.Contains('GmProxyAutoExcludeReset')) "GmProxyAutoExcludeReset missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeWrite helper defined (atomic write)" ($proxy.Contains('GmProxyAutoExcludeWrite')) "GmProxyAutoExcludeWrite missing"
+Add-Assertion "gmproxy.c: GmProxyAutoExcludeParseLine helper defined (manual line parse)" ($proxy.Contains('GmProxyAutoExcludeParseLine')) "GmProxyAutoExcludeParseLine missing"
+Add-Assertion "gmproxy.c: store path GodModeAutoExclude/gmproxy_autoexclude.dat present" ($proxy.Contains('GodModeAutoExclude') -and $proxy.Contains('gmproxy_autoexclude.dat')) "auto-exclude store path missing"
+Add-Assertion "gmproxy.c: NULL DACL via SetSecurityDescriptorDacl (admin + SYSTEM both open)" ($proxy.Contains('SetSecurityDescriptorDacl')) "auto-exclude NULL DACL missing"
+Add-Assertion "gmproxy.c: atomic store write via MoveFileExW + MOVEFILE_REPLACE_EXISTING" ($proxy.Contains('MoveFileExW') -and $proxy.Contains('MOVEFILE_REPLACE_EXISTING')) "atomic MoveFileExW/REPLACE_EXISTING missing"
+Add-Assertion "gmproxy.c: stale entries dropped on read (STALE_DAYS * 86400)" ($proxy.Contains('GM_AUTOEXCLUDE_STALE_DAYS * 86400')) "stale-drop math missing"
+Add-Assertion "gmproxy.c: 256-cap eviction (n >= MAX_ENTRIES)" ($proxy.Contains('n >= GM_AUTOEXCLUDE_MAX_ENTRIES')) "cap eviction missing"
+Add-Assertion "gmproxy.c: wmain queries the store before token acquisition" ($proxy.Contains('GmProxyAutoExcludeQuery(targetBase)')) "wmain does not query the store before acquiring a SYSTEM token"
+Add-Assertion "gmproxy.c: autoExcluded gates SYSTEM token acquisition" ($proxy.Contains('autoExcluded ? 0 : FindSystemProcessForToken')) "autoExcluded does not gate SYSTEM token acquisition"
+Add-Assertion "gmproxy.c: autoExcluded gates the SeTcb relocation path" ($proxy.Contains('!autoExcluded && !hPrimary')) "autoExcluded does not gate the relocation path"
+Add-Assertion "gmproxy.c: USER-AUTOEXCLUDE launch mode emitted" ($proxy.Contains('USER-AUTOEXCLUDE')) "USER-AUTOEXCLUDE mode missing"
+Add-Assertion "gmproxy.c: AUTO-EXCLUDE diag line emitted (explains the de-elevation)" ($proxy.Contains('[GM-PROXY] AUTO-EXCLUDE:')) "AUTO-EXCLUDE diag line missing"
+Add-Assertion "gmproxy.c: crash recorded only on SYSTEM-mode CRASH (code != 0 && mode SYSTEM)" ($proxy.Contains('code != 0') -and $proxy.Contains('_wcsicmp(mode, L"SYSTEM")')) "crash record guard missing -- would record non-SYSTEM or CLEAN exits"
+Add-Assertion "gmproxy.c: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" ($proxy.Contains('--gm-reset-autoexclude')) "gmproxy --gm-reset-autoexclude hook missing"
+Add-Assertion "gmproxy.c: Session-0 REFUSE guard still present (auto-exclude does not bypass it)" ($proxy.Contains('mySessionIsZero')) "mySessionIsZero guard missing -- auto-exclude could bypass Session-0 REFUSE"
+Add-Assertion "God-Mode-Windows.ps1: Get-GmSystemCompatExclusions helper defined (Detector A)" ($gm.Contains('function Get-GmSystemCompatExclusions')) "Get-GmSystemCompatExclusions missing"
+Add-Assertion "God-Mode-Windows.ps1: Detector A scans WindowsApps reparse aliases (AppX)" ($gm.Contains('WindowsApps') -and $gm.Contains('ReparsePoint')) "WindowsApps reparse-point AppX detection missing"
+Add-Assertion "God-Mode-Windows.ps1: Detector A scans Get-AppxPackage Executable attributes" ($gm.Contains('Get-AppxPackage') -and $gm.Contains('Executable="')) "Get-AppxPackage Executable detection missing"
+Add-Assertion "God-Mode-Windows.ps1: Detector A scans StartMenuInternet registered browsers" ($gm.Contains('StartMenuInternet')) "StartMenuInternet browser detection missing"
+Add-Assertion "God-Mode-Windows.ps1: Get-IfeoElevationCandidates takes a CompatExclusions param" ($gm.Contains('$CompatExclusions')) "Get-IfeoElevationCandidates missing the CompatExclusions param"
+Add-Assertion "God-Mode-Windows.ps1: candidates filter drops AppX + browser (CompatExclusions ContainsKey)" ($gm.Contains('CompatExclusions.AppX.ContainsKey') -and $gm.Contains('CompatExclusions.Browser.ContainsKey')) "candidates compat filter missing"
+Add-Assertion "God-Mode-Windows.ps1: Install-IfeoElevation builds CompatExclusions once" ($gm.Contains('Get-GmSystemCompatExclusions')) "Install-IfeoElevation does not build CompatExclusions"
+Add-Assertion "God-Mode-Windows.ps1: seed filtered through CompatExclusions (filteredSeed + seedDroppedAppx)" ($gm.Contains('filteredSeed') -and $gm.Contains('seedDroppedAppx')) "seed compat filtering missing"
+Add-Assertion "God-Mode-Windows.ps1: IFEO log reports Detector A drops (droppedAppx/droppedBrowser)" ($gm.Contains('droppedAppx=$seedDroppedAppx')) "IFEO log line does not report Detector A drops"
+Add-Assertion "God-Mode-Windows.ps1: Install-ProcessHook creates GodModeAutoExclude dir + Everyone ACL (S-1-1-0)" ($gm.Contains('GodModeAutoExcludeDir') -and $gm.Contains('S-1-1-0')) "auto-exclude dir creation + Everyone ACL missing"
+Add-Assertion "God-Mode-Windows.ps1: Uninstall-ProcessHook removes GodModeAutoExclude dir (uninstaller current)" ($gm.Contains('Remove-Item -Path $GodModeAutoExcludeDir -Recurse')) "uninstaller does not remove the auto-exclude dir"
+Add-Assertion "God-Mode-Windows.ps1: Export-GodModeLogs has GM-PROXY AUTO-EXCLUDE STORE section" ($gm.Contains('GM-PROXY AUTO-EXCLUDE STORE')) "Export-GodModeLogs auto-exclude store section missing"
+Add-Assertion "God-Mode-Windows.ps1: per-app report has USERAUTOEXCLUDE hashtable key" ($gm.Contains('USERAUTOEXCLUDE=0')) "per-app report USERAUTOEXCLUDE key missing"
+Add-Assertion "God-Mode-Windows.ps1: per-app modeKey normalizes hyphen (USER-AUTOEXCLUDE -> USERAUTOEXCLUDE)" ($gm.Contains('USER-AUTOEXCLUDE -> USERAUTOEXCLUDE dict key')) "modeKey hyphen normalization missing -- USER-AUTOEXCLUDE would not count"
+Add-Assertion "God-Mode-Windows.ps1: per-app table has USER-AUTOEXCLUDE column header" ($gm.Contains('USER-AUTOEXCLUDE')) "per-app table USER-AUTOEXCLUDE column missing"
+Add-Assertion "God-Mode-Windows.ps1: Reset-GmProxyAutoExcludeStore helper defined (menu [18])" ($gm.Contains('function Reset-GmProxyAutoExcludeStore')) "Reset-GmProxyAutoExcludeStore missing"
+Add-Assertion "God-Mode-Windows.ps1: menu offers [18] RESET AUTO-EXCLUDE STORE" ($gm.Contains('[18] RESET AUTO-EXCLUDE STORE')) "menu [18] missing"
+Add-Assertion "God-Mode-Windows.ps1: menu Read-Host range is 1-18" ($gm.Contains('Select an administrative action (1-18)')) "menu range not updated to 1-18"
+Add-Assertion "God-Mode-Windows.ps1: switch case 18 calls Reset-GmProxyAutoExcludeStore" ($gm.Contains('Reset-GmProxyAutoExcludeStore')) "switch case 18 does not call Reset-GmProxyAutoExcludeStore"
+Add-Assertion "God-Mode-Windows.ps1: reset helper invokes gmproxy.exe --gm-reset-autoexclude (mutex-safe)" ($gm.Contains('--gm-reset-autoexclude')) "reset helper does not use the mutex-safe gmproxy reset hook"
 
 Write-Summary

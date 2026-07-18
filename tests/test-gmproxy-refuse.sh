@@ -144,6 +144,16 @@ grep -qF 'GmProxyDiagLogMutex' "$SRC" && record "src: Global GmProxyDiagLogMutex
 grep -qF 'SetSecurityDescriptorDacl' "$SRC" && record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 1 || record "src: SetSecurityDescriptorDacl NULL DACL present (admin + SYSTEM both open)" 0 "not found"
 grep -qF 'GM_DIAG_LOG_MUTEX_TIMEOUT_MS' "$SRC" && record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 1 || record "src: GM_DIAG_LOG_MUTEX_TIMEOUT_MS bounded wait present (never stall a launch)" 0 "not found"
 grep -qF 'WAIT_ABANDONED' "$SRC" && record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 1 || record "src: WAIT_ABANDONED tolerated (crashed holder does not block logging)" 0 "not found"
+# Runtime SYSTEM-crash auto-exclude store (Detector B) source invariants (runtime
+# proof in tests/test-gmproxy-autoexclude.sh): same symbol set as test-gmproxy-
+# session.sh, kept here so the REFUSE runtime test also guards the auto-exclude
+# machinery is present + the build links + runs with it.
+grep -qF 'GM_AUTOEXCLUDE_THRESHOLD' "$SRC" && record "src: GM_AUTOEXCLUDE_THRESHOLD present (crash threshold)" 1 || record "src: GM_AUTOEXCLUDE_THRESHOLD present (crash threshold)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeQuery' "$SRC" && record "src: GmProxyAutoExcludeQuery present (excluded lookup)" 1 || record "src: GmProxyAutoExcludeQuery present (excluded lookup)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeRecord' "$SRC" && record "src: GmProxyAutoExcludeRecord present (increment+threshold)" 1 || record "src: GmProxyAutoExcludeRecord present (increment+threshold)" 0 "not found"
+grep -qF 'GmProxyAutoExcludeMutex' "$SRC" && record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 1 || record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 0 "not found"
+grep -qF 'USER-AUTOEXCLUDE' "$SRC" && record "src: USER-AUTOEXCLUDE launch mode present" 1 || record "src: USER-AUTOEXCLUDE launch mode present" 0 "not found"
+grep -qF -- '--gm-reset-autoexclude' "$SRC" && record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 1 || record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 0 "not found"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.

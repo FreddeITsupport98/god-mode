@@ -16,6 +16,8 @@
 #include <stdarg.h>   /* va_list for DiagLog() */
 #include <userenv.h>  /* CreateEnvironmentBlock/DestroyEnvironmentBlock (Layer 1 env fix) */
 #include <sddl.h>    /* ConvertSidToStringSidW (elevation-context token SID logging) */
+#include <time.h>     /* time_t / time() for auto-exclude store timestamps (Detector B) */
+#include <stdlib.h>   /* _wtoi / _wtoi64 / wcstoul for auto-exclude store line parsing */
 
 #ifdef _MSC_VER
 #pragma comment(lib, "advapi32.lib")
@@ -201,6 +203,242 @@ static void DiagLog(const wchar_t* fmt, ...) {
         fflush(f);
     }
     if (hMutex) GmProxyDiagMutexRelease();
+}
+
+/* ------------------------------------------------------------------ */
+/* Detector B: runtime SYSTEM-crash auto-exclude store.                */
+/*                                                                     */
+/* A persistent text store records every base name that CRASHED as      */
+/* SYSTEM (child EXITED with a non-zero exit code and no surviving      */
+/* descendant -- a genuine crash, not a stub delegation). Once a base   */
+/* name has crashed >= GM_AUTOEXCLUDE_THRESHOLD times, gmproxy skips    */
+/* the SYSTEM token on its NEXT launch and reuses the interactive-      */
+/* session current-user CreateProcessW fallback so the app actually     */
+/* runs (as the normal user) instead of crashing again. The IFEO hook   */
+/* is RETAINED so God Mode stays the launch gatekeeper + keeps          */
+/* telemetry; the monitor can still attempt in-place elevation later.  */
+/*                                                                     */
+/* This is the safety net for apps that slip past Detector A            */
+/* (Get-GmAppClassification in God-Mode-Windows.ps1 drops known         */
+/* SYSTEM-incompatible classes -- AppX/WinUI packaged apps +           */
+/* registered browsers -- at install time). Detector B catches any     */
+/* UNKNOWN future app that crashes as SYSTEM and self-heals within      */
+/* threshold launches -- no hardcoded names, purely runtime crash       */
+/* observation.                                                        */
+/*                                                                     */
+/* CRASH-only (not CLEAN tree=0): a CLEAN exit with no descendant is   */
+/* ambiguous -- it may be a breakaway stub that delegated out-of-tree    */
+/* (the real app opened, NOT a failure -- see the CAVEAT in             */
+/* GmProxyLogLaunchReport). Incrementing on CLEAN would false-positive */
+/* on working breakaway stubs. CRASH (non-zero exit) is unambiguous:    */
+/* the app crashed as SYSTEM. This is the bulletproof choice -- do no   */
+/* harm to apps that might actually work.                              */
+/*                                                                     */
+/* Store path: C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat */
+/* Line format (UTF-8): basename|crashCount|lastCrashUnixTs|excluded    */
+/*   basename        = lowercase target base name (e.g. "chrome.exe")   */
+/*   crashCount      = number of SYSTEM crashes recorded                */
+/*   lastCrashUnixTs = Unix epoch seconds of the most recent crash      */
+/*   excluded        = 1 once crashCount >= threshold, else 0           */
+/*                                                                     */
+/* Bulletproofing:                                                     */
+/*  - Fail-open everywhere: a missing/corrupt/ACL-denied store NEVER    */
+/*    blocks a launch and never forces a wrong mode -- it degrades to   */
+/*    normal SYSTEM elevation.                                         */
+/*  - Cross-privilege: a Global named mutex with a NULL DACL so the     */
+/*    admin (user-session) gmproxy AND the SYSTEM (nested) gmproxy can  */
+/*    both open it -- same pattern as the diag-log mutex above.         */
+/*  - Bounded 1000ms mutex wait: a stuck holder never stalls a launch  */
+/*    (store recording is advisory, never on the critical path).        */
+/*  - Atomic write (temp file + MoveFileExW REPLACE_EXISTING under the  */
+/*    mutex): no partial lines survive a mid-write crash.               */
+/*  - Line-by-line corruption tolerance: a malformed line is skipped,   */
+/*    the whole file is never discarded.                                */
+/*  - 256-entry cap (evict oldest = lowest lastCrashTs) + 30-day stale  */
+/*    auto-drop on read: unbounded growth + permanent exclusion both    */
+/*    prevented. No reset-on-success -> excluded apps stay excluded     */
+/*    (no flap / re-crash storm) until 30-day staleness or manual reset */
+/*    (God-Mode-Windows.ps1 menu [18] RESET AUTO-EXCLUDE STORE).        */
+/*  - Session-0 refusal is UNCHANGED: auto-exclude only skips the       */
+/*    SYSTEM token; the ownerless-birth REFUSE guard in wmain still     */
+/*    fires when gmproxy itself is in Session 0 with no session-correct */
+/*    token (auto-excluded + Session-0 -> still REFUSE, never an        */
+/*    ownerless child).                                                 */
+/* ------------------------------------------------------------------ */
+#define GM_AUTOEXCLUDE_THRESHOLD        2      /* SYSTEM crashes before auto-exclude */
+#define GM_AUTOEXCLUDE_STALE_DAYS       30     /* drop entries older than this on read */
+#define GM_AUTOEXCLUDE_MAX_ENTRIES      256    /* cap; evict oldest (lowest lastCrashTs) */
+#define GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS 1000   /* bounded wait; never stall a launch */
+#define GM_AUTOEXCLUDE_BASE_CAP         64     /* max base-name length stored (chars) */
+
+typedef struct {
+    wchar_t base[GM_AUTOEXCLUDE_BASE_CAP];
+    DWORD   crashCount;
+    time_t  lastCrashTs;
+    BOOL    excluded;
+} GmAutoExcludeEntry;
+
+static HANDLE g_GmProxyAutoExcludeMutex = NULL;
+
+/* Global NULL-DACL mutex so admin + SYSTEM gmproxy both serialize store */
+/* writes (mirrors GmProxyDiagMutexAcquire above). */
+static HANDLE GmProxyAutoExcludeMutexAcquire(void) {
+    if (!g_GmProxyAutoExcludeMutex) {
+        SECURITY_DESCRIPTOR sd; SECURITY_ATTRIBUTES sa;
+        ZeroMemory(&sd, sizeof(sd)); ZeroMemory(&sa, sizeof(sa));
+        if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) &&
+            SetSecurityDescriptorDacl(&sd, TRUE, NULL, FALSE)) {
+            sa.nLength = sizeof(sa);
+            sa.lpSecurityDescriptor = &sd;
+            sa.bInheritHandle = FALSE;
+            g_GmProxyAutoExcludeMutex = CreateMutexW(&sa, FALSE, L"Global\\GmProxyAutoExcludeMutex");
+        }
+        if (!g_GmProxyAutoExcludeMutex) {
+            g_GmProxyAutoExcludeMutex = CreateMutexW(NULL, FALSE, L"Global\\GmProxyAutoExcludeMutex");
+        }
+    }
+    if (!g_GmProxyAutoExcludeMutex) return NULL;
+    DWORD wr = WaitForSingleObject(g_GmProxyAutoExcludeMutex, GM_AUTOEXCLUDE_MUTEX_TIMEOUT_MS);
+    if (wr == WAIT_OBJECT_0 || wr == WAIT_ABANDONED) return g_GmProxyAutoExcludeMutex;
+    return NULL;
+}
+
+static void GmProxyAutoExcludeMutexRelease(void) {
+    if (g_GmProxyAutoExcludeMutex) ReleaseMutex(g_GmProxyAutoExcludeMutex);
+}
+
+/* Fill buf with the full store path. Returns FALSE on buffer overflow. */
+static BOOL GmProxyAutoExcludeStorePath(wchar_t* buf, size_t cap) {
+    if (!buf || cap == 0) return FALSE;
+    const wchar_t kPath[] = L"C:\\ProgramData\\GodModeAutoExclude\\gmproxy_autoexclude.dat";
+    if (sizeof(kPath)/sizeof(kPath[0]) > cap) return FALSE;
+    wcscpy(buf, kPath);
+    return TRUE;
+}
+
+/* Parse one "base|crashCount|lastCrashTs|excluded" line manually (no     */
+/* swscanf scanset pitfalls). Returns TRUE on a well-formed line.         */
+static BOOL GmProxyAutoExcludeParseLine(const wchar_t* line,
+                                         wchar_t* base, size_t baseCap,
+                                         DWORD* crashCount,
+                                         time_t* lastCrashTs, BOOL* excluded) {
+    if (!line || !base || !crashCount || !lastCrashTs || !excluded || baseCap == 0) return FALSE;
+    base[0] = 0; *crashCount = 0; *lastCrashTs = 0; *excluded = FALSE;
+    const wchar_t* p1 = wcschr(line, L'|'); if (!p1) return FALSE;
+    const wchar_t* p2 = wcschr(p1 + 1, L'|'); if (!p2) return FALSE;
+    const wchar_t* p3 = wcschr(p2 + 1, L'|'); if (!p3) return FALSE;
+    size_t baseLen = (size_t)(p1 - line);
+    if (baseLen == 0 || baseLen >= baseCap) return FALSE;
+    wcsncpy(base, line, baseLen); base[baseLen] = 0;
+    *crashCount = (DWORD)wcstoul(p1 + 1, NULL, 10);     /* stops at '|' */
+    *lastCrashTs = (time_t)_wtoi64(p2 + 1);              /* stops at '|' */
+    *excluded = (_wtoi(p3 + 1) != 0);                    /* stops at newline */
+    return TRUE;
+}
+
+/* Load + prune the store into entries[]. Returns the entry count (0 on   */
+/* any failure -- fail-open). Drops stale entries (> STALE_DAYS) and      */
+/* truncates to maxEntries. */
+static int GmProxyAutoExcludeLoad(GmAutoExcludeEntry* entries, int maxEntries) {
+    if (!entries || maxEntries <= 0) return 0;
+    wchar_t path[MAX_PATH] = {0};
+    if (!GmProxyAutoExcludeStorePath(path, MAX_PATH)) return 0;
+    FILE* f = _wfopen(path, L"r");
+    if (!f) return 0;  /* fail-open: no store -> no exclusions */
+    int n = 0;
+    wchar_t line[256];
+    time_t now = time(NULL);
+    time_t staleSec = (time_t)GM_AUTOEXCLUDE_STALE_DAYS * 86400;
+    while (n < maxEntries && fgetws(line, 256, f)) {
+        GmAutoExcludeEntry e;
+        if (!GmProxyAutoExcludeParseLine(line, e.base, GM_AUTOEXCLUDE_BASE_CAP,
+                                          &e.crashCount, &e.lastCrashTs, &e.excluded)) continue;
+        if (e.lastCrashTs > 0 && now > e.lastCrashTs && (now - e.lastCrashTs) > staleSec) continue;  /* stale */
+        entries[n++] = e;
+    }
+    fclose(f);
+    return n;
+}
+
+/* Returns TRUE if baseName is currently auto-excluded (crashCount >=    */
+/* threshold). Read-only; no mutex (atomic rename guarantees consistency).*/
+static BOOL GmProxyAutoExcludeQuery(const wchar_t* baseName) {
+    if (!baseName || !baseName[0]) return FALSE;
+    GmAutoExcludeEntry entries[GM_AUTOEXCLUDE_MAX_ENTRIES];
+    int n = GmProxyAutoExcludeLoad(entries, GM_AUTOEXCLUDE_MAX_ENTRIES);
+    for (int i = 0; i < n; i++) {
+        if (_wcsicmp(entries[i].base, baseName) == 0) return entries[i].excluded;
+    }
+    return FALSE;
+}
+
+/* Atomic write of entries[] to the store (temp + MoveFileExW).          */
+static void GmProxyAutoExcludeWrite(const GmAutoExcludeEntry* entries, int n) {
+    wchar_t path[MAX_PATH] = {0};
+    if (!GmProxyAutoExcludeStorePath(path, MAX_PATH)) return;
+    wchar_t tmp[MAX_PATH] = {0};
+    if (wcslen(path) + 8 > MAX_PATH) return;
+    wcscpy(tmp, path); wcscat(tmp, L".tmp");
+    FILE* f = _wfopen(tmp, L"w");
+    if (!f) return;  /* fail-open */
+    for (int i = 0; i < n; i++) {
+        fwprintf(f, L"%ls|%lu|%lld|%d\n", entries[i].base,
+                 (unsigned long)entries[i].crashCount,
+                 (long long)entries[i].lastCrashTs,
+                 entries[i].excluded ? 1 : 0);
+    }
+    fflush(f);
+    fclose(f);
+    if (!MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(tmp);  /* replace failed (ACL?): best-effort, fail-open */
+    }
+}
+
+/* Record a SYSTEM crash for baseName: increment crashCount, update      */
+/* lastCrashTs, set excluded at threshold, evict oldest if at cap, write  */
+/* atomically under the mutex. Best-effort: never affects the launch.     */
+static void GmProxyAutoExcludeRecord(const wchar_t* baseName) {
+    if (!baseName || !baseName[0]) return;
+    HANDLE hMutex = GmProxyAutoExcludeMutexAcquire();
+    if (!hMutex) return;  /* fail-open: can't lock, skip recording */
+    GmAutoExcludeEntry entries[GM_AUTOEXCLUDE_MAX_ENTRIES];
+    int n = GmProxyAutoExcludeLoad(entries, GM_AUTOEXCLUDE_MAX_ENTRIES);
+    int idx = -1;
+    for (int i = 0; i < n; i++) {
+        if (_wcsicmp(entries[i].base, baseName) == 0) { idx = i; break; }
+    }
+    time_t now = time(NULL);
+    BOOL isNew = (idx < 0);
+    if (isNew) {
+        if (n >= GM_AUTOEXCLUDE_MAX_ENTRIES) {
+            int oldest = 0;
+            for (int i = 1; i < n; i++) {
+                if (entries[i].lastCrashTs < entries[oldest].lastCrashTs) oldest = i;
+            }
+            idx = oldest;  /* evict oldest, reuse its slot */
+        } else {
+            idx = n; n++;
+        }
+        wcsncpy(entries[idx].base, baseName, GM_AUTOEXCLUDE_BASE_CAP - 1);
+        entries[idx].base[GM_AUTOEXCLUDE_BASE_CAP - 1] = 0;
+        entries[idx].crashCount = 0;
+        entries[idx].lastCrashTs = 0;
+        entries[idx].excluded = FALSE;
+    }
+    entries[idx].crashCount++;
+    entries[idx].lastCrashTs = now;
+    entries[idx].excluded = (entries[idx].crashCount >= GM_AUTOEXCLUDE_THRESHOLD);
+    GmProxyAutoExcludeWrite(entries, n);
+    GmProxyAutoExcludeMutexRelease();
+}
+
+/* Delete the store (God-Mode-Windows.ps1 menu [18] + uninstall). */
+static void GmProxyAutoExcludeReset(void) {
+    wchar_t path[MAX_PATH] = {0};
+    if (!GmProxyAutoExcludeStorePath(path, MAX_PATH)) return;
+    HANDLE hMutex = GmProxyAutoExcludeMutexAcquire();
+    DeleteFileW(path);
+    if (hMutex) GmProxyAutoExcludeMutexRelease();
 }
 
 /* ------------------------------------------------------------------ */
@@ -433,6 +671,18 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
         } else if (hJob) {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls tree=0 (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
+            /* Detector B: a confirmed SYSTEM-mode CRASH (tree=0, non-zero exit,
+               job observed so no surviving descendant) is a genuine "app crashed
+               as SYSTEM" signal. Record it so the NEXT launch auto-excludes to
+               the current-user fallback. CLEAN (exitcode 0) is NOT recorded -- it
+               may be a breakaway stub that delegated out-of-tree (the real app
+               opened; see the CAVEAT above). The job=disabled branch below is
+               also NOT recorded (tree state unconfirmed). FALLBACK / USER-
+               AUTOEXCLUDE modes are NOT recorded -- the child was not born as
+               SYSTEM. Best-effort: a store write failure never affects the launch. */
+            if (code != 0 && _wcsicmp(mode, L"SYSTEM") == 0) {
+                GmProxyAutoExcludeRecord(base);
+            }
         } else {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls job=disabled (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
@@ -627,6 +877,17 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
+    /* Hidden maintenance hook: --gm-reset-autoexclude clears the Detector B
+       crash store (called by God-Mode-Windows.ps1 menu [18]). Acquires the
+       store mutex so it cannot race a concurrent gmproxy launch mid-write,
+       then returns immediately without ever reaching the IFEO launch path.
+       This also keeps GmProxyAutoExcludeReset referenced (no dead code). */
+    if (_wcsicmp(argv[1], L"--gm-reset-autoexclude") == 0) {
+        GmProxyAutoExcludeReset();
+        DiagLog(L"[GM-PROXY] AUTO-EXCLUDE store reset (--gm-reset-autoexclude).\n");
+        return 0;
+    }
+
     /* Reject over-long target paths up front: several stack buffers below are
        MAX_PATH wide and wcscpy/swprintf would otherwise overflow them. */
     if (wcslen(argv[1]) >= MAX_PATH) {
@@ -644,6 +905,16 @@ int wmain(int argc, wchar_t* argv[]) {
         GmWidenAscii(__TIME__, wtime, 16);
         DiagLog(L"[GM-PROXY] BUILD %ls %ls (compiled)\n", wdate, wtime);   /* %ls: wide wdate/wtime (MinGW %s truncates wchar_t) */
     }
+
+    /* Detector B query: if this target previously crashed as SYSTEM >=
+       GM_AUTOEXCLUDE_THRESHOLD times, skip the SYSTEM token and launch as
+       the current user so the app runs instead of crashing again. The IFEO
+       hook is retained (God Mode stays the gatekeeper + telemetry). Read-
+       only; fail-open (missing/corrupt/ACL-denied store -> no exclusions ->
+       normal SYSTEM elevation). */
+    const wchar_t* targetBase = wcsrchr(argv[1], L'\\');
+    if (targetBase) targetBase++; else targetBase = argv[1];
+    const BOOL autoExcluded = GmProxyAutoExcludeQuery(targetBase);
 
     EnablePrivilege(L"SeDebugPrivilege");
     EnablePrivilege(L"SeImpersonatePrivilege");
@@ -692,7 +963,7 @@ int wmain(int argc, wchar_t* argv[]) {
        A token sourced from Session 0 (services/lsass) produces an ownerless
        child with no interactive desktop -- the reported "blank user id /
        unusable / instant-kill" symptom. */
-    DWORD srcPid = FindSystemProcessForToken(activeSession);
+    DWORD srcPid = autoExcluded ? 0 : FindSystemProcessForToken(activeSession);
     HANDLE hPrimary = NULL;
     if (srcPid != 0) {
         hPrimary = StealSystemToken(srcPid);
@@ -710,8 +981,10 @@ int wmain(int argc, wchar_t* argv[]) {
     /* If no active-session SYSTEM token is openable (e.g. all PPL-protected),
        try to steal ANY SYSTEM token and relocate it to the active session. This
        only succeeds when SeTcb is held (gmproxy running as SYSTEM); otherwise it
-       fails and we degrade gracefully (launch as the current user) below. */
-    if (!hPrimary) {
+       fails and we degrade gracefully (launch as the current user) below.
+       Skipped when auto-excluded (Detector B): we intentionally do NOT acquire
+       a SYSTEM token so the launch degrades to the current-user fallback. */
+    if (!autoExcluded && !hPrimary) {
         DWORD anyPid = FindAnySystemProcessPid();
         if (anyPid != 0) {
             HANDLE hTmp = StealSystemToken(anyPid);
@@ -729,7 +1002,9 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     const BOOL haveToken = (hPrimary != NULL);
-    if (!haveToken) {
+    if (autoExcluded) {
+        DiagLog(L"[GM-PROXY] AUTO-EXCLUDE: %ls previously crashed as SYSTEM >= %d times; launching as current user (IFEO hook retained; monitor may still elevate in-place).\n", targetBase, GM_AUTOEXCLUDE_THRESHOLD);
+    } else if (!haveToken) {
         DiagLog(L"[GM-PROXY] WARN: no usable SYSTEM token in session %lu; will launch target as current user (not SYSTEM).\n", activeSession);
     }
 
@@ -958,7 +1233,8 @@ int wmain(int argc, wchar_t* argv[]) {
        child handle. The wait returns immediately when the child exits (crash),
        so a fast-dying app adds ~0 latency; a healthy app keeps gmproxy alive
        for the grace window (acceptable for a diagnostic phase). */
-    GmProxyLogLaunchReport(argv[1], haveToken ? L"SYSTEM" : L"FALLBACK", injectFlag, TRUE, &pi, envBlock, srcPid, activeSession, hJob);
+    const wchar_t* launchMode = autoExcluded ? L"USER-AUTOEXCLUDE" : (haveToken ? L"SYSTEM" : L"FALLBACK");
+    GmProxyLogLaunchReport(argv[1], launchMode, injectFlag, TRUE, &pi, envBlock, srcPid, activeSession, hJob);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);

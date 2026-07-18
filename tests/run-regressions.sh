@@ -207,6 +207,26 @@ else
     fi
 fi
 
+# 5c. gmproxy Detector B auto-exclude store wine runtime test: RUNS the freshly-
+#     built gmproxy.exe under wine with a PRE-SEEDED crash store -> asserts the
+#     app auto-de-elevates to the current user (USER-AUTOEXCLUDE mode), a CORRUPT
+#     store fail-opens, and --gm-reset-autoexclude deletes the store. Runtime
+#     analogue of the source-level section 24 invariants (tests/test-gmproxy-
+#     autoexclude.sh).
+gmautoex="$SCRIPT_DIR/test-gmproxy-autoexclude.sh"
+if [ ! -f "$gmautoex" ]; then
+    record "test-gmproxy-autoexclude.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$gmautoex" >"$log" 2>&1; then
+        record "gmproxy AUTO-EXCLUDE: wine runtime (pre-seeded + corrupt + reset)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "gmproxy AUTO-EXCLUDE: wine runtime (pre-seeded + corrupt + reset)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
 # 6. syntax_check.ps1 honesty test (clean -> exit 0; broken .ps1/.c -> exit 1 + FAIL SUMMARY).
 synhonest="$SCRIPT_DIR/test-syntax-check.sh"
 if [ ! -f "$synhonest" ]; then
