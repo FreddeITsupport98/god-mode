@@ -3633,6 +3633,126 @@ function Export-GodModeLogs {
     }
 }
 
+function Test-GmAutoExcluded {
+    <#
+    .SYNOPSIS
+        Detector B store consult: return $true if a base name is currently
+        auto-excluded (gmproxy recorded it refusing/crashing as SYSTEM >=
+        GM_AUTOEXCLUDE_THRESHOLD times). Used by the monitor's elevation entry
+        points to SKIP re-elevating an app the runtime store learned is SYSTEM-
+        incompatible -- defense-in-depth alongside gmproxy's A3 (no feedback
+        handoff for autoExcluded) and gmhook's B2 (no SYSTEM birth for excluded
+        bases). Fail-open: a missing/corrupt/ACL-denied store -> $false -> normal
+        elevation (never blocks elevation on a store error).
+    .PARAMETER BaseName
+        The target base name WITH extension (e.g. "notepad.exe"), matching the
+        store line format "base|count|ts|excluded". Case-insensitive.
+    #>
+    param([string]$BaseName)
+    if (-not $BaseName) { return $false }
+    try {
+        if (-not (Test-Path $GodModeAutoExcludeFile)) { return $false }
+        $lines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+        if (-not $lines) { return $false }
+        $target = $BaseName.ToLower()
+        foreach ($line in $lines) {
+            if (-not $line) { continue }
+            $parts = $line -split '\|'
+            if ($parts.Count -ge 4 -and $parts[0].ToLower() -eq $target -and $parts[3] -eq '1') {
+                return $true
+            }
+        }
+    } catch {
+        return $false  # fail-open: store error -> not excluded -> normal elevation
+    }
+    return $false
+}
+
+function Add-GmAutoExcludeEntries {
+    <#
+    .SYNOPSIS
+        Persist base names to the Detector B auto-exclude store at threshold
+        (count=2, excluded=1) so gmproxy + gmhook + the monitor all treat them
+        as excluded from the FIRST launch after enable. Called once by
+        Install-IfeoElevation with the dropped BROWSER base names (UWP/AppX
+        stay hooked -> try SYSTEM first -> Detector B catches refusals at
+        runtime). Opens the same Global kernel mutex gmproxy.c uses
+        (Global\GmProxyAutoExcludeMutex) so it cannot race a concurrent gmproxy
+        launch mid-write; if the mutex does not exist yet (first install,
+        gmproxy has not run), proceeds without it -- the atomic temp+rename is
+        the real consistency guarantee, and no concurrent gmproxy can race us
+        before the IFEO hooks are live. Fail-open: any error -> skip (never
+        blocks the install).
+    .PARAMETER BaseNames
+        Array of base names WITH extension (e.g. "chrome.exe").
+    #>
+    param([string[]]$BaseNames)
+    if (-not $BaseNames -or $BaseNames.Count -eq 0) { return }
+    try {
+        if (-not (Test-Path $GodModeAutoExcludeDir)) {
+            $null = New-Item -Path $GodModeAutoExcludeDir -ItemType Directory -Force -ErrorAction SilentlyContinue
+        }
+        # Cross-privilege mutex (same name as gmproxy.c). Try to open it; if it
+        # does not exist yet (first install), proceed without -- the atomic
+        # temp+rename write is the real consistency guarantee, and no concurrent
+        # gmproxy can race us before the IFEO hooks are live.
+        $mutex = $null
+        $mutexName = "Global\GmProxyAutoExcludeMutex"
+        try { $mutex = [System.Threading.Mutex]::OpenExisting($mutexName) } catch { $mutex = $null }
+        $owned = $false
+        if ($mutex) {
+            try { $owned = $mutex.WaitOne(1000) } catch { $owned = $false }
+        }
+        try {
+            # Load existing entries (skip bad lines, mirror gmproxy.c's parser).
+            $existing = @{}
+            if (Test-Path $GodModeAutoExcludeFile) {
+                $lines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+                if ($lines) {
+                    foreach ($line in $lines) {
+                        if (-not $line) { continue }
+                        $parts = $line -split '\|'
+                        if ($parts.Count -ge 4) {
+                            $existing[$parts[0].ToLower()] = $line.Trim()
+                        }
+                    }
+                }
+            }
+            # Merge: for each new name, write base|2|<now>|1 (threshold, excluded).
+            # If the name already exists, keep the higher count and never downgrade
+            # excluded (a later Detector B record only raises count and keeps
+            # excluded=TRUE -- this helper never downgrades).
+            $nowTs = [int64][DateTimeOffset]::Now.ToUnixTimeSeconds()
+            foreach ($name in $BaseNames) {
+                if (-not $name) { continue }
+                $key = $name.ToLower()
+                if ($existing.ContainsKey($key)) {
+                    $parts = $existing[$key] -split '\|'
+                    $cnt = 2; if ($parts.Count -ge 2) { $cnt = [int]$parts[1]; if ($cnt -lt 2) { $cnt = 2 } }
+                    $excl = 1; if ($parts.Count -ge 4) { $excl = [int]$parts[3]; if ($excl -lt 1) { $excl = 1 } }
+                    $existing[$key] = "$key|$cnt|$nowTs|$excl"
+                } else {
+                    $existing[$key] = "$key|2|$nowTs|1"
+                }
+            }
+            # Atomic write (temp + Move-Item -Force, mirrors gmproxy.c's
+            # MoveFileExW REPLACE_EXISTING).
+            $tmp = "$GodModeAutoExcludeFile.tmp"
+            $content = ($existing.Values | ForEach-Object { $_ }) -join "`n"
+            if ($content) { $content += "`n" }
+            Set-Content -Path $tmp -Value $content -Encoding UTF8 -ErrorAction SilentlyContinue
+            if (Test-Path $tmp) {
+                Move-Item -Path $tmp -Destination $GodModeAutoExcludeFile -Force -ErrorAction SilentlyContinue
+            }
+        } finally {
+            if ($owned -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
+            if ($mutex) { try { $mutex.Close() } catch {} }
+        }
+    } catch {
+        Write-DebugLog -FunctionName "Add-GmAutoExcludeEntries" -Action "WARN" -Message "Failed: $_"
+    }
+}
+
 function Reset-GmProxyAutoExcludeStore {
     <#
     .SYNOPSIS
@@ -4548,41 +4668,76 @@ function Get-GmSystemCompatExclusions {
         Install-IfeoElevation; the returned sets are checked against both the
         curated seed and the auto-populated candidates.
     .DESCRIPTION
-        No hardcoded app names. AppX is detected two ways: (1) the AppX
-        execution-alias reparse points in %LOCALAPPDATA%\Microsoft\WindowsApps
-        (Win11 Store aliases -- notepad/calc/photos/etc.); (2) Get-AppxPackage
-        application Executable attributes parsed from each AppXManifest.xml
-        (catches Store apps without an alias). Browsers are detected from the
-        registered StartMenuInternet clients (HKLM/HKCU \SOFTWARE\Clients\n        StartMenuInternet\<Client>\shell\open\command) -- every installed +
-        registered browser (Chrome, Firefox, Edge, Brave, Arc, ...) with no
-        name list. Fail-open: any error (missing Appx module on Server Core,
-        registry parse failure, ACL denial) -> that set is empty -> the app
-        stays hookable -> Detector B (gmproxy.c runtime crash store) catches
-        it as the safety net.
+        No hardcoded app names. AppX/UWP is detected THREE ways: (1) the AppX
+        execution-alias reparse points in ALL user profiles'
+        AppData\Local\Microsoft\WindowsApps (Win11 Store aliases --
+        notepad/calc/photos/etc. -- scanning ALL profiles, not just
+        $env:LOCALAPPDATA, catches aliases for other users + system-
+        provisioned aliases); (2) Get-AppxPackage application Executable
+        attributes parsed from each AppXManifest.xml (per-user); (3)
+        Get-AppxPackage -AllUsers (catches system-provisioned AppX like the
+        Win11 Store Notepad that per-user Get-AppxPackage misses on an admin
+        account). Browsers are detected from the registered StartMenuInternet
+        clients (HKLM/HKCU\SOFTWARE\Clients\StartMenuInternet\<Client>\
+        shell\open\command) -- every installed + registered browser (Chrome,
+        Firefox, Edge, Brave, Arc, ...) with no name list.
+        STRATEGY: only BROWSERS are dropped from IFEO (launch as user from
+        launch #1). UWP/AppX STAY hooked -> try SYSTEM first -> Detector B
+        (widened to record CLEAN-GUI refusals) catches failures at runtime
+        and auto-excludes after 2 refusals. The AppX set is still built (for
+        classification/telemetry + future use) but is NOT used to drop from
+        IFEO. Fail-open: any error -> that set is empty.
     .OUTPUTS
         @{ AppX = hashtable-of-lowercase-basenames; Browser = hashtable-of-lowercase-basenames }
     #>
     $appx = @{}
     $browser = @{}
 
-    # --- AppX (1): execution-alias reparse points in WindowsApps ---
+    # --- AppX (1): execution-alias reparse points in WindowsApps (ALL profiles) ---
     try {
-        $aliasDir = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
-        if (Test-Path $aliasDir) {
-            Get-ChildItem -Path $aliasDir -Filter "*.exe" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        $usersRoot = "C:\Users"
+        if (Test-Path $usersRoot) {
+            Get-ChildItem -Path $usersRoot -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
                 try {
-                    if ($_.Attributes.ToString() -match "ReparsePoint") {
-                        $appx[$_.Name.ToLower()] = $true
+                    $aliasDir = Join-Path $_.FullName "AppData\Local\Microsoft\WindowsApps"
+                    if (-not (Test-Path $aliasDir)) { return }
+                    Get-ChildItem -Path $aliasDir -Filter "*.exe" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                        try {
+                            if ($_.Attributes.ToString() -match "ReparsePoint") {
+                                $appx[$_.Name.ToLower()] = $true
+                            }
+                        } catch {}
                     }
                 } catch {}
             }
         }
     } catch {}
 
-    # --- AppX (2): Get-AppxPackage application Executable attributes ---
+    # --- AppX (2): Get-AppxPackage application Executable attributes (per-user) ---
     try {
         $pkgs = Get-AppxPackage -ErrorAction SilentlyContinue
         foreach ($pkg in $pkgs) {
+            try {
+                $manifestPath = Join-Path $pkg.InstallLocation "AppXManifest.xml"
+                if (-not (Test-Path $manifestPath)) { continue }
+                $manifest = Get-Content $manifestPath -Raw -ErrorAction SilentlyContinue
+                if (-not $manifest) { continue }
+                $exeMatches = [regex]::Matches($manifest, 'Executable="([^"]+\.exe)"', 'IgnoreCase')
+                foreach ($em in $exeMatches) {
+                    $b = [System.IO.Path]::GetFileName($em.Groups[1].Value)
+                    if ($b) { $appx[$b.ToLower()] = $true }
+                }
+            } catch {}
+        }
+    } catch {}
+
+    # --- AppX (3): Get-AppxPackage -AllUsers (system-provisioned AppX like ---
+    #     the Win11 Store Notepad that per-user Get-AppxPackage misses on an
+    #     admin account). Fail-open: -AllUsers needs admin; on a non-admin or
+    #     Server Core without the Appx module this throws and is swallowed.
+    try {
+        $pkgsAll = Get-AppxPackage -AllUsers -ErrorAction SilentlyContinue
+        foreach ($pkg in $pkgsAll) {
             try {
                 $manifestPath = Join-Path $pkg.InstallLocation "AppXManifest.xml"
                 if (-not (Test-Path $manifestPath)) { continue }
@@ -4773,14 +4928,14 @@ function Get-IfeoElevationCandidates {
             if ($excludeSet.ContainsKey($bare)) { $excluded++; continue }
 
             # Safety net #3 (Detector A): drop structurally SYSTEM-incompatible
-            # classes -- AppX/WinUI packaged apps + registered browsers -- so
-            # they launch as the normal user instead of via gmproxy -> SYSTEM
-            # (where they crash / render blank / exit with no window). The set
-            # is built once by Get-GmSystemCompatExclusions (Install-IfeoElevation)
-            # and passed in. Fail-open: a null set -> no compat drop -> Detector B
-            # (gmproxy.c runtime crash store) is the safety net.
+            # BROWSERS only so they launch as the normal user instead of via
+            # gmproxy -> SYSTEM (where they crash / render blank). UWP/AppX are
+            # NOT dropped -- they stay hooked -> try SYSTEM first -> Detector B
+            # (widened to record CLEAN-GUI refusals) auto-excludes after 2
+            # refusals. The AppX set is still built by Get-GmSystemCompatExclusions
+            # (for classification) but is NOT used to drop here. Fail-open: a
+            # null set -> no compat drop -> Detector B is the safety net.
             if ($CompatExclusions) {
-                if ($CompatExclusions.AppX.ContainsKey($baseKey)) { $excluded++; continue }
                 if ($CompatExclusions.Browser.ContainsKey($baseKey)) { $excluded++; continue }
             }
 
@@ -4822,30 +4977,46 @@ function Install-IfeoElevation {
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
 
-        # Detector A: build the SYSTEM-incompatible base-name sets (AppX +
-        # registered browsers) ONCE, then drop those from BOTH the curated seed
-        # and the auto-populated candidates so they launch as the normal user
-        # instead of via gmproxy -> SYSTEM. Fail-open (empty sets -> no drop ->
+        # Detector A: build the SYSTEM-incompatible base-name sets (AppX/UWP +
+        # registered browsers) ONCE. Only BROWSERS are dropped from the hook set
+        # (launch as user from launch #1). UWP/AppX STAY hooked -> try SYSTEM
+        # first -> Detector B (widened to record CLEAN-GUI refusals) auto-
+        # excludes after 2 refusals. Fail-open (empty sets -> no drop ->
         # Detector B in gmproxy.c is the runtime safety net).
         $CompatExclusions = Get-GmSystemCompatExclusions
 
         # Auto-populate additional candidates from installed/running programs,
-        # passing the compat sets so the same filter applies there. Then merge.
+        # passing the compat sets so the same browser-only filter applies there.
         $autoCandidates = Get-IfeoElevationCandidates -GmProxyExe $GmProxyExe -CompatExclusions $CompatExclusions
 
         # Filter the curated seed through the compat sets (the seed bypasses
-        # Get-IfeoElevationCandidates' path/denylist filters, so AppX/browser
-        # names like chrome.exe / firefox.exe / notepad.exe in the seed must be
-        # dropped here explicitly). Count drops for the log line below.
-        $seedDroppedAppx = 0; $seedDroppedBrowser = 0
+        # Get-IfeoElevationCandidates' path/denylist filters, so browser names
+        # like chrome.exe / firefox.exe in the seed must be dropped here
+        # explicitly). UWP/AppX names (notepad.exe, calc.exe) are NOT dropped --
+        # they stay hooked so they try SYSTEM first and Detector B catches
+        # refusals at runtime. Collect the dropped BROWSER names for the store
+        # persist below (so gmproxy + gmhook + the monitor exclude them from
+        # launch #1, defense-in-depth alongside the IFEO drop).
+        $seedDroppedBrowser = 0
+        $droppedBrowserNames = @()
         $filteredSeed = @()
         foreach ($app in $IfeoElevationApps) {
             $bk = $app.ToLower()
-            if ($CompatExclusions.AppX.ContainsKey($bk)) { $seedDroppedAppx++; continue }
-            if ($CompatExclusions.Browser.ContainsKey($bk)) { $seedDroppedBrowser++; continue }
+            if ($CompatExclusions.Browser.ContainsKey($bk)) { $seedDroppedBrowser++; $droppedBrowserNames += $app; continue }
             $filteredSeed += $app
         }
         $allApps = $filteredSeed + $autoCandidates | Select-Object -Unique
+
+        # Detector A persist: write the dropped BROWSER base names to the
+        # auto-exclude store at threshold (count=2, excluded=1) so gmproxy +
+        # gmhook + the monitor all treat them as excluded from the FIRST launch
+        # after enable -- defense-in-depth alongside the IFEO drop (covers the
+        # gmhook child-birth path + the monitor periodic scan, which the IFEO
+        # drop alone does not reach). UWP/AppX are NOT persisted here -- they
+        # get a SYSTEM attempt first and rely on Detector B runtime catch.
+        if ($droppedBrowserNames.Count -gt 0) {
+            Add-GmAutoExcludeEntries -BaseNames $droppedBrowserNames
+        }
 
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
@@ -4887,8 +5058,8 @@ function Install-IfeoElevation {
         $totalUnique = $allApps.Count
         $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
         if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedAppx AppX + $seedDroppedBrowser browser from the seed (launch as user, not SYSTEM). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedAppx=$seedDroppedAppx droppedBrowser=$seedDroppedBrowser"
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser from the seed (launch as user from launch #1; persisted to auto-exclude store). UWP/AppX stay hooked -> try SYSTEM first -> Detector B catches CLEAN-GUI refusals (auto-exclude after 2). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count)"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
@@ -5786,10 +5957,14 @@ function Invoke-ExistingProcessElevation {
     $failCount = 0
     Write-Log -Message "Aggressive scan found $total non-SYSTEM processes to elevate. Deduplicating and launching parallel elevation..." -Type "INFO" -Color Yellow
 
-    # Deduplicate by process name (detect first)
+    # Deduplicate by process name (detect first). Detector B store consult:
+    # skip auto-excluded base names so the aggressive startup scan does NOT
+    # force-elevate an app gmproxy learned is SYSTEM-incompatible (would re-kill
+    # it). Fail-open (missing store -> no exclusion -> normal scan).
     $seen = @{}
     $uniqueTargets = foreach ($proc in $targetProcs) {
         $procName = [System.IO.Path]::GetFileNameWithoutExtension($proc.ExecutablePath)
+        if (Test-GmAutoExcluded "$procName.exe") { continue }
         if (-not $seen.ContainsKey($procName)) {
             $seen[$procName] = $true
             $proc
@@ -5839,6 +6014,14 @@ function Invoke-GmProxyFeedbackElevation {
         Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is shell/critical; skipping in-place elevation"
         return $false
     }
+    # Detector B store consult (defense-in-depth): even though gmproxy A3
+    # skips the feedback handoff for auto-excluded PIDs, if a PID somehow
+    # arrives here, do NOT re-elevate it to SYSTEM (that would defeat the
+    # auto-exclude and re-kill the app). Fail-open (missing store -> elevate).
+    if (Test-GmAutoExcluded "$($proc.Name).exe") {
+        Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is auto-excluded (Detector B); not re-elevating"
+        return $false
+    }
     Enable-ElevationPrivileges
     [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
     $systemPid = Find-SystemProcessCandidate
@@ -5864,6 +6047,15 @@ function Monitor-ElevateProcess {
         return $false
     }
     $procName = [System.IO.Path]::GetFileNameWithoutExtension($Path)
+    # Detector B store consult: if this base name is auto-excluded (gmproxy
+    # learned it refuses/crashes as SYSTEM >= threshold), leave it as the user --
+    # do NOT elevate. Defense-in-depth alongside gmproxy A3 (no feedback handoff)
+    # + gmhook B2 (no SYSTEM birth). Covers the WMI watcher drain + any direct
+    # Monitor-ElevateProcess call. Fail-open (missing store -> no exclusion).
+    if (Test-GmAutoExcluded "$procName.exe") {
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "SKIP" -Message "$procName.exe is auto-excluded (Detector B); leaving as user, not elevating"
+        return $true
+    }
     if (Test-SystemProcessExists -ProcessName "$procName.exe") {
         # Aggressive: if a SYSTEM instance exists, wipe all non-SYSTEM instances so the app is 100% SYSTEM
         Stop-NonSystemInstances -ProcessName "$procName.exe"
@@ -6106,6 +6298,10 @@ function Start-Monitoring {
                 foreach ($proc in $ExistingProcesses) {
                     $procName = [System.IO.Path]::GetFileName($proc.ExecutablePath)
                     if ($CriticalProcs -contains $procName) { continue }
+                    # Detector B store consult: skip auto-excluded base names so
+                    # the 15s periodic scan does NOT re-elevate an app gmproxy
+                    # learned is SYSTEM-incompatible. Fail-open (missing store).
+                    if (Test-GmAutoExcluded $procName) { continue }
                     $path = $proc.ExecutablePath
                     if (-not $lastElevated.ContainsKey($path) -or $lastElevated[$path] -lt (Get-Date).AddSeconds(-15)) {
                         $lastElevated[$path] = Get-Date

@@ -227,6 +227,30 @@ else
     fi
 fi
 
+# 5d. gmproxy CLEAN-GUI + A3 wine runtime test: RUNS the freshly-built gmproxy.exe
+#     under wine with a PRE-SEEDED auto-exclude store -> asserts USER-AUTOEXCLUDE
+#     mode AND that the PID is NOT handed to the monitor (A3: no "Handed PID" line
+#     in the log -- auto-excluded launches are not re-elevated in-place). Also
+#     grep-proves the CLEAN-GUI refusal recording source invariants (Part A2:
+#     GmProxyIsGuiSubsystem + IMAGE_SUBSYSTEM_WINDOWS_GUI + the widened record
+#     guard). The CLEAN-GUI RECORDING path itself cannot be exercised under wine
+#     (no real SYSTEM token -> mode=FALLBACK, not SYSTEM -> record guard never
+#     fires); the recording is proven at the source level here + in
+#     Test-GmProxySession.ps1 (tests/test-gmproxy-cleangui.sh).
+gmcleangui="$SCRIPT_DIR/test-gmproxy-cleangui.sh"
+if [ ! -f "$gmcleangui" ]; then
+    record "test-gmproxy-cleangui.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$gmcleangui" >"$log" 2>&1; then
+        record "gmproxy CLEAN-GUI + A3: wine runtime (USER-AUTOEXCLUDE + no Handed PID)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "gmproxy CLEAN-GUI + A3: wine runtime (USER-AUTOEXCLUDE + no Handed PID)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
 # 6. syntax_check.ps1 honesty test (clean -> exit 0; broken .ps1/.c -> exit 1 + FAIL SUMMARY).
 synhonest="$SCRIPT_DIR/test-syntax-check.sh"
 if [ ! -f "$synhonest" ]; then

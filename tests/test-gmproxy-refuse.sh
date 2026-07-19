@@ -154,6 +154,14 @@ grep -qF 'GmProxyAutoExcludeRecord' "$SRC" && record "src: GmProxyAutoExcludeRec
 grep -qF 'GmProxyAutoExcludeMutex' "$SRC" && record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 1 || record "src: Global GmProxyAutoExcludeMutex present (cross-privilege serializer)" 0 "not found"
 grep -qF 'USER-AUTOEXCLUDE' "$SRC" && record "src: USER-AUTOEXCLUDE launch mode present" 1 || record "src: USER-AUTOEXCLUDE launch mode present" 0 "not found"
 grep -qF -- '--gm-reset-autoexclude' "$SRC" && record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 1 || record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 0 "not found"
+# CLEAN-GUI refusal recording (Part A): gmproxy now records a SYSTEM-mode CLEAN
+# exit when the target is a GUI PE (IMAGE_SUBSYSTEM_WINDOWS_GUI), not just CRASH.
+# This is the fix for Win11 Notepad (CLEAN exit as SYSTEM, no window). The
+# NORMAL + FORCED builds below must link + run with this new code.
+grep -qF 'GmProxyIsGuiSubsystem' "$SRC" && record "src: GmProxyIsGuiSubsystem present (PE subsystem gate for CLEAN-GUI recording)" 1 || record "src: GmProxyIsGuiSubsystem present (PE subsystem gate for CLEAN-GUI recording)" 0 "not found -- CLEAN-GUI refusals (notepad) would never be recorded"
+grep -qF 'IMAGE_SUBSYSTEM_WINDOWS_GUI' "$SRC" && record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 1 || record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 0 "not found -- the PE-subsystem gate has no target value"
+grep -qF 'IMAGE_FILE_HEADER' "$SRC" && record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 1 || record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 0 "not found -- Subsystem would read from the wrong offset"
+grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found -- auto-excluded PIDs would be re-elevated by the monitor"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.

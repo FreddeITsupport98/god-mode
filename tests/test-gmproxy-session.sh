@@ -15,6 +15,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$(cd "$SCRIPT_DIR/.." && pwd)/driver/gmproxy.c"
+GMHOOK_SRC="$(cd "$SCRIPT_DIR/.." && pwd)/driver/gmhook.c"
 
 pass_count=0
 fail_count=0
@@ -187,6 +188,32 @@ grep -qF 'USER-AUTOEXCLUDE' "$SRC" && record "src: USER-AUTOEXCLUDE launch mode 
 grep -qF 'MoveFileExW' "$SRC" && record "src: MoveFileExW present (atomic store write)" 1 || record "src: MoveFileExW present (atomic store write)" 0 "not found"
 grep -qF -- '--gm-reset-autoexclude' "$SRC" && record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 1 || record "src: --gm-reset-autoexclude CLI hook present (mutex-safe reset)" 0 "not found"
 grep -qF 'GodModeAutoExclude' "$SRC" && record "src: GodModeAutoExclude store path present" 1 || record "src: GodModeAutoExclude store path present" 0 "not found"
+
+# CLEAN-GUI refusal recording (Part A): gmproxy now records a SYSTEM-mode CLEAN
+# exit (exitcode 0, tree=0) WHEN the target is a GUI PE (IMAGE_SUBSYSTEM_WINDOWS_GUI),
+# not just CRASH (non-zero exit). This is the fix for Win11 Notepad -- it exits
+# CLEAN as SYSTEM (WinUI stub cannot init under SYSTEM) but is a GUI app, so the
+# widened guard records it and Detector B auto-excludes after 2 refusals. The
+# PE-subsystem gate avoids false-excluding console apps (nslookup/ftp/7z exit 0
+# as SYSTEM legitimately -- they are CUI, not GUI).
+grep -qF 'GmProxyIsGuiSubsystem' "$SRC" && record "src: GmProxyIsGuiSubsystem present (PE subsystem gate for CLEAN-GUI recording)" 1 || record "src: GmProxyIsGuiSubsystem present (PE subsystem gate for CLEAN-GUI recording)" 0 "not found -- CLEAN-GUI refusals (notepad) would never be recorded"
+grep -qF 'IMAGE_SUBSYSTEM_WINDOWS_GUI' "$SRC" && record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 1 || record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 0 "not found -- the PE-subsystem gate has no target value"
+grep -qF 'IMAGE_FILE_HEADER' "$SRC" && record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 1 || record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 0 "not found -- OptionalHeader.Subsystem would read from the wrong offset"
+grep -qF 'GmProxyIsGuiSubsystem(targetPath)' "$SRC" && record "src: widened record guard references GmProxyIsGuiSubsystem(targetPath)" 1 || record "src: widened record guard references GmProxyIsGuiSubsystem(targetPath)" 0 "not found -- CLEAN-GUI refusals not gated on the PE subsystem"
+grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found -- auto-excluded PIDs would be re-elevated by the monitor"
+
+# gmhook.c store consult (Part B): gmhook reads the auto-exclude store before
+# birthing a child as SYSTEM; a store-excluded base name falls through to the
+# real CreateProcessW (born as the host's normal user token, not SYSTEM). 2s
+# in-process cache so the CreateProcess hot path does at most one file read
+# per 2s per process. Fail-open.
+if [ -f "$GMHOOK_SRC" ]; then
+    grep -qF 'GmHookIsAutoExcluded' "$GMHOOK_SRC" && record "src: gmhook GmHookIsAutoExcluded present (store consult before SYSTEM birth)" 1 || record "src: gmhook GmHookIsAutoExcluded present (store consult before SYSTEM birth)" 0 "not found -- gmhook cannot consult the store"
+    grep -qF 'GmHookIsAutoExcluded(baseName)' "$GMHOOK_SRC" && record "src: gmhook HookCreateProcessW consults GmHookIsAutoExcluded(baseName)" 1 || record "src: gmhook HookCreateProcessW consults GmHookIsAutoExcluded(baseName)" 0 "not found -- excluded apps still born as SYSTEM from hooked hosts"
+    grep -qF 'GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS' "$GMHOOK_SRC" && record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 1 || record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 0 "not found -- CreateProcess hot path would read the store file every call"
+else
+    record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"
+fi
 
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then

@@ -403,6 +403,63 @@ static BOOL TryCreateProcessWithSystemToken(
         flagsOut, lpEnvironment, lpCurrentDirectory, pSi, lpProcessInformation);
 }
 
+/* Detector B store consult: read the auto-exclude store (written by
+   gmproxy.c) to decide whether a base name should be born as the host's
+   normal user token instead of SYSTEM. gmproxy records a base name here
+   after it refuses/crashes >= GM_AUTOEXCLUDE_THRESHOLD times as SYSTEM;
+   gmhook then SKIPS the SYSTEM-token birth for that base so the app is
+   not force-elevated (and re-killed) on every child launch from a hooked
+   host. No mutex (gmproxy's atomic temp+MoveFileExW rename guarantees a
+   consistent read); 2s in-process cache (GetTickCount64) so the
+   CreateProcess hot path does at most one tiny file read per 2s per
+   process. Fail-open: any read/parse error -> FALSE -> current SYSTEM-
+   birth behavior (never blocks elevation). No hardcoded app names --
+   the store is populated purely by runtime observation in gmproxy.c. */
+#define GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS 2000
+#define GMHOOK_AUTOEXCLUDE_MAX_ENTRIES 256
+#define GMHOOK_AUTOEXCLUDE_BASE_CAP    64
+
+typedef struct {
+    wchar_t base[GMHOOK_AUTOEXCLUDE_BASE_CAP];
+    BOOL    excluded;
+} GmHookAutoExcludeEntry;
+
+static BOOL GmHookIsAutoExcluded(const wchar_t* baseName) {
+    if (!baseName || !baseName[0]) return FALSE;  /* fail-open */
+    static GmHookAutoExcludeEntry cache[GMHOOK_AUTOEXCLUDE_MAX_ENTRIES];
+    static int cacheCount = -1;  /* -1 = not loaded yet */
+    static ULONGLONG cacheLoadTick = 0;
+    ULONGLONG now = GetTickCount64();
+    if (cacheCount < 0 || (now - cacheLoadTick) > GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS) {
+        cacheCount = 0;
+        cacheLoadTick = now;
+        const wchar_t kPath[] = L"C:\\ProgramData\\GodModeAutoExclude\\gmproxy_autoexclude.dat";
+        FILE* f = _wfopen(kPath, L"r");
+        if (f) {
+            wchar_t line[256];
+            while (cacheCount < GMHOOK_AUTOEXCLUDE_MAX_ENTRIES && fgetws(line, 256, f)) {
+                /* Parse "base|count|ts|excluded" manually (no swscanf pitfalls). */
+                const wchar_t* p1 = wcschr(line, L'|'); if (!p1) continue;
+                const wchar_t* p2 = wcschr(p1 + 1, L'|'); if (!p2) continue;
+                const wchar_t* p3 = wcschr(p2 + 1, L'|'); if (!p3) continue;
+                size_t baseLen = (size_t)(p1 - line);
+                if (baseLen == 0 || baseLen >= GMHOOK_AUTOEXCLUDE_BASE_CAP) continue;
+                wcsncpy(cache[cacheCount].base, line, baseLen);
+                cache[cacheCount].base[baseLen] = 0;
+                cache[cacheCount].excluded = (_wtoi(p3 + 1) != 0);
+                cacheCount++;
+            }
+            fclose(f);
+        }
+        /* If the file is absent/corrupt, cacheCount stays 0 (no exclusions)
+           for the TTL window -> fail-open -> normal SYSTEM-birth behavior. */
+    }
+    for (int i = 0; i < cacheCount; i++) {
+        if (_wcsicmp(cache[i].base, baseName) == 0) return cache[i].excluded;
+    }
+    return FALSE;  /* fail-open: not found -> not excluded */
+}
+
 static BOOL WINAPI HookCreateProcessW(
     LPCWSTR lpApplicationName,
     LPWSTR lpCommandLine,
@@ -498,6 +555,26 @@ static BOOL WINAPI HookCreateProcessW(
        excluded too. These hosts are still elevated to SYSTEM by the task /
        service path in God-Mode-Windows.ps1; they are simply not IAT-hooked. */
     if (IsCriticalProcess(baseName) || IsShellLauncherProcess(baseName)) {
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        InterlockedExchange(&inHook, 0);
+        return result;
+    }
+
+    /* Detector B store consult: if this base name was auto-excluded by
+       gmproxy (it refused/crashed as SYSTEM >= threshold times), do NOT
+       birth it as SYSTEM -- fall through to the real CreateProcessW so the
+       child is born as the host's normal user token. This prevents gmhook
+       from re-elevating (and re-killing) an app the runtime store already
+       learned is SYSTEM-incompatible. The store is the SAME file gmproxy.c
+       writes (C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat);
+       gmhook reads it with a 2s in-process cache. Fail-open: a
+       missing/corrupt/ACL-denied store -> GmHookIsAutoExcluded returns FALSE
+       -> normal SYSTEM-birth behavior (never blocks elevation). */
+    if (baseName && GmHookIsAutoExcluded(baseName)) {
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,

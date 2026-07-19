@@ -205,6 +205,49 @@ static void DiagLog(const wchar_t* fmt, ...) {
     if (hMutex) GmProxyDiagMutexRelease();
 }
 
+/* TRUE if exePath points at a PE image whose OptionalHeader.Subsystem
+   is IMAGE_SUBSYSTEM_WINDOWS_GUI (a windowed app). Used ONLY to gate
+   CLEAN-refusal recording in Detector B (a GUI app that exits 0 with no
+   surviving descendant as SYSTEM is a silent WinUI/AppX refusal, not a
+   legit CLI run). Console apps (IMAGE_SUBSYSTEM_WINDOWS_CUI) returning
+   CLEAN are NOT recorded -- nslookup/ftp/7z/etc. that exit 0 as SYSTEM
+   are legit runs, not failures. Fail-open: any read/parse error -> FALSE
+   (never blocks a launch; only suppresses CLEAN recording). No hardcoded
+   names -- the PE subsystem field is the no-hardcode disambiguator. */
+static BOOL GmProxyIsGuiSubsystem(const wchar_t* exePath) {
+    if (!exePath || !exePath[0]) return FALSE;
+    HANDLE h = CreateFileW(exePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;  /* fail-open */
+    BOOL isGui = FALSE;
+    IMAGE_DOS_HEADER dos = {0};
+    DWORD got = 0;
+    if (ReadFile(h, &dos, sizeof(dos), &got, NULL) && got == sizeof(dos) &&
+        dos.e_magic == IMAGE_DOS_SIGNATURE) {
+        /* Seek to the NT headers (e_lfanew). Layout: Signature(4) +
+           IMAGE_FILE_HEADER(20) + IMAGE_OPTIONAL_HEADER(...). Subsystem lives
+           in the OptionalHeader. We read Signature + FileHeader first, then the
+           OptionalHeader. Subsystem is at the SAME offset (68) in both PE32 and
+           PE32+ (the structs diverge at offset 24-31 but re-align at 32), so
+           reading an IMAGE_OPTIONAL_HEADER (PE32) struct from a PE32+ image
+           still yields the correct Subsystem field. */
+        if (SetFilePointer(h, dos.e_lfanew, NULL, FILE_BEGIN) != INVALID_SET_FILE_POINTER) {
+            DWORD sig = 0;
+            IMAGE_FILE_HEADER fh = {0};
+            if (ReadFile(h, &sig, sizeof(sig), &got, NULL) && got == sizeof(sig) &&
+                sig == IMAGE_NT_SIGNATURE &&
+                ReadFile(h, &fh, sizeof(fh), &got, NULL) && got == sizeof(fh)) {
+                IMAGE_OPTIONAL_HEADER opt = {0};
+                if (ReadFile(h, &opt, sizeof(opt), &got, NULL) && got == sizeof(opt)) {
+                    isGui = (opt.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI);
+                }
+            }
+        }
+    }
+    CloseHandle(h);
+    return isGui;
+}
+
 /* ------------------------------------------------------------------ */
 /* Detector B: runtime SYSTEM-crash auto-exclude store.                */
 /*                                                                     */
@@ -226,13 +269,21 @@ static void DiagLog(const wchar_t* fmt, ...) {
 /* threshold launches -- no hardcoded names, purely runtime crash       */
 /* observation.                                                        */
 /*                                                                     */
-/* CRASH-only (not CLEAN tree=0): a CLEAN exit with no descendant is   */
-/* ambiguous -- it may be a breakaway stub that delegated out-of-tree    */
-/* (the real app opened, NOT a failure -- see the CAVEAT in             */
-/* GmProxyLogLaunchReport). Incrementing on CLEAN would false-positive */
-/* on working breakaway stubs. CRASH (non-zero exit) is unambiguous:    */
-/* the app crashed as SYSTEM. This is the bulletproof choice -- do no   */
-/* harm to apps that might actually work.                              */
+/* Record CRASH (non-zero exit, tree=0, SYSTEM mode) AND CLEAN-GUI
+   refusal (exitcode 0, tree=0, SYSTEM mode, target PE subsystem ==
+   IMAGE_SUBSYSTEM_WINDOWS_GUI). A GUI app that silently exits 0 as
+   SYSTEM with no surviving descendant is a WinUI/AppX stub refusal
+   (the real symptom for Win11 Notepad) -- NOT a legit run, and NOT a
+   breakaway stub (a breakaway stub's real app opened out-of-tree, but a
+   GUI app that produces NO window AND no descendant is a genuine
+   refusal). The PE-subsystem gate (GmProxyIsGuiSubsystem) is the no-
+   hardcoded-name disambiguator: console apps (CUI) that exit 0 as SYSTEM
+   are legit CLI runs (nslookup/ftp/7z) and are NOT recorded -- no false
+   exclusion. The only "false positive" is a successful breakaway GUI
+   stub, which then runs as the user on the next launch = still works =
+   graceful, not a break. Threshold stays 2: a GUI app that refuses twice
+   as SYSTEM is auto-excluded. CRASH remains unambiguous (the app crashed
+   as SYSTEM) and is always recorded regardless of subsystem. */
 /*                                                                     */
 /* Store path: C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat */
 /* Line format (UTF-8): basename|crashCount|lastCrashUnixTs|excluded    */
@@ -671,16 +722,23 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
         } else if (hJob) {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls tree=0 (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
-            /* Detector B: a confirmed SYSTEM-mode CRASH (tree=0, non-zero exit,
-               job observed so no surviving descendant) is a genuine "app crashed
-               as SYSTEM" signal. Record it so the NEXT launch auto-excludes to
-               the current-user fallback. CLEAN (exitcode 0) is NOT recorded -- it
-               may be a breakaway stub that delegated out-of-tree (the real app
-               opened; see the CAVEAT above). The job=disabled branch below is
-               also NOT recorded (tree state unconfirmed). FALLBACK / USER-
-               AUTOEXCLUDE modes are NOT recorded -- the child was not born as
-               SYSTEM. Best-effort: a store write failure never affects the launch. */
-            if (code != 0 && _wcsicmp(mode, L"SYSTEM") == 0) {
+            /* Detector B: record a SYSTEM-mode refusal so the NEXT launch auto-
+               excludes to the current-user fallback. Two refusal flavors:
+                 (a) CRASH  -- exitcode != 0 (tree=0, job observed). Unambiguous:
+                     the app crashed as SYSTEM. Recorded regardless of subsystem.
+                 (b) CLEAN-GUI -- exitcode == 0 AND the target is a GUI PE
+                     (GmProxyIsGuiSubsystem). A windowed app that exits 0 with no
+                     surviving descendant as SYSTEM is a WinUI/AppX stub refusal
+                     (Win11 Notepad's symptom), NOT a legit run. The PE-subsystem
+                     gate avoids false-excluding console apps (nslookup/ftp/7z exit
+                     0 as SYSTEM legitimately) -- they are CUI, not GUI, so they
+                     stay unrecorded. CLEAN+console is NOT recorded.
+               The job=disabled branch below is NOT recorded (tree state
+               unconfirmed). FALLBACK / USER-AUTOEXCLUDE modes are NOT recorded --
+               the child was not born as SYSTEM. Best-effort: a store write
+               failure never affects the launch. */
+            if (_wcsicmp(mode, L"SYSTEM") == 0 &&
+                (code != 0 || (code == 0 && GmProxyIsGuiSubsystem(targetPath)))) {
                 GmProxyAutoExcludeRecord(base);
             }
         } else {
@@ -1172,9 +1230,19 @@ int wmain(int argc, wchar_t* argv[]) {
             /* Hand the PID to the God Mode monitor so it can elevate this process
                IN PLACE (token replacement) instead of the 15s periodic scan
                kill+relaunching it (which would spawn a duplicate). Best-effort:
-               if no monitor is listening, the periodic scan remains a fallback. */
-            SignalGmProxyFeedback(pi.dwProcessId);
-            DiagLog(L"[GM-PROXY] Handed PID %lu to monitor via GodMode-GmProxyFeedback for in-place elevation.\n", pi.dwProcessId);
+               if no monitor is listening, the periodic scan remains a fallback.
+               SKIPPED when autoExcluded: an auto-excluded launch is an
+               INTENTIONALLY-user launch (Detector B said this app refuses/
+               crashes as SYSTEM); handing its PID back to the monitor for
+               in-place SYSTEM elevation would defeat the auto-exclude and
+               re-kill the app. The monitor's Test-GmAutoExcluded guard
+               (God-Mode-Windows.ps1) is the belt-and-suspenders for this. */
+            if (!autoExcluded) {
+                SignalGmProxyFeedback(pi.dwProcessId);
+                DiagLog(L"[GM-PROXY] Handed PID %lu to monitor via GodMode-GmProxyFeedback for in-place elevation.\n", pi.dwProcessId);
+            } else {
+                DiagLog(L"[GM-PROXY] AUTO-EXCLUDE: skipping monitor feedback handoff for PID %lu (intentionally-user launch; re-elevation would defeat the auto-exclude).\n", pi.dwProcessId);
+            }
         } else {
             DWORD e = GetLastError();
             DiagLog(L"[GM-PROXY] CREATEPROC: method=currentuser result=FAIL gle=%lu\n", (unsigned long)e);
