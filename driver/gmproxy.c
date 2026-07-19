@@ -286,11 +286,19 @@ static BOOL GmProxyIsGuiSubsystem(const wchar_t* exePath) {
    as SYSTEM) and is always recorded regardless of subsystem. */
 /*                                                                     */
 /* Store path: C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat */
-/* Line format (UTF-8): basename|crashCount|lastCrashUnixTs|excluded    */
+/* Line format (UTF-8): basename|crashCount|lastCrashUnixTs|excluded|reason */
 /*   basename        = lowercase target base name (e.g. "chrome.exe")   */
 /*   crashCount      = number of SYSTEM crashes recorded                */
 /*   lastCrashUnixTs = Unix epoch seconds of the most recent crash      */
 /*   excluded        = 1 once crashCount >= threshold, else 0           */
+/*   reason          = most recent refusal flavor (additive 5th field): */
+/*                     'C' = CRASH  (non-zero exit as SYSTEM, any subsys)*/
+/*                     'G' = CLEAN-GUI (exit 0 + GUI PE = WinUI/AppX    */
+/*                           silent refusal -- the Win11 notepad case). */
+/*                     'P' = PRE-DROP (install-time browser drop via    */
+/*                           Add-GmAutoExcludeEntries in the PS layer). */
+/*                     Old 4-field lines parse with reason='?' (backward */
+/*                     compat -- the field is purely informational).    */
 /*                                                                     */
 /* Bulletproofing:                                                     */
 /*  - Fail-open everywhere: a missing/corrupt/ACL-denied store NEVER    */
@@ -327,6 +335,7 @@ typedef struct {
     DWORD   crashCount;
     time_t  lastCrashTs;
     BOOL    excluded;
+    wchar_t reason;   /* 'C' crash, 'G' clean-gui, 'P' pre-drop, '?' old/unknown */
 } GmAutoExcludeEntry;
 
 static HANDLE g_GmProxyAutoExcludeMutex = NULL;
@@ -367,14 +376,17 @@ static BOOL GmProxyAutoExcludeStorePath(wchar_t* buf, size_t cap) {
     return TRUE;
 }
 
-/* Parse one "base|crashCount|lastCrashTs|excluded" line manually (no     */
-/* swscanf scanset pitfalls). Returns TRUE on a well-formed line.         */
+/* Parse one "base|crashCount|lastCrashTs|excluded[|reason]" line manually */
+/* (no swscanf scanset pitfalls). Returns TRUE on a well-formed line. The  */
+/* 5th 'reason' field is OPTIONAL: old 4-field lines parse with reason='?'.*/
 static BOOL GmProxyAutoExcludeParseLine(const wchar_t* line,
                                          wchar_t* base, size_t baseCap,
                                          DWORD* crashCount,
-                                         time_t* lastCrashTs, BOOL* excluded) {
+                                         time_t* lastCrashTs, BOOL* excluded,
+                                         wchar_t* reason) {
     if (!line || !base || !crashCount || !lastCrashTs || !excluded || baseCap == 0) return FALSE;
     base[0] = 0; *crashCount = 0; *lastCrashTs = 0; *excluded = FALSE;
+    if (reason) *reason = L'?';   /* default for old 4-field lines */
     const wchar_t* p1 = wcschr(line, L'|'); if (!p1) return FALSE;
     const wchar_t* p2 = wcschr(p1 + 1, L'|'); if (!p2) return FALSE;
     const wchar_t* p3 = wcschr(p2 + 1, L'|'); if (!p3) return FALSE;
@@ -383,7 +395,15 @@ static BOOL GmProxyAutoExcludeParseLine(const wchar_t* line,
     wcsncpy(base, line, baseLen); base[baseLen] = 0;
     *crashCount = (DWORD)wcstoul(p1 + 1, NULL, 10);     /* stops at '|' */
     *lastCrashTs = (time_t)_wtoi64(p2 + 1);              /* stops at '|' */
-    *excluded = (_wtoi(p3 + 1) != 0);                    /* stops at newline */
+    *excluded = (_wtoi(p3 + 1) != 0);                    /* stops at '|' or newline */
+    /* Optional 5th field: the reason char after the 4th '|'. Forward-compat:
+       a 5-field line still parses the 4 required fields above (the int
+       parsers stop at '|'); the reason is read ONLY if a 4th pipe exists,
+       so old 4-field lines (no 4th pipe) keep reason='?'. */
+    if (reason) {
+        const wchar_t* p4 = wcschr(p3 + 1, L'|');
+        if (p4 && p4[1] && p4[1] != L'\n' && p4[1] != L'\r') *reason = p4[1];
+    }
     return TRUE;
 }
 
@@ -403,7 +423,7 @@ static int GmProxyAutoExcludeLoad(GmAutoExcludeEntry* entries, int maxEntries) {
     while (n < maxEntries && fgetws(line, 256, f)) {
         GmAutoExcludeEntry e;
         if (!GmProxyAutoExcludeParseLine(line, e.base, GM_AUTOEXCLUDE_BASE_CAP,
-                                          &e.crashCount, &e.lastCrashTs, &e.excluded)) continue;
+                                          &e.crashCount, &e.lastCrashTs, &e.excluded, &e.reason)) continue;
         if (e.lastCrashTs > 0 && now > e.lastCrashTs && (now - e.lastCrashTs) > staleSec) continue;  /* stale */
         entries[n++] = e;
     }
@@ -433,10 +453,11 @@ static void GmProxyAutoExcludeWrite(const GmAutoExcludeEntry* entries, int n) {
     FILE* f = _wfopen(tmp, L"w");
     if (!f) return;  /* fail-open */
     for (int i = 0; i < n; i++) {
-        fwprintf(f, L"%ls|%lu|%lld|%d\n", entries[i].base,
+        fwprintf(f, L"%ls|%lu|%lld|%d|%lc\n", entries[i].base,
                  (unsigned long)entries[i].crashCount,
                  (long long)entries[i].lastCrashTs,
-                 entries[i].excluded ? 1 : 0);
+                 entries[i].excluded ? 1 : 0,
+                 (wint_t)(entries[i].reason ? entries[i].reason : L'?'));
     }
     fflush(f);
     fclose(f);
@@ -445,10 +466,13 @@ static void GmProxyAutoExcludeWrite(const GmAutoExcludeEntry* entries, int n) {
     }
 }
 
-/* Record a SYSTEM crash for baseName: increment crashCount, update      */
-/* lastCrashTs, set excluded at threshold, evict oldest if at cap, write  */
-/* atomically under the mutex. Best-effort: never affects the launch.     */
-static void GmProxyAutoExcludeRecord(const wchar_t* baseName) {
+/* Record a SYSTEM refusal for baseName: increment crashCount, update      */
+/* lastCrashTs, set excluded at threshold + the reason flavor, evict oldest*/
+/* if at cap, write atomically under the mutex. 'reason' is 'C' (crash) or */
+/* 'G' (clean-gui); the latest refusal's reason overwrites the stored one  */
+/* (the most recent flavor is the most informative for debugging). Best-  */
+/* effort: never affects the launch.                                       */
+static void GmProxyAutoExcludeRecord(const wchar_t* baseName, wchar_t reason) {
     if (!baseName || !baseName[0]) return;
     HANDLE hMutex = GmProxyAutoExcludeMutexAcquire();
     if (!hMutex) return;  /* fail-open: can't lock, skip recording */
@@ -475,10 +499,12 @@ static void GmProxyAutoExcludeRecord(const wchar_t* baseName) {
         entries[idx].crashCount = 0;
         entries[idx].lastCrashTs = 0;
         entries[idx].excluded = FALSE;
+        entries[idx].reason = L'?';
     }
     entries[idx].crashCount++;
     entries[idx].lastCrashTs = now;
     entries[idx].excluded = (entries[idx].crashCount >= GM_AUTOEXCLUDE_THRESHOLD);
+    entries[idx].reason = reason;   /* latest refusal flavor (overwrite) */
     GmProxyAutoExcludeWrite(entries, n);
     GmProxyAutoExcludeMutexRelease();
 }
@@ -737,13 +763,51 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
                unconfirmed). FALLBACK / USER-AUTOEXCLUDE modes are NOT recorded --
                the child was not born as SYSTEM. Best-effort: a store write
                failure never affects the launch. */
-            if (_wcsicmp(mode, L"SYSTEM") == 0 &&
+            /* Record the refusal flavor: 'C' crash (non-zero exit) or 'G'
+               clean-gui (exit 0 + GUI PE). The PE-subsystem gate is the no-
+               hardcoded-name disambiguator (console apps exiting 0 as SYSTEM
+               are legit CLI runs, NOT recorded). */
+#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE
+            /* Test-only COMPILE-TIME seam (see tests/test-gmproxy-force-system.sh):
+               wine has NO real SYSTEM token, so the launch mode here is FALLBACK
+               (not SYSTEM) and the production guard below would never fire under
+               wine -- leaving the count->threshold->excluded transition unproven
+               at runtime (only source-level proven). Defining
+               GMPROXY_TEST_FORCE_SYSTEM_MODE at compile time forces recordAsSystem
+               =TRUE so the recording path is deterministically exercised by the
+               wine runtime test. The PRODUCTION build (driver/build.ps1) does NOT
+               define this macro, so the shipped gmproxy.exe uses the #else branch
+               (byte-for-byte the original _wcsicmp(mode,L"SYSTEM") guard) -- a
+               compile-time test double, NOT a runtime env-var hook. Mirrors the
+               GMPROXY_TEST_FORCE_SESSION0 seam in wmain. */
+            BOOL recordAsSystem = TRUE;
+#else
+            BOOL recordAsSystem = (_wcsicmp(mode, L"SYSTEM") == 0);
+#endif
+            if (recordAsSystem &&
                 (code != 0 || (code == 0 && GmProxyIsGuiSubsystem(targetPath)))) {
-                GmProxyAutoExcludeRecord(base);
+                GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
             }
         } else {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls job=disabled (mode=%ls)\n",
                     base, (unsigned long)ppi->dwProcessId, (unsigned long)code, cls, mode);
+#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE
+            /* Test-only: wine may stub Job Objects (CreateJobObjectW returns NULL
+               or AssignProcessToJobObject fails -> hJob=NULL -> this job=disabled
+               branch), which would make the recording logic unreachable under
+               wine even with the force-system seam. Under the seam, also record
+               here so the count->threshold->excluded->USER-AUTOEXCLUDE transition
+               is runtime-provable regardless of wine job support. The recording
+               CALL is identical to the hJob branch (same GmProxyAutoExcludeRecord),
+               so this proves the same logic. Production build NEVER records in
+               job=disabled (tree state unconfirmed -- a delegation that escaped
+               the job cannot be distinguished from a genuine EXITED, so recording
+               would risk a false exclusion; the #ifdef keeps that conservative
+               behavior in production). */
+            if (code != 0 || (code == 0 && GmProxyIsGuiSubsystem(targetPath))) {
+                GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
+            }
+#endif
         }
     } else {
         DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=UNKNOWN waiterr=%lu (mode=%ls)\n",

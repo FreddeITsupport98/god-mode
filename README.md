@@ -58,6 +58,7 @@ It is **not** recommended for general use or as a casual elevation tool.
 - [Project Overview](#project-overview)
 - [Scripts Included](#scripts-included)
 - [Features](#features)
+- [Smart IFEO Compatibility Layer](#smart-ifeo-compatibility-layer)
 - [Prerequisites](#prerequisites)
 - [Usage](#usage)
 - [God Mode Dangerous Features](#god-mode-dangerous-features)
@@ -81,6 +82,7 @@ It is **not** recommended for general use or as a casual elevation tool.
 | [God-Mode-Windows.ps1](#god-mode-windowsps1--enterprise-dns--god-mode) | DNS Lockout + God Mode (dangerous admin control) |
 | [syntax_check.ps1](#syntax-checking) | Project-wide syntax checker & auto-chmod script |
 | [tests/](#testing--regression) | Regression test suite folder |
+| [Smart IFEO Compatibility Layer](#smart-ifeo-compatibility-layer) | Detector A/B auto-exclude + hardening (reason field, force-system seam, mtime invalidation, cache, mutex fallback) |
 | [CHANGELOG](#changelog) | Version history and unreleased changes |
 
 ---
@@ -94,6 +96,7 @@ It is **not** recommended for general use or as a casual elevation tool.
 - [Regression Tests](#testing--regression)
 - [Changelog](#changelog)
 - [Architecture & How It Works](#architecture--how-it-works)
+- [Smart IFEO Compatibility Layer](#smart-ifeo-compatibility-layer)
 - [Parameter Reference](#parameter-reference)
 - [Troubleshooting](#troubleshooting)
 
@@ -349,9 +352,30 @@ The project includes a custom `syntax_check.ps1` script that scans all PowerShel
 
 ---
 
+## Smart IFEO Compatibility Layer
+
+The Smart IFEO Compatibility Layer keeps the IFEO `Debugger -> gmproxy.exe` "born as SYSTEM" gatekeeper for normal programs while preventing the apps that CANNOT run as SYSTEM (Win11 Notepad/Store stubs, Chrome/Firefox/Edge browsers) from being killed/blanked on launch. Two dynamic detectors, NO hardcoded app names:
+
+- **Detector A (install-time, `God-Mode-Windows.ps1` `Get-GmSystemCompatExclusions`)** builds the AppX/WinUI set (`WindowsApps` reparse aliases + `Get-AppxPackage` Executables incl. `-AllUsers` + all-profiles `C:\Users\*\AppData\Local\Microsoft\WindowsApps`) + the registered-browser set (`StartMenuInternet` clients). `Install-IfeoElevation` + `Get-IfeoElevationCandidates` DROP matching BROWSER entries (persisted to the auto-exclude store via `Add-GmAutoExcludeEntries` so gmproxy + gmhook + the monitor all exclude them from launch #1). UWP/AppX stay hooked -> try SYSTEM first -> Detector B catches refusals at runtime.
+- **Detector B (runtime, `driver/gmproxy.c` + `driver/gmhook.c`)** is a persistent auto-exclude store at `C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat`. gmproxy records every base name that refuses/crashes as SYSTEM (EXITED tree=0, SYSTEM mode): CRASH (non-zero exit, any subsystem) OR CLEAN-GUI (exit 0 + GUI PE = the Win11 Notepad silent-refusal case, gated by `GmProxyIsGuiSubsystem` so console apps exiting 0 as SYSTEM are NOT recorded). At `>= 2` refusals the NEXT launch skips the SYSTEM token -> current-user fallback (`USER-AUTOEXCLUDE` mode; IFEO hook retained so telemetry + in-place elevation stay available). gmhook's `GmHookIsAutoExcluded` consults the same store before birthing a child as SYSTEM (defense-in-depth). Fail-open everywhere; 256-cap + 30-day stale; atomic temp+`MoveFileExW`; Global NULL-DACL mutex; reset via menu [18] / `gmproxy.exe --gm-reset-autoexclude`. Session-0 ownerless-birth REFUSE is unchanged (auto-excluded + Session-0 -> still REFUSE).
+
+### Hardening (2026-07-19)
+
+Five additive hardening improvements on the layer, all backward-compatible:
+
+- **Store `reason` field (5th, additive)** -- the store line is now `base|count|ts|excluded|reason` where `reason` is `C` (crash), `G` (clean-gui), `P` (pre-drop install-time browser drop), or `?` (old 4-field line). The parser defaults to `?` so old lines still parse; `Export-GodModeLogs` (option [11]) prints a legend so you can tell WHY each app was excluded.
+- **`GMPROXY_TEST_FORCE_SYSTEM_MODE` compile-time seam** -- lets the wine runtime test (`tests/test-gmproxy-force-system.sh`) exercise the RECORDING path (count -> threshold -> excluded) for BOTH refusal flavors (CLEAN-GUI + CRASH) + the end-to-end `USER-AUTOEXCLUDE` handoff on the next PRODUCTION launch. The production build does NOT define it; the `#else` branch is the byte-for-byte original guard.
+- **gmhook mtime invalidation** -- the 2s cache also reloads when the store file's `LastWriteTime` changes, so a newly-excluded app is respected on the NEXT `CreateProcessW` instead of waiting up to 2s.
+- **`Test-GmAutoExcluded` 15s script cache** -- collapses the monitor's N-per-scan store reads to ~1 per 15s; invalidated by `Add-GmAutoExcludeEntries`.
+- **`Add-GmAutoExcludeEntries` mutex create fallback** -- when `OpenExisting` fails (first-install window), creates the Global mutex so the installer write serializes against a concurrent gmproxy (closes a narrow writer race; atomic temp+rename stays the safety net).
+
+---
+
 ## Changelog
 
 ### Unreleased
+
+- **2026-07-19 18:36 UTC** — Five additive hardening improvements on the Smart IFEO Compatibility Layer (Detector A install-time AppX/browser drop + Detector B runtime SYSTEM-crash auto-exclude store), all backward-compatible. (1) **Store `reason` field (5th, additive)**: the auto-exclude store line is now `base|count|ts|excluded|reason` where reason is `C` (crash), `G` (clean-gui = the Win11 notepad silent-refusal case), `P` (pre-drop install-time browser drop), or `?` (old 4-field line). The parser defaults to `?` so old lines still parse; `Export-GodModeLogs` (option [11]) prints a legend so the user can tell WHY each app was excluded. (2) **`GMPROXY_TEST_FORCE_SYSTEM_MODE` compile-time seam** (mirrors `GMPROXY_TEST_FORCE_SESSION0`): wine has no real SYSTEM token so the production `_wcsicmp(mode,L"SYSTEM")` recording guard never fires under wine -- the seam forces `recordAsSystem=TRUE` so the count->threshold->excluded recording path is runtime-provable. The production build (`driver/build.ps1`) does NOT define it; the `#else` branch is the byte-for-byte original guard. New `tests/test-gmproxy-force-system.sh` + `tests/gmproxy-cleangui-target.c` (a GUI-subsystem dummy) RUN the FORCED build under wine and prove CLEAN-GUI recording (store -> `|2|..|1|G`), CRASH recording (`|2|..|1|C`), AND end-to-end USER-AUTOEXCLUDE on the next PRODUCTION launch (the 5-field store is read correctly by the production binary). (3) **gmhook mtime invalidation**: the 2s in-process cache now ALSO reloads when the store file's `LastWriteTime` changes (`GetFileAttributesExW`), so a newly-excluded app is respected on the NEXT `CreateProcessW` instead of waiting up to 2s (TTL stays as secondary invalidation; fail-open preserved). (4) **`Test-GmAutoExcluded` 15s script-level cache** (`$script:GmAutoExcludeCache` + `$script:GmAutoExcludeCacheDt`): collapses the monitor's N-per-scan store reads to ~1 per 15s; invalidated by `Add-GmAutoExcludeEntries` so a fresh write is seen at once. (5) **`Add-GmAutoExcludeEntries` mutex create fallback**: when `[System.Threading.Mutex]::OpenExisting` fails (first-install window before gmproxy has run), it now creates the Global mutex (`New-Object Threading.Mutex($false, $name)` + `WaitOne`) so the installer write still serializes against a concurrent gmproxy -- closes a narrow writer race (atomic temp+rename stays the safety net). Regression: `tests/Test-GmProxySession.ps1` +27 section-25 assertions; `tests/test-gmproxy-session.sh` + `tests/test-gmproxy-refuse.sh` +greps (reason field, force-system seam, gmhook mtime); new `tests/test-gmproxy-force-system.sh` bound into `tests/run-regressions.sh` as step 5e. MinGW rebuild required for the gmproxy.c + gmhook.c changes (PE32+). NOT pushed.
 
 - **2026-07-17 00:31 UTC** — Two residual edge cases from the 00:14 ownerless-birth fix closed, plus a deterministic RUNTIME proof of the gmproxy REFUSE under wine. (1) `Invoke-HybridElevation` Phase 2 (scheduled-task fallback) kill ordering reversed: kill-AFTER-success instead of kill-before-launch -- the old `Get-Process|Stop-Process` + 800ms settle BEFORE the task left the user with NO app if gmproxy-as-task refused or the SYSTEM child lost the single-instance race; Phase 2 now waits for a SYSTEM instance via `Test-SystemProcessExists` after the task enters Running and only THEN purges non-SYSTEM duplicates (gated on `$systemAlive`), keeping the user app if no SYSTEM child surfaces (graceful degradation). (2) New `tests/test-gmproxy-refuse.sh` + `tests/gmproxy-refuse-target.c` RUN `gmproxy.exe` under wine with a dummy target and prove BOTH branches at runtime: NORMAL build -> graceful current-user fallback (exit 0); FORCED build (`-DGMPROXY_TEST_FORCE_SESSION0=1`, a COMPILE-TIME test seam in `driver/gmproxy.c` that forces `mySession=0` -- the production build does NOT define it, so the shipped `gmproxy.exe` is byte-for-byte unaffected) -> ownerless-birth REFUSE (exit 1 + `[GM-PROXY] REFUSE` in `%TEMP%\gmproxy.log`). wine reports session 1 (not Session 0), so without the seam the REFUSE branch is never exercised under wine. Regression: `tests/Test-GmProxySession.ps1` +8 section-18 assertions (104/104, was 96/96); `tests/test-gmproxy-session.sh` +4 invariants; `tests/run-regressions.sh` +1 step (5b); `tests/test-gmproxy-refuse.sh` 16/16; full suite 17/17 (was 15/15), FAIL SUMMARY 0; `syntax_check.ps1` 18/18, 0 ERROR. No binary rebuild required (the gmproxy.c seam is compiled out of production; Phase 2 is PowerShell-side). NOT pushed.
 

@@ -211,9 +211,30 @@ if [ -f "$GMHOOK_SRC" ]; then
     grep -qF 'GmHookIsAutoExcluded' "$GMHOOK_SRC" && record "src: gmhook GmHookIsAutoExcluded present (store consult before SYSTEM birth)" 1 || record "src: gmhook GmHookIsAutoExcluded present (store consult before SYSTEM birth)" 0 "not found -- gmhook cannot consult the store"
     grep -qF 'GmHookIsAutoExcluded(baseName)' "$GMHOOK_SRC" && record "src: gmhook HookCreateProcessW consults GmHookIsAutoExcluded(baseName)" 1 || record "src: gmhook HookCreateProcessW consults GmHookIsAutoExcluded(baseName)" 0 "not found -- excluded apps still born as SYSTEM from hooked hosts"
     grep -qF 'GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS' "$GMHOOK_SRC" && record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 1 || record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 0 "not found -- CreateProcess hot path would read the store file every call"
+    grep -qF 'GetFileAttributesExW' "$GMHOOK_SRC" && record "src: gmhook mtime invalidation (GetFileAttributesExW) present -- newly-excluded app respected on next CreateProcessW" 1 || record "src: gmhook mtime invalidation (GetFileAttributesExW) present" 0 "not found -- a fresh exclusion waits up to the 2s TTL"
+    grep -qF 'cacheLoadMtime' "$GMHOOK_SRC" && record "src: gmhook tracks the store LastWriteTime (cacheLoadMtime) for mtime invalidation" 1 || record "src: gmhook tracks the store LastWriteTime (cacheLoadMtime)" 0 "not found -- mtime change cannot trigger a reload"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"
 fi
+
+# Detector B reason field (5th, additive): the store line is now
+# base|count|ts|excluded|reason (C=crash, G=clean-gui, P=pre-drop, ?=old line).
+# The reason is informational (Export-GodModeLogs debuggability); the parser
+# defaults to '?' so old 4-field lines still parse. The MinGW build below must
+# still compile with the new field + the reason-threaded record call.
+grep -qF "GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G')" "$SRC" && record "src: record call threads the reason flavor ('C' crash / 'G' clean-gui)" 1 || record "src: record call threads the reason flavor ('C' / 'G')" 0 "not found -- the refusal flavor is not recorded"
+grep -qF '|%lc' "$SRC" && record "src: store write emits the 5th reason field (%lc)" 1 || record "src: store write emits the 5th reason field (%lc)" 0 "not found -- reason not persisted to the store"
+grep -qF "if (reason) *reason = L'?';" "$SRC" && record "src: parser defaults reason to '?' (old 4-field lines backward compat)" 1 || record "src: parser defaults reason to '?' (old 4-field lines backward compat)" 0 "not found -- old 4-field store lines would not parse"
+
+# GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam: mirrors the
+# GMPROXY_TEST_FORCE_SESSION0 seam. Lets the wine runtime test
+# (test-gmproxy-force-system.sh) exercise the RECORDING path (the production
+# _wcsicmp(mode,L"SYSTEM") guard never fires under wine, since wine has no
+# real SYSTEM token). The PRODUCTION build does NOT define it; the #else branch
+# is the byte-for-byte original guard. driver/build.ps1 must NOT reference it.
+grep -qF '#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE' "$SRC" && record "src: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam present (#ifdef)" 1 || record "src: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam present (#ifdef)" 0 "not found -- recording cannot be exercised under wine"
+grep -qF 'BOOL recordAsSystem = TRUE;' "$SRC" && record "src: seam forces recordAsSystem=TRUE (test build records even under wine FALLBACK)" 1 || record "src: seam forces recordAsSystem=TRUE" 0 "not found"
+grep -qF 'BOOL recordAsSystem = (_wcsicmp(mode, L"SYSTEM") == 0);' "$SRC" && record "src: production #else branch keeps the original _wcsicmp(mode,L\"SYSTEM\") guard (byte-for-byte)" 1 || record "src: production #else branch keeps the original _wcsicmp(mode,L\"SYSTEM\") guard" 0 "not found -- production recording guard regressed"
 
 # Build: MinGW cross-compile (mirrors driver/build.ps1 Build-WithMinGW for gmproxy).
 if ! command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then

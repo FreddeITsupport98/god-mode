@@ -3483,7 +3483,8 @@ function Export-GodModeLogs {
         #     SYSTEM-crash auto-exclude store so the user can see which base
         #     names gmproxy has learned to launch as the current user (after
         #     >= threshold SYSTEM crashes) instead of as SYSTEM. Each line:
-        #     basename|crashCount|lastCrashUnixTs|excluded. Reset via menu [18].
+        #     basename|crashCount|lastCrashUnixTs|excluded|reason. Reset via
+        #     menu [18]. reason: C=crash, G=clean-gui, P=pre-drop, ?=old line.
         $LogContent += "`r`n===== GM-PROXY AUTO-EXCLUDE STORE ====="
         if (Test-Path $GodModeAutoExcludeFile) {
             $LogContent += "`r`n(Source: $GodModeAutoExcludeFile)"
@@ -3500,6 +3501,10 @@ function Export-GodModeLogs {
         $LogContent += "`r`nNOTE: an entry with excluded=1 means gmproxy will launch that app as the"
         $LogContent += "`r`n      current user (USER-AUTOEXCLUDE mode) instead of as SYSTEM on its next"
         $LogContent += "`r`n      launch. Entries auto-drop after 30 days or via menu [18] RESET AUTO-EXCLUDE STORE."
+        $LogContent += "`r`n      Line format: basename|crashCount|lastCrashUnixTs|excluded|reason"
+        $LogContent += "`r`n      reason: C=CRASH (non-zero exit as SYSTEM), G=CLEAN-GUI (exit 0 + GUI PE ="
+        $LogContent += "`r`n      WinUI/AppX silent refusal -- the Win11 notepad case), P=PRE-DROP (install-"
+        $LogContent += "`r`n      time browser drop), ?=old 4-field line (reason added after the fact)."
 
         # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
         #     gmproxy invocation into a per-app summary so the user can report
@@ -3644,28 +3649,66 @@ function Test-GmAutoExcluded {
         handoff for autoExcluded) and gmhook's B2 (no SYSTEM birth for excluded
         bases). Fail-open: a missing/corrupt/ACL-denied store -> $false -> normal
         elevation (never blocks elevation on a store error).
+    .DESCRIPTION
+        15-second script-level cache ($script:GmAutoExcludeCache hashtable +
+        $script:GmAutoExcludeCacheDt). The monitor's 15s periodic scan calls
+        this once per process per scan, and without a cache each call re-reads
+        the store file; the cache collapses N reads per scan to ~1 per 15s.
+        Invalidated by Add-GmAutoExcludeEntries (sets both to $null so the next
+        consult re-reads immediately). Fail-open preserved: a store error clears
+        the cache (next call retries) and returns $false.
     .PARAMETER BaseName
         The target base name WITH extension (e.g. "notepad.exe"), matching the
-        store line format "base|count|ts|excluded". Case-insensitive.
+        store line format "base|count|ts|excluded[|reason]". Case-insensitive.
     #>
     param([string]$BaseName)
     if (-not $BaseName) { return $false }
+    $target = $BaseName.ToLower()
     try {
-        if (-not (Test-Path $GodModeAutoExcludeFile)) { return $false }
+        $now = [DateTimeOffset]::Now
+        if ($null -ne $script:GmAutoExcludeCache -and $null -ne $script:GmAutoExcludeCacheDt -and
+            ($now - $script:GmAutoExcludeCacheDt).TotalSeconds -lt 15) {
+            # 15s TTL: collapse N-per-scan store reads to ~1 per 15s. Add-GmAuto-
+            # ExcludeEntries sets both to $null so a fresh write is seen at once.
+            # Return the STORED VALUE (the excluded bool), NOT ContainsKey -- an
+            # entry with excluded=0 (count < threshold) is in the cache with value
+            # $false and must return $false (not yet excluded), so Detector B still
+            # gets the 2nd SYSTEM attempt to reach threshold.
+            if ($script:GmAutoExcludeCache.ContainsKey($target)) { return [bool]$script:GmAutoExcludeCache[$target] }
+            return $false
+        }
+        if (-not (Test-Path $GodModeAutoExcludeFile)) {
+            $script:GmAutoExcludeCache = @{}
+            $script:GmAutoExcludeCacheDt = $now
+            return $false
+        }
         $lines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
-        if (-not $lines) { return $false }
-        $target = $BaseName.ToLower()
-        foreach ($line in $lines) {
-            if (-not $line) { continue }
-            $parts = $line -split '\|'
-            if ($parts.Count -ge 4 -and $parts[0].ToLower() -eq $target -and $parts[3] -eq '1') {
-                return $true
+        $cache = @{}
+        if ($lines) {
+            foreach ($line in $lines) {
+                if (-not $line) { continue }
+                $parts = $line -split '\|'
+                # 5th 'reason' field (C/G/P) is informational only -- excluded
+                # is still parts[3]. Count -ge 4 keeps old 4-field lines working.
+                if ($parts.Count -ge 4) {
+                    $cache[$parts[0].ToLower()] = ($parts[3] -eq '1')
+                }
             }
         }
+        $script:GmAutoExcludeCache = $cache
+        $script:GmAutoExcludeCacheDt = $now
+        # Return the stored excluded bool for $target (the VALUE), not key existence:
+        # an excluded=0 entry (count < threshold) stores $false and must return
+        # $false so the monitor still attempts SYSTEM elevation (Detector B needs
+        # the 2nd refusal to reach threshold). A base absent from the store -> $false.
+        if ($cache.ContainsKey($target)) { return [bool]$cache[$target] }
+        return $false
     } catch {
-        return $false  # fail-open: store error -> not excluded -> normal elevation
+        # fail-open: store error -> clear the cache (retry next call) -> not excluded.
+        $script:GmAutoExcludeCache = $null
+        $script:GmAutoExcludeCacheDt = $null
+        return $false
     }
-    return $false
 }
 
 function Add-GmAutoExcludeEntries {
@@ -3698,8 +3741,20 @@ function Add-GmAutoExcludeEntries {
         # gmproxy can race us before the IFEO hooks are live.
         $mutex = $null
         $mutexName = "Global\GmProxyAutoExcludeMutex"
-        try { $mutex = [System.Threading.Mutex]::OpenExisting($mutexName) } catch { $mutex = $null }
         $owned = $false
+        try {
+            $mutex = [System.Threading.Mutex]::OpenExisting($mutexName)
+        } catch {
+            # First-install window: gmproxy has not run yet so the Global mutex
+            # does not exist. Create it (initiallyOwned=$false, then WaitOne) so
+            # this write still serializes against a concurrent gmproxy that may
+            # be starting in parallel -- closes the narrow race where two writers
+            # (this installer + a just-launched gmproxy) both proceed without the
+            # mutex. If create also fails (ACL/privilege), proceed without -- the
+            # atomic temp+rename write is the real consistency guarantee, and no
+            # concurrent gmproxy can race before the IFEO hooks are live.
+            try { $mutex = New-Object System.Threading.Mutex($false, $mutexName) } catch { $mutex = $null }
+        }
         if ($mutex) {
             try { $owned = $mutex.WaitOne(1000) } catch { $owned = $false }
         }
@@ -3730,9 +3785,12 @@ function Add-GmAutoExcludeEntries {
                     $parts = $existing[$key] -split '\|'
                     $cnt = 2; if ($parts.Count -ge 2) { $cnt = [int]$parts[1]; if ($cnt -lt 2) { $cnt = 2 } }
                     $excl = 1; if ($parts.Count -ge 4) { $excl = [int]$parts[3]; if ($excl -lt 1) { $excl = 1 } }
-                    $existing[$key] = "$key|$cnt|$nowTs|$excl"
+                    # Preserve an existing reason (5th field) if present; else 'P'
+                    # (pre-drop). The reason is informational (Export-GodModeLogs).
+                    $rsn = 'P'; if ($parts.Count -ge 5 -and $parts[4]) { $rsn = $parts[4] }
+                    $existing[$key] = "$key|$cnt|$nowTs|$excl|$rsn"
                 } else {
-                    $existing[$key] = "$key|2|$nowTs|1"
+                    $existing[$key] = "$key|2|$nowTs|1|P"
                 }
             }
             # Atomic write (temp + Move-Item -Force, mirrors gmproxy.c's
@@ -3745,6 +3803,11 @@ function Add-GmAutoExcludeEntries {
                 Move-Item -Path $tmp -Destination $GodModeAutoExcludeFile -Force -ErrorAction SilentlyContinue
             }
         } finally {
+            # Invalidate the Test-GmAutoExcluded 15s cache so the next consult
+            # re-reads the store immediately (this write may have added/changed
+            # exclusions; without this a scan within 15s would miss the new entry).
+            $script:GmAutoExcludeCache = $null
+            $script:GmAutoExcludeCacheDt = $null
             if ($owned -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
             if ($mutex) { try { $mutex.Close() } catch {} }
         }

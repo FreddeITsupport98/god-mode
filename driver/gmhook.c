@@ -429,16 +429,38 @@ static BOOL GmHookIsAutoExcluded(const wchar_t* baseName) {
     static GmHookAutoExcludeEntry cache[GMHOOK_AUTOEXCLUDE_MAX_ENTRIES];
     static int cacheCount = -1;  /* -1 = not loaded yet */
     static ULONGLONG cacheLoadTick = 0;
+    static FILETIME cacheLoadMtime;   /* store LastWriteTime captured at last load */
+    const wchar_t kPath[] = L"C:\\ProgramData\\GodModeAutoExclude\\gmproxy_autoexclude.dat";
     ULONGLONG now = GetTickCount64();
-    if (cacheCount < 0 || (now - cacheLoadTick) > GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS) {
+    /* mtime invalidation: a newly-excluded app (just crashed as SYSTEM and
+       recorded by gmproxy) is respected on the NEXT CreateProcessW instead of
+       waiting up to the TTL. Read the store file's LastWriteTime; if it changed
+       since the last load, reload immediately. The TTL stays a secondary
+       invalidation so a long-idle host still refreshes. Fail-open: if
+       GetFileAttributesExW fails (file missing/ACL-denied), curMtime is zeroed
+       and the reload decision falls back to the TTL check (and a missing file
+       loads zero entries = no exclusions = normal SYSTEM-birth behavior). */
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    BOOL haveMtime = GetFileAttributesExW(kPath, GetFileExInfoStandard, &fa);
+    FILETIME curMtime;
+    if (haveMtime) curMtime = fa.ftLastWriteTime;
+    else { curMtime.dwLowDateTime = 0; curMtime.dwHighDateTime = 0; }
+    BOOL mtimeChanged = (cacheCount < 0) ||
+        (curMtime.dwLowDateTime  != cacheLoadMtime.dwLowDateTime) ||
+        (curMtime.dwHighDateTime != cacheLoadMtime.dwHighDateTime);
+    if (mtimeChanged || (now - cacheLoadTick) > GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS) {
         cacheCount = 0;
         cacheLoadTick = now;
-        const wchar_t kPath[] = L"C:\\ProgramData\\GodModeAutoExclude\\gmproxy_autoexclude.dat";
+        cacheLoadMtime = curMtime;
         FILE* f = _wfopen(kPath, L"r");
         if (f) {
             wchar_t line[256];
             while (cacheCount < GMHOOK_AUTOEXCLUDE_MAX_ENTRIES && fgetws(line, 256, f)) {
-                /* Parse "base|count|ts|excluded" manually (no swscanf pitfalls). */
+                /* Parse "base|count|ts|excluded[|reason]" manually (no swscanf).
+                   The 5th 'reason' field (C/G/P, added for Export-GodModeLogs
+                   debuggability) is IGNORED here -- gmhook only needs base +
+                   excluded. The int parser stops at '|' so a 5-field line still
+                   yields the correct excluded flag (forward-compatible). */
                 const wchar_t* p1 = wcschr(line, L'|'); if (!p1) continue;
                 const wchar_t* p2 = wcschr(p1 + 1, L'|'); if (!p2) continue;
                 const wchar_t* p3 = wcschr(p2 + 1, L'|'); if (!p3) continue;

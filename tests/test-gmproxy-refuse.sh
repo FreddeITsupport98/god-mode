@@ -162,6 +162,19 @@ grep -qF 'GmProxyIsGuiSubsystem' "$SRC" && record "src: GmProxyIsGuiSubsystem pr
 grep -qF 'IMAGE_SUBSYSTEM_WINDOWS_GUI' "$SRC" && record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 1 || record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 0 "not found -- the PE-subsystem gate has no target value"
 grep -qF 'IMAGE_FILE_HEADER' "$SRC" && record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 1 || record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 0 "not found -- Subsystem would read from the wrong offset"
 grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found -- auto-excluded PIDs would be re-elevated by the monitor"
+# Detector B reason field (5th, additive): store line is base|count|ts|excluded|reason
+# (C=crash, G=clean-gui, P=pre-drop, ?=old 4-field line). Informational for
+# Export-GodModeLogs; the parser defaults to '?' so old lines still parse.
+grep -qF "GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G')" "$SRC" && record "src: record call threads the reason flavor ('C' crash / 'G' clean-gui)" 1 || record "src: record call threads the reason flavor ('C' / 'G')" 0 "not found -- refusal flavor not recorded"
+grep -qF '|%lc' "$SRC" && record "src: store write emits the 5th reason field (%lc)" 1 || record "src: store write emits the 5th reason field (%lc)" 0 "not found -- reason not persisted"
+grep -qF "if (reason) *reason = L'?';" "$SRC" && record "src: parser defaults reason to '?' (old 4-field lines backward compat)" 1 || record "src: parser defaults reason to '?' (old 4-field lines backward compat)" 0 "not found -- old store lines would not parse"
+# GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam (mirrors GMPROXY_TEST_FORCE_SESSION0):
+# lets the wine runtime test exercise the RECORDING path (the production
+# _wcsicmp(mode,L"SYSTEM") guard never fires under wine -- no real SYSTEM token).
+# Production build does NOT define it; #else is the byte-for-byte original guard.
+grep -qF '#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE' "$SRC" && record "src: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam present (#ifdef)" 1 || record "src: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam present (#ifdef)" 0 "not found -- recording cannot be exercised under wine"
+grep -qF 'BOOL recordAsSystem = TRUE;' "$SRC" && record "src: seam forces recordAsSystem=TRUE (test build records under wine FALLBACK)" 1 || record "src: seam forces recordAsSystem=TRUE" 0 "not found"
+grep -qF 'BOOL recordAsSystem = (_wcsicmp(mode, L"SYSTEM") == 0);' "$SRC" && record "src: production #else branch keeps the original _wcsicmp(mode,L\"SYSTEM\") guard" 1 || record "src: production #else branch keeps the original _wcsicmp(mode,L\"SYSTEM\") guard" 0 "not found -- production recording guard regressed"
 # CRITICAL invariant: the PRODUCTION build must NOT define the test seam (else
 # the shipped gmproxy.exe would force-refuse ownerless birth in the field).
 # Negative assertion on driver/build.ps1.

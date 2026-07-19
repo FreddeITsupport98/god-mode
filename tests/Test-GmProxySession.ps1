@@ -562,4 +562,58 @@ Add-Assertion "God-Mode-Windows.ps1: menu Read-Host range is 1-18" ($gm.Contains
 Add-Assertion "God-Mode-Windows.ps1: switch case 18 calls Reset-GmProxyAutoExcludeStore" ($gm.Contains('Reset-GmProxyAutoExcludeStore')) "switch case 18 does not call Reset-GmProxyAutoExcludeStore"
 Add-Assertion "God-Mode-Windows.ps1: reset helper invokes gmproxy.exe --gm-reset-autoexclude (mutex-safe)" ($gm.Contains('--gm-reset-autoexclude')) "reset helper does not use the mutex-safe gmproxy reset hook"
 
+# --- 25. Hardening: reason field (5th) + GMPROXY_TEST_FORCE_SYSTEM_MODE recording seam + gmhook mtime invalidation + Test-GmAutoExcluded cache + mutex create fallback ---
+# Five additive hardening improvements on top of the Smart IFEO Compatibility
+# Layer (section 24), all backward-compatible (old 4-field store lines still
+# parse; production build byte-for-byte unaffected by the test seam):
+#   H1 gmproxy.c: the auto-exclude store gains an informational 5th 'reason'
+#      field (C=crash, G=clean-gui, P=pre-drop, ?=old line) so Export-GodModeLogs
+#      can show WHY each app was excluded. The parser defaults to '?' so old
+#      4-field lines still parse (forward/backward compatible).
+#   H2 gmproxy.c: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam (mirrors
+#      GMPROXY_TEST_FORCE_SESSION0) lets the wine runtime test
+#      (test-gmproxy-force-system.sh) exercise the RECORDING path -- the
+#      production _wcsicmp(mode,L"SYSTEM") guard never fires under wine (no real
+#      SYSTEM token). Production build does NOT define it; #else is the original.
+#   H3 gmhook.c: mtime invalidation -- the 2s cache also reloads when the store
+#      file's LastWriteTime changes, so a newly-excluded app is respected on the
+#      NEXT CreateProcessW instead of waiting up to 2s.
+#   H4 God-Mode-Windows.ps1: Test-GmAutoExcluded gains a 15s script-level cache
+#      (collapses N-per-scan store reads to ~1 per 15s), invalidated by
+#      Add-GmAutoExcludeEntries.
+#   H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries falls back to creating the
+#      Global mutex (New-Object Threading.Mutex) when OpenExisting fails (first-
+#      install window before gmproxy has run), closing a narrow writer race.
+Add-Assertion "H1 gmproxy.c: GmAutoExcludeEntry struct has a reason field" ($proxy.Contains('wchar_t reason;')) "GmAutoExcludeEntry reason field missing -- refusal flavor cannot be stored"
+Add-Assertion "H1 gmproxy.c: GmProxyAutoExcludeRecord takes a reason param (wchar_t reason)" ($proxy -match 'GmProxyAutoExcludeRecord\s*\(\s*const\s+wchar_t\*\s+baseName\s*,\s*wchar_t\s+reason\s*\)') "GmProxyAutoExcludeRecord missing the reason param -- flavor not threaded into the record"
+Add-Assertion "H1 gmproxy.c: record call passes reason 'C' (crash) / 'G' (clean-gui)" ($proxy.Contains("GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G')")) "record call does not pass the reason flavor"
+Add-Assertion "H1 gmproxy.c: record sets entries[idx].reason = reason (latest flavor overwrites)" ($proxy.Contains('entries[idx].reason = reason;')) "record does not store the reason on the entry"
+Add-Assertion "H1 gmproxy.c: store write emits the 5th reason field (%lc)" ($proxy.Contains('|%lc')) "store write does not emit the 5th reason field"
+Add-Assertion "H1 gmproxy.c: parser reads the optional 5th field (p4 = wcschr(p3+1, '|'))" ($proxy.Contains('const wchar_t* p4 = wcschr(p3 + 1, L''|'');')) "parser does not read the optional 5th reason field"
+Add-Assertion "H1 gmproxy.c: parser defaults reason to '?' for old 4-field lines" ($proxy.Contains("if (reason) *reason = L'?';")) "parser does not default reason to '?' -- old 4-field store lines would not parse"
+Add-Assertion "H2 gmproxy.c: GMPROXY_TEST_FORCE_SYSTEM_MODE compile-time seam present (#ifdef)" ($proxy.Contains('#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE')) "force-system seam missing -- recording cannot be exercised under wine"
+Add-Assertion "H2 gmproxy.c: seam forces recordAsSystem=TRUE (test build records under wine FALLBACK)" ($proxy.Contains('BOOL recordAsSystem = TRUE;')) "seam does not force recordAsSystem=TRUE"
+Add-Assertion "H2 gmproxy.c: production #else branch keeps the original _wcsicmp(mode,L""SYSTEM"") guard" ($proxy.Contains('BOOL recordAsSystem = (_wcsicmp(mode, L"SYSTEM") == 0);')) "production #else branch lost the original _wcsicmp(mode,L""SYSTEM"") guard -- production recording regressed"
+Add-Assertion "H2 gmproxy.c: job=disabled branch records ONLY under the seam (production never records there)" ($proxy -match 'job=disabled[\s\S]{0,500}#ifdef GMPROXY_TEST_FORCE_SYSTEM_MODE') "job=disabled branch not guarded by the force-system seam -- production would record on unconfirmed tree state OR wine job stubs would block the test"
+$BuildPs1 = Join-Path $ProjectRoot "driver/build.ps1"
+$buildPs = ""
+if (Test-Path $BuildPs1) { $buildPs = Get-Content -Raw $BuildPs1 -ErrorAction SilentlyContinue }
+if (-not $buildPs) { $buildPs = "" }
+Add-Assertion "H2 driver/build.ps1: production build does NOT define the force-system seam" ($buildPs -and -not $buildPs.Contains('GMPROXY_TEST_FORCE_SYSTEM_MODE')) "driver/build.ps1 references GMPROXY_TEST_FORCE_SYSTEM_MODE (or is missing) -- production binary would force-record in the field"
+Add-Assertion "H3 gmhook.c: mtime invalidation reads the store LastWriteTime (GetFileAttributesExW)" ($gmhook.Contains('GetFileAttributesExW')) "gmhook mtime invalidation missing -- a fresh exclusion waits up to the 2s TTL"
+Add-Assertion "H3 gmhook.c: tracks the store LastWriteTime (cacheLoadMtime static)" ($gmhook.Contains('cacheLoadMtime')) "gmhook does not track cacheLoadMtime -- mtime change cannot trigger a reload"
+Add-Assertion "H3 gmhook.c: WIN32_FILE_ATTRIBUTE_DATA used for the mtime read" ($gmhook.Contains('WIN32_FILE_ATTRIBUTE_DATA')) "gmhook does not use WIN32_FILE_ATTRIBUTE_DATA for the mtime read"
+Add-Assertion "H3 gmhook.c: reload fires on mtime change OR TTL expiry (mtimeChanged || TTL)" ($gmhook.Contains('mtimeChanged') -and $gmhook.Contains('GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS')) "gmhook does not gate the reload on mtimeChanged || TTL"
+Add-Assertion "H3 gmhook.c: 5th reason field ignored (forward-compat -- parse stops at '|', reason not required)" ($gmhook.Contains('excluded = (_wtoi(p3 + 1) != 0)') -and -not $gmhook.Contains('p4')) "gmhook parser changed -- the 5th reason field is not forward-compatible"
+Add-Assertion "H4 God-Mode-Windows.ps1: Test-GmAutoExcluded has a 15s script cache (GmAutoExcludeCache)" ($gm.Contains('GmAutoExcludeCache')) "Test-GmAutoExcluded 15s cache missing -- N-per-scan store reads not collapsed"
+Add-Assertion "H4 God-Mode-Windows.ps1: Test-GmAutoExcluded cache TTL is 15s (TotalSeconds -lt 15)" ($gm.Contains('TotalSeconds -lt 15')) "Test-GmAutoExcluded cache TTL is not 15s"
+Add-Assertion "H4 God-Mode-Windows.ps1: Test-GmAutoExcluded cache timestamp var (GmAutoExcludeCacheDt)" ($gm.Contains('GmAutoExcludeCacheDt')) "Test-GmAutoExcluded cache timestamp var missing"
+Add-Assertion "H4 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries invalidates the cache (sets both to null)" ($gm.Contains('GmAutoExcludeCache = $null') -and $gm.Contains('GmAutoExcludeCacheDt = $null')) "Add-GmAutoExcludeEntries does not invalidate the Test-GmAutoExcluded cache"
+Add-Assertion "H4 God-Mode-Windows.ps1: Test-GmAutoExcluded returns the stored VALUE ($cache[$target]), not ContainsKey -- excluded=0 stays \$false" ($gm.Contains('$cache[$target]') -and $gm.Contains('$script:GmAutoExcludeCache[$target]')) "Test-GmAutoExcluded returns ContainsKey (key existence) instead of the stored excluded bool -- an excluded=0 entry (count<threshold) would wrongly return true and over-exclude, breaking Detector B"
+Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries mutex create fallback (New-Object Threading.Mutex)" ($gm.Contains('New-Object System.Threading.Mutex($false, $mutexName)')) "Add-GmAutoExcludeEntries missing the mutex create fallback -- first-install window could race a concurrent gmproxy"
+Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries new entries written with reason 'P' (pre-drop)" ($gm.Contains('"$key|2|$nowTs|1|P"')) "Add-GmAutoExcludeEntries new entries do not carry reason 'P'"
+Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries preserves an existing reason on merge" ($gm.Contains('$parts.Count -ge 5 -and $parts[4]')) "Add-GmAutoExcludeEntries does not preserve an existing reason on merge"
+Add-Assertion "H5 God-Mode-Windows.ps1: Export-GodModeLogs reason legend (C=CRASH / G=CLEAN-GUI / P=PRE-DROP)" ($gm.Contains('C=CRASH') -and $gm.Contains('G=CLEAN-GUI') -and $gm.Contains('P=PRE-DROP')) "Export-GodModeLogs reason legend missing -- user cannot tell why an app was excluded"
+Add-Assertion "H5 God-Mode-Windows.ps1: Export-GodModeLogs store line-format note includes the reason field" ($gm.Contains('basename|crashCount|lastCrashUnixTs|excluded|reason')) "Export-GodModeLogs line-format note does not include the reason field"
+
 Write-Summary

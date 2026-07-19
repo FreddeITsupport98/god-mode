@@ -251,6 +251,31 @@ else
     fi
 fi
 
+# 5e. gmproxy RECORDING (force-system seam) wine runtime test: RUNS the freshly-
+#     built gmproxy.exe (FORCED build, -DGMPROXY_TEST_FORCE_SYSTEM_MODE=1) under
+#     wine with a GUI-subsystem dummy + a PRE-SEEDED count=1 store -> asserts the
+#     recording path fires (store becomes count=2 excluded=1 reason 'G' for a
+#     CLEAN-GUI exit, reason 'C' for a CRASH exit), AND that the PRODUCTION
+#     (NORMAL) build then launches USER-AUTOEXCLUDE on the next run (end-to-end:
+#     the force-system-recorded store is read correctly by the production binary,
+#     5-field format backward/forward compatible). The recording path was
+#     previously only source-level proven (the production _wcsicmp(mode,L"SYSTEM")
+#     guard never fires under wine -- no real SYSTEM token); this test closes
+#     that gap (tests/test-gmproxy-force-system.sh).
+gmforce="$SCRIPT_DIR/test-gmproxy-force-system.sh"
+if [ ! -f "$gmforce" ]; then
+    record "test-gmproxy-force-system.sh present" 0 "missing"
+else
+    log="$(mktemp)"
+    if bash "$gmforce" >"$log" 2>&1; then
+        record "gmproxy RECORDING (force-system): wine runtime (CLEAN-GUI + CRASH + end-to-end USER-AUTOEXCLUDE)" 1
+        rm -f "$log"
+    else
+        rc=$?
+        record "gmproxy RECORDING (force-system): wine runtime (CLEAN-GUI + CRASH + end-to-end USER-AUTOEXCLUDE)" 0 "exit=$rc (log: $log)"
+    fi
+fi
+
 # 6. syntax_check.ps1 honesty test (clean -> exit 0; broken .ps1/.c -> exit 1 + FAIL SUMMARY).
 synhonest="$SCRIPT_DIR/test-syntax-check.sh"
 if [ ! -f "$synhonest" ]; then
