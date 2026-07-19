@@ -430,6 +430,18 @@ static BOOL GmHookIsAutoExcluded(const wchar_t* baseName) {
     static int cacheCount = -1;  /* -1 = not loaded yet */
     static ULONGLONG cacheLoadTick = 0;
     static FILETIME cacheLoadMtime;   /* store LastWriteTime captured at last load */
+    /* host-process-token invalidation: if the host's process token changed
+       since the last load (e.g. the monitor elevated this host to SYSTEM
+       in-place via ReplaceProcessTokenForPid / NtSetInformationProcess, or a
+       token swap mid-session), reload the store so a freshly-excluded app is
+       respected immediately under the new token context. Captured at cache-
+       load time into cacheLoadTokenSid; on consult the current token SID is
+       re-queried and compared (EqualSid). Fail-open: any token query failure
+       -> tokenChanged stays FALSE -> the mtime + TTL invalidations still
+       govern (the store path is token-independent, so this is a belt-and-
+       suspenders "always fresh" guarantee, not a correctness requirement). */
+    static BYTE cacheLoadTokenSid[256];  /* SECURITY_MAX_SID_SIZE */
+    static BOOL cacheLoadTokenSidValid = FALSE;
     const wchar_t kPath[] = L"C:\\ProgramData\\GodModeAutoExclude\\gmproxy_autoexclude.dat";
     ULONGLONG now = GetTickCount64();
     /* mtime invalidation: a newly-excluded app (just crashed as SYSTEM and
@@ -448,10 +460,44 @@ static BOOL GmHookIsAutoExcluded(const wchar_t* baseName) {
     BOOL mtimeChanged = (cacheCount < 0) ||
         (curMtime.dwLowDateTime  != cacheLoadMtime.dwLowDateTime) ||
         (curMtime.dwHighDateTime != cacheLoadMtime.dwHighDateTime);
-    if (mtimeChanged || (now - cacheLoadTick) > GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS) {
+    /* Query the current host-process token SID once per consult (mirrors the
+       mtime GetFileAttributesExW per-call pattern); if it differs from the SID
+       captured at the last load, force a reload. One OpenProcessToken +
+       GetTokenInformation + CopySid + EqualSid per call (~microseconds; the
+       CreateProcessW it gates is ~1ms). Fail-open: any failure -> haveCurSid
+       stays FALSE -> tokenChanged FALSE -> mtime/TTL govern. */
+    BYTE curSid[256]; BOOL haveCurSid = FALSE;
+    HANDLE hTok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok)) {
+        BYTE tub[256]; DWORD tlen = 0;
+        if (GetTokenInformation(hTok, TokenUser, tub, sizeof(tub), &tlen)) {
+            TOKEN_USER* tu = (TOKEN_USER*)tub;
+            if (tu && IsValidSid(tu->User.Sid)) {
+                DWORD sidLen = GetLengthSid(tu->User.Sid);
+                if (sidLen > 0 && sidLen <= sizeof(cacheLoadTokenSid) &&
+                    CopySid(sizeof(curSid), curSid, tu->User.Sid)) {
+                    haveCurSid = TRUE;
+                }
+            }
+        }
+        CloseHandle(hTok);
+    }
+    BOOL tokenChanged = haveCurSid &&
+        (!cacheLoadTokenSidValid || !EqualSid(cacheLoadTokenSid, curSid));
+    if (mtimeChanged || tokenChanged || (now - cacheLoadTick) > GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS) {
         cacheCount = 0;
         cacheLoadTick = now;
         cacheLoadMtime = curMtime;
+        /* capture the current host-process token SID so the next consult can
+           detect a host-token change (the tokenChanged reload trigger above).
+           Uses the curSid already queried this consult (no second token query).
+           Fail-open: if haveCurSid is FALSE, leave cacheLoadTokenSidValid
+           FALSE so the next consult re-attempts (no stale SID captured). */
+        if (haveCurSid) {
+            if (CopySid(sizeof(cacheLoadTokenSid), cacheLoadTokenSid, curSid)) {
+                cacheLoadTokenSidValid = TRUE;
+            }
+        }
         FILE* f = _wfopen(kPath, L"r");
         if (f) {
             wchar_t line[256];

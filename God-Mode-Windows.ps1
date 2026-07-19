@@ -3503,8 +3503,11 @@ function Export-GodModeLogs {
         $LogContent += "`r`n      launch. Entries auto-drop after 30 days or via menu [18] RESET AUTO-EXCLUDE STORE."
         $LogContent += "`r`n      Line format: basename|crashCount|lastCrashUnixTs|excluded|reason"
         $LogContent += "`r`n      reason: C=CRASH (non-zero exit as SYSTEM), G=CLEAN-GUI (exit 0 + GUI PE ="
-        $LogContent += "`r`n      WinUI/AppX silent refusal -- the Win11 notepad case), P=PRE-DROP (install-"
-        $LogContent += "`r`n      time browser drop), ?=old 4-field line (reason added after the fact)."
+        $LogContent += "`r`n      a WinUI/AppX silent refusal), P=PRE-DROP (install-time browser drop),"
+        $LogContent += "`r`n      A=ALIAS-STUB (install-time AppX/Store-redirector drop -- notepad/mspaint/"
+        $LogContent += "`r`n      calc/photos; these cannot run as SYSTEM + gmproxy rename breaks their"
+        $LogContent += "`r`n      Store redirect, so they launch natively as the user via the alias),"
+        $LogContent += "`r`n      ?=old 4-field line (reason added after the fact)."
 
         # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
         #     gmproxy invocation into a per-app summary so the user can report
@@ -3556,11 +3559,32 @@ function Export-GodModeLogs {
                 if ($report.Count -eq 0) {
                     $LogContent += "`r`n[No gmproxy LAUNCH/CHILD-STATUS entries yet -- no IFEO launches recorded]"
                 } else {
-                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)  DELEGATED-RECUR  USER-AUTOEXCLUDE"
-                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------  -------------  ---------------"
+                    # Build a base->reason map from the auto-exclude store so the
+                    # per-app REASON column shows WHY each app was excluded (the
+                    # stored 5th field: C/G/P/A/?). Display-only; additive.
+                    $reasonMap = @{}
+                    if (Test-Path $GodModeAutoExcludeFile) {
+                        try {
+                            $storeLines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+                            if ($storeLines) {
+                                foreach ($ln in $storeLines) {
+                                    if (-not $ln) { continue }
+                                    $p = $ln -split '\|'
+                                    if ($p.Count -ge 4) {
+                                        $rsn = '?'; if ($p.Count -ge 5 -and $p[4]) { $rsn = $p[4] }
+                                        $reasonMap[$p[0].ToLower()] = $rsn
+                                    }
+                                }
+                            }
+                        } catch {}
+                    }
+                    $LogContent += "`r`nApp                 Launches  SYSTEM  FALLBACK  REFUSE  FAILED  ALIVE  DELEGATED  EXITED(crash?)  DELEGATED-RECUR  USER-AUTOEXCLUDE  REASON"
+                    $LogContent += "`r`n------------------  --------  ------  --------  ------  ------  -----  ---------  -------------  -------------  ---------------  ------"
                     foreach ($app in ($report.Keys | Sort-Object)) {
                         $r = $report[$app]
-                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}  {9,13}  {10,15}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED, $r.DELEGATEDRECUR, $r.USERAUTOEXCLUDE)
+                        $appReason = $reasonMap[$app.ToLower()]
+                        if (-not $appReason) { $appReason = '?' }
+                        $LogContent += ("`r`n{0,-18}  {1,8}  {2,6}  {3,8}  {4,6}  {5,6}  {6,5}  {7,9}  {8,13}  {9,13}  {10,15}  {11,-6}" -f $app, $r.Launches, $r.SYSTEM, $r.FALLBACK, $r.REFUSE, $r.FAILED, $r.ALIVE, $r.DELEGATED, $r.EXITED, $r.DELEGATEDRECUR, $r.USERAUTOEXCLUDE, $appReason)
                     }
                     $LogContent += "`r`nNOTE: ALIVE = child still running after the grace window (healthy)."
                     $LogContent += "`r`n      DELEGATED = the child exited cleanly (exitcode 0) but left a surviving"
@@ -3582,6 +3606,10 @@ function Export-GodModeLogs {
                     $LogContent += "`r`n      CLEAN as a graceful refusal."
                     $LogContent += "`r`n      Report the per-app EXITED(class=CRASH) counts so the IFEO"
                     $LogContent += "`r`n      exclusion can be scoped to exactly the apps that break as SYSTEM."
+                    $LogContent += "`r`n      REASON column = the stored auto-exclude reason for that app (the"
+                    $LogContent += "`r`n      store's 5th field): C=CRASH, G=CLEAN-GUI, P=PRE-DROP (browser),"
+                    $LogContent += "`r`n      A=ALIAS-STUB (AppX/Store-redirector install-time drop), ?=not in the"
+                    $LogContent += "`r`n      store (never excluded / no runtime refusal recorded yet)."
                 }
                 # --- ELEVATION FAULTS (root-cause): parse the [GM-PROXY] CREATEPROC:
                 #     result=FAIL lines (which CreateProcess method failed + gle) and the
@@ -3728,8 +3756,16 @@ function Add-GmAutoExcludeEntries {
         blocks the install).
     .PARAMETER BaseNames
         Array of base names WITH extension (e.g. "chrome.exe").
+    .PARAMETER Reason
+        Single reason char written as the 5th store field for NEW entries (and
+        the fallback when an existing entry has no reason). Defaults to 'P'
+        (PRE-DROP install-time browser drop). Install-IfeoElevation passes 'A'
+        for AppX/Store-redirector stub drops (notepad/mspaint/calc/photos/...).
+        An existing 5th-field reason is ALWAYS preserved on merge (a later
+        install-time drop never overwrites a runtime C/G the store already
+        learned). Informational only (Export-GodModeLogs legend).
     #>
-    param([string[]]$BaseNames)
+    param([string[]]$BaseNames, [string]$Reason = 'P')
     if (-not $BaseNames -or $BaseNames.Count -eq 0) { return }
     try {
         if (-not (Test-Path $GodModeAutoExcludeDir)) {
@@ -3785,12 +3821,13 @@ function Add-GmAutoExcludeEntries {
                     $parts = $existing[$key] -split '\|'
                     $cnt = 2; if ($parts.Count -ge 2) { $cnt = [int]$parts[1]; if ($cnt -lt 2) { $cnt = 2 } }
                     $excl = 1; if ($parts.Count -ge 4) { $excl = [int]$parts[3]; if ($excl -lt 1) { $excl = 1 } }
-                    # Preserve an existing reason (5th field) if present; else 'P'
-                    # (pre-drop). The reason is informational (Export-GodModeLogs).
-                    $rsn = 'P'; if ($parts.Count -ge 5 -and $parts[4]) { $rsn = $parts[4] }
+                    # Preserve an existing reason (5th field) if present; else the
+                    # caller's $Reason (default 'P' browser, 'A' AppX stub). The
+                    # reason is informational (Export-GodModeLogs legend).
+                    $rsn = $Reason; if ($parts.Count -ge 5 -and $parts[4]) { $rsn = $parts[4] }
                     $existing[$key] = "$key|$cnt|$nowTs|$excl|$rsn"
                 } else {
-                    $existing[$key] = "$key|2|$nowTs|1|P"
+                    $existing[$key] = "$key|2|$nowTs|1|$Reason"
                 }
             }
             # Atomic write (temp + Move-Item -Force, mirrors gmproxy.c's
@@ -3847,6 +3884,13 @@ function Reset-GmProxyAutoExcludeStore {
             }
             $reset = $true
         }
+        # Invalidate the Test-GmAutoExcluded 15s script cache so a monitor scan
+        # right after this reset does not see stale exclusions for up to 15s
+        # (the store file is gone, but the in-memory cache could still serve
+        # the old excluded=1 entries until the TTL expires). Mirrors the
+        # Add-GmAutoExcludeEntries finally-block invalidation.
+        $script:GmAutoExcludeCache = $null
+        $script:GmAutoExcludeCacheDt = $null
         if (Test-Path $GodModeAutoExcludeFile) {
             Write-Log -Message "Auto-exclude store reset FAILED (file still present at $GodModeAutoExcludeFile)." -Type "WARN" -Color Yellow
         } else {
@@ -4744,12 +4788,20 @@ function Get-GmSystemCompatExclusions {
         clients (HKLM/HKCU\SOFTWARE\Clients\StartMenuInternet\<Client>\
         shell\open\command) -- every installed + registered browser (Chrome,
         Firefox, Edge, Brave, Arc, ...) with no name list.
-        STRATEGY: only BROWSERS are dropped from IFEO (launch as user from
-        launch #1). UWP/AppX STAY hooked -> try SYSTEM first -> Detector B
-        (widened to record CLEAN-GUI refusals) catches failures at runtime
-        and auto-excludes after 2 refusals. The AppX set is still built (for
-        classification/telemetry + future use) but is NOT used to drop from
-        IFEO. Fail-open: any error -> that set is empty.
+        STRATEGY: BROWSERS + AppX/WinUI Store-redirector stubs are BOTH dropped
+        from IFEO (launch as user from launch #1). AppX/Store stubs (Win11
+        notepad/mspaint/calc/photos/...) cannot run as SYSTEM (AppX package
+        activation needs user identity) AND gmproxy's IFEO-bypass rename/copy
+        breaks their App Execution Alias redirect + .mui resource lookup, so
+        they exit 0 with no window under gmproxy as BOTH SYSTEM and user ->
+        launching them natively as the user (via the alias) is the only way
+        they start. Persisted to the auto-exclude store with reason 'A' so
+        gmproxy + gmhook + the monitor all skip SYSTEM-birth for them from
+        launch #1 (defense-in-depth alongside the IFEO drop). gmproxy.c also
+        has a runtime alias-stub guard (GmProxyIsAppExecutionAliasStub) that
+        skips recording a CLEAN-GUI refusal for any base with a Store alias,
+        belt-and-suspenders for a stub that slips past this install-time drop.
+        Fail-open: any error -> that set is empty.
     .OUTPUTS
         @{ AppX = hashtable-of-lowercase-basenames; Browser = hashtable-of-lowercase-basenames }
     #>
@@ -4991,15 +5043,20 @@ function Get-IfeoElevationCandidates {
             if ($excludeSet.ContainsKey($bare)) { $excluded++; continue }
 
             # Safety net #3 (Detector A): drop structurally SYSTEM-incompatible
-            # BROWSERS only so they launch as the normal user instead of via
-            # gmproxy -> SYSTEM (where they crash / render blank). UWP/AppX are
-            # NOT dropped -- they stay hooked -> try SYSTEM first -> Detector B
-            # (widened to record CLEAN-GUI refusals) auto-excludes after 2
-            # refusals. The AppX set is still built by Get-GmSystemCompatExclusions
-            # (for classification) but is NOT used to drop here. Fail-open: a
-            # null set -> no compat drop -> Detector B is the safety net.
+            # BROWSERS + AppX/WinUI Store-redirector stubs so they launch as the
+            # normal user instead of via gmproxy -> SYSTEM (where browsers crash
+            # / render blank, and AppX/Store stubs exit 0 with no window because
+            # gmproxy's IFEO-bypass rename breaks their App Execution Alias
+            # redirect + .mui resource lookup). AppX/Store stubs cannot run as
+            # SYSTEM (AppX activation needs user identity), so native user launch
+            # via the alias is the only way they start. Install-IfeoElevation
+            # persists the full AppX set to the auto-exclude store with reason
+            # 'A' (gmproxy + gmhook + monitor then skip them from launch #1).
+            # Fail-open: a null set -> no compat drop -> gmproxy.c's alias-stub
+            # guard (GmProxyIsAppExecutionAliasStub) is the runtime safety net.
             if ($CompatExclusions) {
                 if ($CompatExclusions.Browser.ContainsKey($baseKey)) { $excluded++; continue }
+                if ($CompatExclusions.AppX.ContainsKey($baseKey)) { $excluded++; continue }
             }
 
             # Deduplicate by base name.
@@ -5041,11 +5098,15 @@ function Install-IfeoElevation {
         )
 
         # Detector A: build the SYSTEM-incompatible base-name sets (AppX/UWP +
-        # registered browsers) ONCE. Only BROWSERS are dropped from the hook set
-        # (launch as user from launch #1). UWP/AppX STAY hooked -> try SYSTEM
-        # first -> Detector B (widened to record CLEAN-GUI refusals) auto-
-        # excludes after 2 refusals. Fail-open (empty sets -> no drop ->
-        # Detector B in gmproxy.c is the runtime safety net).
+        # registered browsers) ONCE. BROWSERS + AppX/WinUI Store-redirector
+        # stubs are BOTH dropped from the hook set (launch as user from launch
+        # #1) + persisted to the auto-exclude store (reason 'P' browser / 'A'
+        # AppX) so gmproxy + gmhook + the monitor skip them from launch #1.
+        # AppX/Store stubs cannot run as SYSTEM (AppX activation needs user
+        # identity) AND gmproxy's IFEO-bypass rename breaks their App Execution
+        # Alias redirect + .mui lookup, so native user launch is the only way
+        # they start. Fail-open (empty sets -> no drop -> gmproxy.c's
+        # GmProxyIsAppExecutionAliasStub runtime guard is the safety net).
         $CompatExclusions = Get-GmSystemCompatExclusions
 
         # Auto-populate additional candidates from installed/running programs,
@@ -5054,36 +5115,80 @@ function Install-IfeoElevation {
 
         # Filter the curated seed through the compat sets (the seed bypasses
         # Get-IfeoElevationCandidates' path/denylist filters, so browser names
-        # like chrome.exe / firefox.exe in the seed must be dropped here
-        # explicitly). UWP/AppX names (notepad.exe, calc.exe) are NOT dropped --
-        # they stay hooked so they try SYSTEM first and Detector B catches
-        # refusals at runtime. Collect the dropped BROWSER names for the store
-        # persist below (so gmproxy + gmhook + the monitor exclude them from
-        # launch #1, defense-in-depth alongside the IFEO drop).
+        # like chrome.exe / firefox.exe AND AppX/Store-stub names (notepad.exe,
+        # calc.exe, mspaint.exe, photos.exe, ...) in the seed must be dropped
+        # here explicitly). AppX/Store stubs are dropped (NOT hooked) + the full
+        # AppX set is persisted to the store with reason 'A' below so gmproxy +
+        # gmhook + the monitor exclude them from launch #1. Collect the dropped
+        # BROWSER + AppX seed names (browsers persisted with default 'P'; AppX
+        # seed names drive the prior-IFEO-hook cleanup below).
         $seedDroppedBrowser = 0
+        $seedDroppedAppx = 0
         $droppedBrowserNames = @()
+        $droppedAppxNames = @()
         $filteredSeed = @()
         foreach ($app in $IfeoElevationApps) {
             $bk = $app.ToLower()
             if ($CompatExclusions.Browser.ContainsKey($bk)) { $seedDroppedBrowser++; $droppedBrowserNames += $app; continue }
+            if ($CompatExclusions.AppX.ContainsKey($bk)) { $seedDroppedAppx++; $droppedAppxNames += $app; continue }
             $filteredSeed += $app
         }
         $allApps = $filteredSeed + $autoCandidates | Select-Object -Unique
 
         # Detector A persist: write the dropped BROWSER base names to the
-        # auto-exclude store at threshold (count=2, excluded=1) so gmproxy +
-        # gmhook + the monitor all treat them as excluded from the FIRST launch
-        # after enable -- defense-in-depth alongside the IFEO drop (covers the
-        # gmhook child-birth path + the monitor periodic scan, which the IFEO
-        # drop alone does not reach). UWP/AppX are NOT persisted here -- they
-        # get a SYSTEM attempt first and rely on Detector B runtime catch.
+        # auto-exclude store at threshold (count=2, excluded=1, reason 'P') so
+        # gmproxy + gmhook + the monitor all treat them as excluded from the
+        # FIRST launch after enable -- defense-in-depth alongside the IFEO drop
+        # (covers the gmhook child-birth path + the monitor periodic scan,
+        # which the IFEO drop alone does not reach).
         if ($droppedBrowserNames.Count -gt 0) {
             Add-GmAutoExcludeEntries -BaseNames $droppedBrowserNames
+        }
+        # Detector A persist (AppX/WinUI Store-redirector stubs): write the FULL
+        # AppX set to the auto-exclude store with reason 'A' so gmproxy + gmhook
+        # + the monitor skip SYSTEM-birth for EVERY detected Store/WinUI app
+        # from launch #1 (not just the seed names). AppX apps cannot run as
+        # SYSTEM (AppX package activation needs user identity) AND gmproxy's
+        # IFEO-bypass rename breaks their Store redirect (the notepad stub case),
+        # so launching them natively as the user is the only way they start. No
+        # hardcoded names -- the AppX set is the runtime alias-reparse +
+        # AppxPackage enumeration in Get-GmSystemCompatExclusions. Fail-open
+        # (empty set -> no persist -> gmproxy.c alias-stub guard is the runtime
+        # safety net). The store's 256-cap + 30-day stale bound the growth.
+        if ($CompatExclusions.AppX.Count -gt 0) {
+            Add-GmAutoExcludeEntries -BaseNames @($CompatExclusions.AppX.Keys) -Reason 'A'
         }
 
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $hooked = 0; $skipped = 0; $failed = 0
+
+        # Detector A cleanup: REMOVE any existing IFEO Debugger hook for the
+        # dropped AppX seed names so a re-enable on a VM that previously hooked
+        # them (before this strategy flip) cleans up the prior hook -- otherwise
+        # notepad.exe / mspaint.exe / calc.exe etc. would stay IFEO-hooked and
+        # keep launching via gmproxy's broken renamed copy (exit 0, no window).
+        # Mirrors Uninstall-IfeoElevation's per-key cleanup (Restore-RegistryKey
+        # lifts the hardened deny ACL, then remove Debugger + key). Only ever
+        # touches keys whose Debugger points at gmproxy (never an unrelated
+        # IFEO key). Best-effort; counts surface in the summary log + debug EXIT.
+        $appxHookRemoved = 0; $appxHookRemoveFailed = 0
+        foreach ($app in $droppedAppxNames) {
+            $appKey = Join-Path $IfeoBase $app
+            if (-not (Test-Path $appKey)) { continue }
+            $dbg = $null
+            try { $dbg = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger } catch {}
+            if (-not $dbg -or $dbg -notlike "*gmproxy*") { continue }
+            try {
+                $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$app"
+                Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
+                Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $appKey)) { $appxHookRemoved++ } else { $appxHookRemoveFailed++ }
+            } catch {
+                $appxHookRemoveFailed++
+                Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "Failed to remove prior AppX IFEO hook for $app`: $_"
+            }
+        }
 
         foreach ($app in $allApps) {
             $appKey = Join-Path $IfeoBase $app
@@ -5121,8 +5226,8 @@ function Install-IfeoElevation {
         $totalUnique = $allApps.Count
         $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
         if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser from the seed (launch as user from launch #1; persisted to auto-exclude store). UWP/AppX stay hooked -> try SYSTEM first -> Detector B catches CLEAN-GUI refusals (auto-exclude after 2). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count)"
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser + $seedDroppedAppx AppX/Store-stub from the seed (launch as user from launch #1; browsers persisted reason 'P', AppX set persisted reason 'A'). AppX/Store-redirector stubs (notepad/mspaint/calc/photos/etc.) are NOT IFEO-hooked -- they cannot run as SYSTEM (AppX activation needs user identity) and gmproxy's rename/copy breaks their Store redirect, so they launch natively as the user via the App Execution Alias. Prior AppX IFEO hooks removed: $appxHookRemoved (failed: $appxHookRemoveFailed). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count) droppedAppx=$seedDroppedAppx persistedAppx=$($CompatExclusions.AppX.Count) appxHookRemoved=$appxHookRemoved appxHookRemoveFailed=$appxHookRemoveFailed"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
@@ -5251,6 +5356,30 @@ function Add-IfeoElevationForApp {
         $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $appKey = Join-Path $IfeoBase $baseName
+
+        # Safety net #4 (Detector A): never IFEO-hook an App Execution Alias
+        # stub (a Win11 Store-redirector like notepad/mspaint/calc/photos).
+        # gmproxy's IFEO-bypass rename/copy breaks their App Execution Alias
+        # redirect + .mui resource lookup, so they exit 0 with no window as
+        # BOTH SYSTEM and user. Smart detection: the alias is a 0-byte reparse
+        # point at %LOCALAPPDATA%\Microsoft\WindowsApps\<base>. No hardcoded
+        # names -- whatever base the watcher sees, if it has a Store alias, skip
+        # hooking. Fail-open: if the alias dir/file is missing or the attr read
+        # fails, continue (Install-IfeoElevation's install-time AppX drop is the
+        # primary gate; this is the watcher defense-in-depth).
+        try {
+            $aliasDir = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps'
+            if ($aliasDir -and (Test-Path $aliasDir)) {
+                $aliasFile = Join-Path $aliasDir $baseName
+                if (Test-Path $aliasFile) {
+                    $aliasItem = Get-Item $aliasFile -Force -ErrorAction SilentlyContinue
+                    if ($aliasItem -and ($aliasItem.Attributes.ToString() -match 'ReparsePoint')) {
+                        Write-DebugLog -FunctionName "Add-IfeoElevationForApp" -Action "SKIP-APPAlias" -Message "$baseName is an App Execution Alias stub (Store-redirector); not IFEO-hooked (gmproxy rename/copy breaks the Store redirect)"
+                        return $false
+                    }
+                }
+            }
+        } catch {}
 
         # Idempotent gate (no retrigger): already pointing at gmproxy -> do nothing.
         $existing = $null

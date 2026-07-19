@@ -200,7 +200,14 @@ grep -qF 'GmProxyIsGuiSubsystem' "$SRC" && record "src: GmProxyIsGuiSubsystem pr
 grep -qF 'IMAGE_SUBSYSTEM_WINDOWS_GUI' "$SRC" && record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 1 || record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 0 "not found -- the PE-subsystem gate has no target value"
 grep -qF 'IMAGE_FILE_HEADER' "$SRC" && record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 1 || record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 0 "not found -- OptionalHeader.Subsystem would read from the wrong offset"
 grep -qF 'GmProxyIsGuiSubsystem(targetPath)' "$SRC" && record "src: widened record guard references GmProxyIsGuiSubsystem(targetPath)" 1 || record "src: widened record guard references GmProxyIsGuiSubsystem(targetPath)" 0 "not found -- CLEAN-GUI refusals not gated on the PE subsystem"
-grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found -- auto-excluded PIDs would be re-elevated by the monitor"
+grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found"
+# Detector B alias-stub guard (2026-07-19): a CLEAN-GUI exit for a Win11 App
+# Execution Alias stub (notepad/mspaint/calc) is NOT a SYSTEM refusal -- it is
+# the IFEO-bypass RENAME breaking the stub's Store redirect + .mui lookup. The
+# guard skips recording it + logs the real cause. CRASH is still recorded.
+grep -qF 'GmProxyIsAppExecutionAliasStub' "$SRC" && record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 1 || record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 0 "not found -- CLEAN-GUI refusals for Store stubs would pollute the store"
+grep -qF 'is an App Execution Alias stub' "$SRC" && record "src: alias guard skip-record DiagLog present (App Execution Alias stub)" 1 || record "src: alias guard skip-record DiagLog present" 0 "not found -- the rename-breaks-stub cause would not be logged"
+grep -qF 'code == 0 && GmProxyIsAppExecutionAliasStub(base)' "$SRC" && record "src: alias guard wraps the CLEAN-GUI record (code == 0 && GmProxyIsAppExecutionAliasStub(base))" 1 || record "src: alias guard wraps the CLEAN-GUI record" 0 "not found -- a stub CLEAN exit would still be recorded"
 
 # gmhook.c store consult (Part B): gmhook reads the auto-exclude store before
 # birthing a child as SYSTEM; a store-excluded base name falls through to the
@@ -213,6 +220,11 @@ if [ -f "$GMHOOK_SRC" ]; then
     grep -qF 'GMHOOK_AUTOEXCLUDE_CACHE_TTL_MS' "$GMHOOK_SRC" && record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 1 || record "src: gmhook 2s TTL cache constant present (hot-path throttle)" 0 "not found -- CreateProcess hot path would read the store file every call"
     grep -qF 'GetFileAttributesExW' "$GMHOOK_SRC" && record "src: gmhook mtime invalidation (GetFileAttributesExW) present -- newly-excluded app respected on next CreateProcessW" 1 || record "src: gmhook mtime invalidation (GetFileAttributesExW) present" 0 "not found -- a fresh exclusion waits up to the 2s TTL"
     grep -qF 'cacheLoadMtime' "$GMHOOK_SRC" && record "src: gmhook tracks the store LastWriteTime (cacheLoadMtime) for mtime invalidation" 1 || record "src: gmhook tracks the store LastWriteTime (cacheLoadMtime)" 0 "not found -- mtime change cannot trigger a reload"
+    # gmhook host-process-token invalidation (2026-07-19): reload the store when
+    # the host's process token changes (monitor in-place elevation / token swap).
+    grep -qF 'cacheLoadTokenSid' "$GMHOOK_SRC" && record "src: gmhook captures the host token SID (cacheLoadTokenSid) for token-change invalidation" 1 || record "src: gmhook captures the host token SID (cacheLoadTokenSid)" 0 "not found -- a host-token change cannot trigger a reload"
+    grep -qF 'tokenChanged' "$GMHOOK_SRC" && record "src: gmhook reloads on a host-token change (tokenChanged)" 1 || record "src: gmhook reloads on a host-token change (tokenChanged)" 0 "not found -- the 'always fresh' guarantee is incomplete"
+    grep -qF 'EqualSid' "$GMHOOK_SRC" && record "src: gmhook token SID compare uses EqualSid (fail-open)" 1 || record "src: gmhook token SID compare uses EqualSid" 0 "not found"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"
 fi

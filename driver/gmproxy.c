@@ -248,6 +248,46 @@ static BOOL GmProxyIsGuiSubsystem(const wchar_t* exePath) {
     return isGui;
 }
 
+/* TRUE if baseName has an App Execution Alias reparse point at
+   %LOCALAPPDATA%\Microsoft\WindowsApps\<base> -- i.e. it is a Win11
+   Store-redirector stub (notepad, mspaint, calc, photos, ...). Used by
+   Detector B to SKIP recording a CLEAN-GUI refusal for such stubs: a CLEAN
+   exit (exitcode 0, tree=0) under gmproxy is caused by the IFEO-bypass RENAME
+   breaking the stub's Store redirect + .mui resource lookup (the App Execution
+   Alias redirect does not fire under the gmproxy_<pid>_<base> name, and the
+   .mui sidecar can't be found), NOT by a SYSTEM token refusal -- so recording
+   it would be a false positive that pollutes the auto-exclude store, AND the
+   user-launch fallback (same renamed copy) still fails, so the app never
+   starts either way. Detector A (Install-IfeoElevation in God-Mode-Windows.ps1)
+   drops these stubs from IFEO at install time so gmproxy is never invoked for
+   them; THIS guard is the belt-and-suspenders for a stub that slips past
+   Detector A (alias created after install, or a detection miss) -- it prevents
+   a false refusal record + logs the real cause so the user sees it should be
+   dropped from IFEO. No hardcoded names -- the reparse-point check is the
+   no-hardcode disambiguator (whatever base has a Store alias is a stub).
+   Fail-open: any error / missing alias file -> FALSE (current behavior:
+   record the refusal). Mirrors Get-GmSystemCompatExclusions' WindowsApps
+   reparse-point scan in God-Mode-Windows.ps1 and Add-IfeoElevationForApp's
+   safety net #4. LOCALAPPDATA is the invoking user's (gmproxy runs as the
+   admin user via IFEO); a nested SYSTEM gmproxy (IFEO re-entry) would get
+   systemprofile's LOCALAPPDATA (no user aliases) -> FALSE -> record, which
+   is acceptable since Detector A drops stubs from IFEO so the nested case
+   is rare. */
+static BOOL GmProxyIsAppExecutionAliasStub(const wchar_t* baseName) {
+    if (!baseName || !baseName[0]) return FALSE;
+    wchar_t localAppData[MAX_PATH] = {0};
+    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return FALSE;  /* fail-open */
+    wchar_t path[MAX_PATH] = {0};
+    /* %ls: wide (MinGW %s truncates wchar_t). Build
+       %LOCALAPPDATA%\Microsoft\WindowsApps\<base>. */
+    int n = swprintf(path, MAX_PATH, L"%ls\\Microsoft\\WindowsApps\\%ls", localAppData, baseName);
+    if (n <= 0 || (size_t)n >= MAX_PATH) return FALSE;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return FALSE;  /* no alias file -> not a stub */
+    return (fa.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? TRUE : FALSE;
+}
+
 /* ------------------------------------------------------------------ */
 /* Detector B: runtime SYSTEM-crash auto-exclude store.                */
 /*                                                                     */
@@ -279,11 +319,21 @@ static BOOL GmProxyIsGuiSubsystem(const wchar_t* exePath) {
    refusal). The PE-subsystem gate (GmProxyIsGuiSubsystem) is the no-
    hardcoded-name disambiguator: console apps (CUI) that exit 0 as SYSTEM
    are legit CLI runs (nslookup/ftp/7z) and are NOT recorded -- no false
-   exclusion. The only "false positive" is a successful breakaway GUI
-   stub, which then runs as the user on the next launch = still works =
-   graceful, not a break. Threshold stays 2: a GUI app that refuses twice
-   as SYSTEM is auto-excluded. CRASH remains unambiguous (the app crashed
-   as SYSTEM) and is always recorded regardless of subsystem. */
+   exclusion. The Win11 App Execution Alias STUB case (notepad/mspaint/calc/...)
+   is NOT a genuine refusal: the stub's CLEAN exit under gmproxy is caused by
+   the IFEO-bypass RENAME breaking the App Execution Alias redirect + .mui
+   lookup (not by SYSTEM), and the user-launch fallback (same renamed copy)
+   still fails -> the app never starts. GmProxyIsAppExecutionAliasStub detects
+   these stubs (reparse point at %LOCALAPPDATA%\Microsoft\WindowsApps) and the
+   record site SKIPS the refusal record + logs the real cause, so the store is
+   not polluted; Detector A (Install-IfeoElevation) drops them from IFEO at
+   install time so they launch natively as the user via the alias. The only
+   remaining "false positive" is a successful breakaway GUI stub whose real
+   app opened out-of-tree (tree=0 but the app DID start) -- it then runs as
+   the user on the next launch = still works = graceful, not a break.
+   Threshold stays 2: a GUI app that refuses twice as SYSTEM is auto-excluded.
+   CRASH remains unambiguous (the app crashed as SYSTEM) and is always
+   recorded regardless of subsystem (even for an alias stub). */
 /*                                                                     */
 /* Store path: C:\ProgramData\GodModeAutoExclude\gmproxy_autoexclude.dat */
 /* Line format (UTF-8): basename|crashCount|lastCrashUnixTs|excluded|reason */
@@ -786,7 +836,25 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
 #endif
             if (recordAsSystem &&
                 (code != 0 || (code == 0 && GmProxyIsGuiSubsystem(targetPath)))) {
-                GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
+                /* Detector B alias-stub guard: a CLEAN-GUI exit (code==0 + GUI
+                   PE) for a Win11 App Execution Alias stub (notepad/mspaint/
+                   calc/...) is NOT a SYSTEM refusal -- it is the IFEO-bypass
+                   RENAME breaking the stub's App Execution Alias redirect +
+                   .mui resource lookup (the alias redirect does not fire under
+                   the gmproxy_<pid>_<base> name, and the .mui sidecar can't be
+                   found), so the stub exits 0 with no window as BOTH SYSTEM
+                   and user. Recording it would pollute the store with a false
+                   refusal AND the user-launch fallback (same renamed copy)
+                   still fails -> the app never starts. Skip the record + log
+                   the real cause so the user sees it should be dropped from
+                   IFEO via Detector A. CRASH (code != 0) is still recorded (a
+                   real crash is unambiguous, even for a stub). Fail-open: if
+                   the alias check fails, record as before. */
+                if (code == 0 && GmProxyIsAppExecutionAliasStub(base)) {
+                    DiagLog(L"[GM-PROXY] AUTO-EXCLUDE: skip record -- %ls is an App Execution Alias stub (CLEAN exit caused by IFEO-bypass rename, not a SYSTEM refusal; drop it from IFEO via Detector A).\n", base);
+                } else {
+                    GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
+                }
             }
         } else {
             DiagLog(L"[GM-PROXY] CHILD-STATUS: app=%ls pid=%lu result=EXITED exitcode=%lu class=%ls job=disabled (mode=%ls)\n",
@@ -805,7 +873,15 @@ static void GmProxyLogLaunchReport(const wchar_t* targetPath, const wchar_t* mod
                would risk a false exclusion; the #ifdef keeps that conservative
                behavior in production). */
             if (code != 0 || (code == 0 && GmProxyIsGuiSubsystem(targetPath))) {
-                GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
+                /* Detector B alias-stub guard (job=disabled branch, test seam
+                   only): same skip as the hJob branch -- a CLEAN-GUI exit for
+                   an App Execution Alias stub is the rename breaking the stub,
+                   not a SYSTEM refusal. CRASH is still recorded. Fail-open. */
+                if (code == 0 && GmProxyIsAppExecutionAliasStub(base)) {
+                    DiagLog(L"[GM-PROXY] AUTO-EXCLUDE: skip record -- %ls is an App Execution Alias stub (CLEAN exit caused by IFEO-bypass rename, not a SYSTEM refusal; drop it from IFEO via Detector A).\n", base);
+                } else {
+                    GmProxyAutoExcludeRecord(base, (code != 0) ? L'C' : L'G');
+                }
             }
 #endif
         }

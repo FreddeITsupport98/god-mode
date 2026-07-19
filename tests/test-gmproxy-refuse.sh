@@ -162,6 +162,13 @@ grep -qF 'GmProxyIsGuiSubsystem' "$SRC" && record "src: GmProxyIsGuiSubsystem pr
 grep -qF 'IMAGE_SUBSYSTEM_WINDOWS_GUI' "$SRC" && record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 1 || record "src: IMAGE_SUBSYSTEM_WINDOWS_GUI constant present (GUI subsystem check)" 0 "not found -- the PE-subsystem gate has no target value"
 grep -qF 'IMAGE_FILE_HEADER' "$SRC" && record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 1 || record "src: IMAGE_FILE_HEADER read before OptionalHeader (PE parse correctness)" 0 "not found -- Subsystem would read from the wrong offset"
 grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 1 || record "src: A3 -- SignalGmProxyFeedback gated on !autoExcluded" 0 "not found -- auto-excluded PIDs would be re-elevated by the monitor"
+# Detector B alias-stub guard (2026-07-19): a CLEAN-GUI exit for a Win11 App
+# Execution Alias stub (notepad/mspaint/calc) is NOT a SYSTEM refusal -- it is
+# the IFEO-bypass RENAME breaking the stub's Store redirect + .mui lookup. The
+# guard skips recording it + logs the real cause. CRASH is still recorded.
+grep -qF 'GmProxyIsAppExecutionAliasStub' "$SRC" && record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 1 || record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 0 "not found -- CLEAN-GUI refusals for Store stubs would pollute the store"
+grep -qF 'is an App Execution Alias stub' "$SRC" && record "src: alias guard skip-record DiagLog present (App Execution Alias stub)" 1 || record "src: alias guard skip-record DiagLog present" 0 "not found -- the rename-breaks-stub cause would not be logged"
+grep -qF 'code == 0 && GmProxyIsAppExecutionAliasStub(base)' "$SRC" && record "src: alias guard wraps the CLEAN-GUI record (code == 0 && GmProxyIsAppExecutionAliasStub(base))" 1 || record "src: alias guard wraps the CLEAN-GUI record" 0 "not found -- a stub CLEAN exit would still be recorded"
 # Detector B reason field (5th, additive): store line is base|count|ts|excluded|reason
 # (C=crash, G=clean-gui, P=pre-drop, ?=old 4-field line). Informational for
 # Export-GodModeLogs; the parser defaults to '?' so old lines still parse.
