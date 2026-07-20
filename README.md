@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon/image.jpg" alt="God Mode" height="420">
+</p>
+
 # God-Mode-Windows
 
 ## Overview

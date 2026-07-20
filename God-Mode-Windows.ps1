@@ -6093,16 +6093,37 @@ $script:GmProxyFeedbackQueue = [System.Collections.ArrayList]::Synchronized([Sys
 $script:GmProxyFeedbackPipeJob = $null
 
 function Register-ProcessCreationWatcher {
+    # NOTE: PowerShell 7 removed the PSEventReceived adapter that let Windows
+    # PowerShell 5.1 attach .NET event handlers with `$obj.EventName += { ... }`.
+    # On PS 7.x that syntax throws "The property '<EventName>' cannot be found on
+    # this object. Verify that the property exists and can be set." -- which is
+    # exactly why this watcher silently failed to register (log: "WMI process
+    # creation watcher failed to register"), and interactive shells
+    # cmd/powershell/pwsh/powershell_ise were never event-elevated. Use
+    # Register-ObjectEvent instead, and pass the shared synchronized queue via
+    # -MessageData: the -Action block runs in the event-subscription runspace
+    # where $script: scope does NOT reliably resolve, so the queue MUST be handed
+    # in explicitly. This watcher is the SOLE event-driven elevator for
+    # interactive shells (console/UI apps the global WH_GETMESSAGE hook does not
+    # auto-inject, and that were removed from IFEO so they are not born via
+    # gmproxy); the Start-Monitoring loop drains the queue into
+    # Monitor-ElevateProcess Phase 0 (in-place ReplaceProcessTokenForPid token
+    # swap, no kill, no relaunch, no duplicate).
     try {
+        try { Unregister-Event -SourceIdentifier 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue } catch {}
+        try { Get-Job -Name 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Add-Type -AssemblyName System.Management -ErrorAction SilentlyContinue } catch {}
         $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
         $script:ProcessCreationWatcher = New-Object System.Management.ManagementEventWatcher($query)
-        $script:ProcessCreationWatcher.EventArrived += {
-            param($sender, $eventArgs)
-            $proc = $eventArgs.NewEvent.TargetInstance
+        $queue = $script:ProcessCreationQueue
+        $action = {
+            $q = $Event.MessageData
+            if (-not $q) { return }
+            $proc = $EventArgs.NewEvent.TargetInstance
             if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe" -and $proc.SessionId -gt 0) {
                 $arguments = ""
                 if ($proc.CommandLine) {
-                    $cmdLine = $proc.CommandLine
+                    $cmdLine = [string]$proc.CommandLine
                     if ($cmdLine.StartsWith('"')) {
                         $endQuote = $cmdLine.IndexOf('"', 1)
                         if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
@@ -6115,15 +6136,18 @@ function Register-ProcessCreationWatcher {
                         }
                     }
                 }
-                [void]$script:ProcessCreationQueue.Add([PSCustomObject]@{
-                    ProcessId = $proc.ProcessId
-                    ExecutablePath = $proc.ExecutablePath
-                    Arguments = $arguments
-                    SessionId = $proc.SessionId
-                    CreationDate = $proc.CreationDate
-                })
+                try {
+                    [void]$q.Add([PSCustomObject]@{
+                        ProcessId      = $proc.ProcessId
+                        ExecutablePath = $proc.ExecutablePath
+                        Arguments      = $arguments
+                        SessionId      = $proc.SessionId
+                        CreationDate   = $proc.CreationDate
+                    })
+                } catch {}
             }
         }
+        $null = Register-ObjectEvent -InputObject $script:ProcessCreationWatcher -EventName 'EventArrived' -SourceIdentifier 'GMProcessCreationWatcher' -MessageData $queue -Action $action
         $script:ProcessCreationWatcher.Start()
         $script:ProcessCreationWatcherActive = $true
         return $true
@@ -6136,12 +6160,12 @@ function Register-ProcessCreationWatcher {
 
 function Unregister-ProcessCreationWatcher {
     if ($script:ProcessCreationWatcher) {
-        try {
-            $script:ProcessCreationWatcher.Stop()
-            $script:ProcessCreationWatcher.Dispose()
-        } catch {}
+        try { $script:ProcessCreationWatcher.Stop() } catch {}
+        try { $script:ProcessCreationWatcher.Dispose() } catch {}
         $script:ProcessCreationWatcher = $null
     }
+    try { Unregister-Event -SourceIdentifier 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue } catch {}
+    try { Get-Job -Name 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
     $script:ProcessCreationWatcherActive = $false
     if ($script:ProcessCreationQueue) {
         $script:ProcessCreationQueue.Clear()
@@ -6219,6 +6243,7 @@ function Stop-GmProxyFeedbackListener {
 $script:IfeoNewAppQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 $script:IfeoNewAppDebounce = [hashtable]::Synchronized(@{})
 $script:IfeoNewAppWatchers = @()
+$script:IfeoNewAppSubscriptions = @()
 $script:IfeoNewAppWatcherActive = $false
 $script:IfeoPruneQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 
@@ -6262,75 +6287,124 @@ function Start-IfeoNewAppWatcher {
         } catch {}
 
         $script:IfeoNewAppWatchers = @()
+        $script:IfeoNewAppSubscriptions = @()
+        $shared = @{
+            Queue = $script:IfeoNewAppQueue
+            Prune = $script:IfeoPruneQueue
+        }
+        $dirIdx = 0
         foreach ($dir in $watchDirs) {
+            $dirIdx++
             try {
                 $w = New-Object System.IO.FileSystemWatcher($dir, "*.exe")
                 $w.IncludeSubdirectories = $true
                 $w.InternalBufferSize = 65536
                 $w.NotifyFilter = [System.IO.NotifyFilters]::FileName -bor [System.IO.NotifyFilters]::DirectoryName
-                $w.Created += {
-                    param($sender, $e)
-                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
-                        [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                # PowerShell 7 removed the `$obj.Event += {}` adapter (it throws
+                # "The property '<Event>' cannot be found on this object"), so the
+                # four FileSystemWatcher handlers below MUST use Register-ObjectEvent.
+                # The -Action block runs in the event-subscription runscape where
+                # $script: scope does NOT reliably resolve, so the shared queues are
+                # passed in via -MessageData (a hashtable) and reached as
+                # $Event.MessageData.Queue / .Prune. $EventArgs is the automatic
+                # event-args (FileSystemEventArgs / RenamedEventArgs / ErrorEventArgs).
+                $createdAction = {
+                    $s = $Event.MessageData
+                    if (-not $s) { return }
+                    $full = $EventArgs.FullPath
+                    if ($full -and $full -like '*.exe') {
+                        try { [void]$s.Queue.Add($full) } catch {}
                         # Re-arm (updater swap): the app reappeared, so cancel any
                         # pending stale-prune for this base name -- never remove a
                         # gmproxy IFEO key mid-update. The prune drain's re-scan is
                         # the belt-and-suspenders; this avoids even attempting it.
-                        $cn = [System.IO.Path]::GetFileName($e.FullPath)
+                        $cn = [System.IO.Path]::GetFileName($full)
                         if (-not [string]::IsNullOrWhiteSpace($cn)) {
-                            for ($ci = $script:IfeoPruneQueue.Count - 1; $ci -ge 0; $ci--) {
+                            for ($ci = $s.Prune.Count - 1; $ci -ge 0; $ci--) {
                                 try {
-                                    if ($script:IfeoPruneQueue[$ci].BaseName -eq $cn) {
-                                        $script:IfeoPruneQueue.RemoveAt($ci)
+                                    if ($s.Prune[$ci].BaseName -eq $cn) {
+                                        $s.Prune.RemoveAt($ci)
                                     }
                                 } catch {}
                             }
                         }
                     }
                 }
-                $w.Renamed += {
-                    param($sender, $e)
-                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
-                        [void]$script:IfeoNewAppQueue.Add($e.FullPath)
+                $renamedAction = {
+                    $s = $Event.MessageData
+                    if (-not $s) { return }
+                    $full = $EventArgs.FullPath
+                    if ($full -and $full -like '*.exe') {
+                        try { [void]$s.Queue.Add($full) } catch {}
                         # Re-arm (updater swap, .tmp->.exe rename): cancel any
                         # pending stale-prune for this base name (app reappeared).
-                        $rn = [System.IO.Path]::GetFileName($e.FullPath)
+                        $rn = [System.IO.Path]::GetFileName($full)
                         if (-not [string]::IsNullOrWhiteSpace($rn)) {
-                            for ($ri = $script:IfeoPruneQueue.Count - 1; $ri -ge 0; $ri--) {
+                            for ($ri = $s.Prune.Count - 1; $ri -ge 0; $ri--) {
                                 try {
-                                    if ($script:IfeoPruneQueue[$ri].BaseName -eq $rn) {
-                                        $script:IfeoPruneQueue.RemoveAt($ri)
+                                    if ($s.Prune[$ri].BaseName -eq $rn) {
+                                        $s.Prune.RemoveAt($ri)
                                     }
                                 } catch {}
                             }
                         }
                     }
                 }
-                $w.Error += {
+                $errorAction = {
                     # Buffer overflow / watcher error -> sentinel for an idempotent catch-up rescan.
-                    [void]$script:IfeoNewAppQueue.Add('__GMIFEO_RESCAN__')
+                    $s = $Event.MessageData
+                    if (-not $s) { return }
+                    try { [void]$s.Queue.Add('__GMIFEO_RESCAN__') } catch {}
                 }
-                $w.Deleted += {
+                $deletedAction = {
                     # A watched .exe was deleted (uninstall, or updater swapping the
                     # binary). Enqueue a DEFERRED stale-prune entry with a ~5s grace
                     # period so an updater's new .exe lands before we decide; the
                     # Start-Monitoring drain re-scans and removes the gmproxy IFEO key
                     # only if the base name is gone everywhere (never touches unrelated
                     # keys, never retriggers on updater swaps).
-                    param($sender, $e)
-                    if ($e.FullPath -and $e.FullPath -like '*.exe') {
-                        $bn = [System.IO.Path]::GetFileName($e.FullPath)
+                    $s = $Event.MessageData
+                    if (-not $s) { return }
+                    $full = $EventArgs.FullPath
+                    if ($full -and $full -like '*.exe') {
+                        $bn = [System.IO.Path]::GetFileName($full)
                         if (-not [string]::IsNullOrWhiteSpace($bn)) {
-                            [void]$script:IfeoPruneQueue.Add([PSCustomObject]@{
-                                BaseName = $bn
-                                FullPath = $e.FullPath
-                                DueTime  = (Get-Date).AddSeconds(5)
-                            })
+                            try {
+                                [void]$s.Prune.Add([PSCustomObject]@{
+                                    BaseName = $bn
+                                    FullPath = $full
+                                    DueTime  = (Get-Date).AddSeconds(5)
+                                })
+                            } catch {}
                         }
                     }
                 }
-                $w.EnableRaisingEvents = $true
-                $script:IfeoNewAppWatchers += $w
+                $baseSid = "GMIFeoNewApp_{0}_{1}" -f $dirIdx, (($dir -replace '[^A-Za-z0-9]','_').Trim('_'))
+                $bindings = @(
+                    @{ Name = 'Created'; Action = $createdAction },
+                    @{ Name = 'Renamed'; Action = $renamedAction },
+                    @{ Name = 'Error';   Action = $errorAction },
+                    @{ Name = 'Deleted'; Action = $deletedAction }
+                )
+                $regOk = $true
+                foreach ($b in $bindings) {
+                    try {
+                        $sid = "$baseSid_$($b.Name)"
+                        try { Unregister-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue } catch {}
+                        try { Get-Job -Name $sid -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+                        $null = Register-ObjectEvent -InputObject $w -EventName $b.Name -SourceIdentifier $sid -MessageData $shared -Action $b.Action
+                        $script:IfeoNewAppSubscriptions += $sid
+                    } catch {
+                        Write-DebugLog -FunctionName "Start-IfeoNewAppWatcher" -Action "WARN" -Message "Could not bind $($b.Name) on $dir`: $_"
+                        $regOk = $false
+                    }
+                }
+                if ($regOk) {
+                    $w.EnableRaisingEvents = $true
+                    $script:IfeoNewAppWatchers += $w
+                } else {
+                    try { $w.Dispose() } catch {}
+                }
             } catch {
                 Write-DebugLog -FunctionName "Start-IfeoNewAppWatcher" -Action "WARN" -Message "Could not watch $dir`: $_"
             }
@@ -6353,6 +6427,13 @@ function Stop-IfeoNewAppWatcher {
         try { $w.Dispose() } catch {}
     }
     $script:IfeoNewAppWatchers = @()
+    if ($script:IfeoNewAppSubscriptions) {
+        foreach ($sid in $script:IfeoNewAppSubscriptions) {
+            try { Unregister-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue } catch {}
+            try { Get-Job -Name $sid -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+        }
+        $script:IfeoNewAppSubscriptions = @()
+    }
     $script:IfeoNewAppWatcherActive = $false
     if ($script:IfeoNewAppQueue) { $script:IfeoNewAppQueue.Clear() }
     if ($script:IfeoNewAppDebounce) { $script:IfeoNewAppDebounce.Clear() }
@@ -6683,6 +6764,17 @@ function Start-Monitoring {
     if ($isSystem) {
         $null = Start-GmProxyFeedbackListener
         $null = Start-IfeoNewAppWatcher
+        # Event-driven WMI process-creation watcher: the SOLE fast elevator for
+        # interactive shells (cmd/powershell/pwsh/powershell_ise -- console/UI apps
+        # the global WH_GETMESSAGE hook does not auto-inject, removed from IFEO so
+        # they are not born via gmproxy). It enqueues new Session>0 .exe PIDs; the
+        # loop below drains them into Monitor-ElevateProcess Phase 0 (in-place
+        # ReplaceProcessTokenForPid token swap). MUST live in THIS persistent
+        # monitor process (the scheduled task), not only in Enable-GodMode (a
+        # one-shot activator that exits) -- otherwise the watcher dies with the
+        # activator and shells are never event-elevated. PS7 uses
+        # Register-ObjectEvent internally (the += adapter was removed in PS7).
+        $null = Register-ProcessCreationWatcher
     }
 
     # --- One-time elevation of all existing user-session processes at startup ---

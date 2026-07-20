@@ -761,4 +761,29 @@ Add-Assertion "Opt2 D: Start-Monitoring `$CriticalProcs contains powershell_ise.
 Add-Assertion "Opt2 D: polling new-process scan passes -ProcessId `$proc.ProcessId (Phase 0 for shells)" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow')) "polling new-process scan does not pass -ProcessId -- shells would fall to kill+relaunch (loses session/cwd)"
 Add-Assertion "Opt2 D: WMI watcher drain still passes -ProcessId `$evt.ProcessId" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain no longer passes -ProcessId -- regression in the in-place elevation path"
 
+# --- 30. PS7 WMI process-creation watcher compat (+= -> Register-ObjectEvent) +
+# persistent-monitor registration (2026-07-20) ---
+# Two bugs broke interactive-shell (cmd/powershell/pwsh/ISE) auto-elevation on
+# PS 7.x: (1) Register-ProcessCreationWatcher used `$watcher.EventArrived += {}`
+# which PS7 rejects ("The property 'EventArrived' cannot be found on this object")
+# -- the watcher silently failed to register (log: "WMI process creation watcher
+# failed to register"); (2) it was called ONLY in Enable-GodMode (a one-shot
+# activator that exits), NOT in Start-Monitoring (the persistent scheduled-task
+# monitor), so even if it registered it died with the activator and the monitor's
+# event-driven shell elevator was dead. Fix: Register-ObjectEvent + -MessageData
+# (PS7-correct; the -Action runs in the event runscape where $script: does not
+# resolve) AND Register-ProcessCreationWatcher is now called from Start-Monitoring
+# so the watcher lives as long as the SYSTEM monitor. Shells are console/UI apps
+# the global WH_GETMESSAGE hook does not auto-inject and were removed from IFEO,
+# so this WMI watcher is their SOLE event-driven elevator (Phase 0 in-place
+# ReplaceProcessTokenForPid token swap). The 5s polling new-process scan remains
+# the fallback when the watcher is inactive.
+Add-Assertion "PS7 WMI: Register-ProcessCreationWatcher uses Register-ObjectEvent (not +=)" ($gm -match 'Register-ObjectEvent -InputObject \$script:ProcessCreationWatcher -EventName ''EventArrived''') "Register-ProcessCreationWatcher still uses the PS7-broken .EventArrived += adapter -- watcher silently fails to register on PS 7.x"
+Add-Assertion "PS7 WMI: NO .EventArrived += left (PS7-incompatible)" ($gm -notmatch '\.EventArrived\s*\+=') "Register-ProcessCreationWatcher still has .EventArrived += -- PS7 throws 'property EventArrived cannot be found' and the watcher never registers"
+Add-Assertion "PS7 WMI: queue passed via -MessageData (runscope-safe, not `$script:)" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?MessageData \$queue') "Register-ProcessCreationWatcher does not pass the queue via -MessageData -- the -Action block (event runscape) could not reach the queue reliably"
+Add-Assertion "PS7 WMI: action reads `$EventArgs.NewEvent.TargetInstance + `$Event.MessageData" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?\$EventArgs\.NewEvent\.TargetInstance' -and $gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?\$Event\.MessageData') "Register-ProcessCreationWatcher action does not use the automatic event vars -- the handler could not read the new process or reach the queue"
+Add-Assertion "PS7 WMI: defensive Add-Type System.Management (assembly load)" ($gm -match 'Add-Type -AssemblyName System\.Management') "Register-ProcessCreationWatcher missing the defensive Add-Type System.Management -- ManagementEventWatcher could be unresolved on a clean PS7 runspace"
+Add-Assertion "PS7 WMI: Start-Monitoring registers the watcher (persistent SYSTEM monitor)" ($gm -match 'function\s+Start-Monitoring[\s\S]{0,8000}?\$null = Register-ProcessCreationWatcher') "Start-Monitoring does NOT call Register-ProcessCreationWatcher -- the watcher was only registered in Enable-GodMode (one-shot, exits) so the persistent monitor's event-driven shell elevator is dead"
+Add-Assertion "PS7 WMI: Unregister-ProcessCreationWatcher tears down the event subscription + job" ($gm -match 'function\s+Unregister-ProcessCreationWatcher[\s\S]{0,2000}?Unregister-Event -SourceIdentifier ''GMProcessCreationWatcher''') "Unregister-ProcessCreationWatcher does not Unregister-Event the subscription -- re-registration / Disable-GodMode would leak the event job"
+
 Write-Summary

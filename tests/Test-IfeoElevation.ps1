@@ -223,11 +223,11 @@ if ($startMatch.Success) {
     Add-Assertion "Instant watcher: uses System.IO.FileSystemWatcher" ($startBody -match 'System\.IO\.FileSystemWatcher') "watcher is not FileSystemWatcher-based -- not event-driven/instant"
     Add-Assertion "Instant watcher: watches Program Files" ($startBody -match 'Program Files') "watcher does not watch Program Files"
     Add-Assertion "Instant watcher: enumerates per-user profiles (C:\\Users + AppData\\Local\\Programs)" ($startBody -match 'C:\\Users' -and $startBody -match 'AppData\\Local\\Programs') "watcher does not enumerate per-user Programs dirs"
-    Add-Assertion "Instant watcher: event-driven Created handler attached (+=)" ($startBody -match '\.Created\s*\+=') "watcher does not attach a Created event handler -- not event-driven"
-    Add-Assertion "Instant watcher: event-driven Renamed handler attached (catches .tmp->.exe installs)" ($startBody -match '\.Renamed\s*\+=') "watcher does not attach a Renamed event handler -- installs that rename .tmp->.exe would be missed"
+    Add-Assertion "Instant watcher: event-driven Created handler bound (Register-ObjectEvent, PS7)" ($startBody -match 'Register-ObjectEvent' -and $startBody -match "'Created'") "watcher does not bind a Created event handler via Register-ObjectEvent -- not event-driven (PS7 removed the += adapter)"
+    Add-Assertion "Instant watcher: event-driven Renamed handler bound (Register-ObjectEvent, PS7, catches .tmp->.exe installs)" ($startBody -match 'Register-ObjectEvent' -and $startBody -match "'Renamed'") "watcher does not bind a Renamed event handler via Register-ObjectEvent -- installs that rename .tmp->.exe would be missed (PS7 removed the += adapter)"
     Add-Assertion "Instant watcher: EnableRaisingEvents set" ($startBody -match 'EnableRaisingEvents\s*=\s*\$true') "watcher does not enable events"
     Add-Assertion "Instant watcher: buffer-overflow hardening (InternalBufferSize)" ($startBody -match 'InternalBufferSize') "watcher does not raise InternalBufferSize -- large installs could overflow the event buffer"
-    Add-Assertion "Instant watcher: Error event -> catch-up rescan sentinel" ($startBody -match '\.Error\s*\+=' -and $startBody -match '__GMIFEO_RESCAN__') "watcher does not handle buffer-overflow Error -> catch-up rescan sentinel missing"
+    Add-Assertion "Instant watcher: Error event -> catch-up rescan sentinel (Register-ObjectEvent, PS7)" ($startBody -match 'Register-ObjectEvent' -and $startBody -match "'Error'" -and $startBody -match '__GMIFEO_RESCAN__') "watcher does not handle buffer-overflow Error via Register-ObjectEvent -> catch-up rescan sentinel missing (PS7 removed the += adapter)"
     Add-Assertion "Instant watcher: synchronized event queue present (IfeoNewAppQueue)" ($gm -match 'IfeoNewAppQueue') "watcher missing the synchronized event queue -- events would be lost"
     Add-Assertion "Instant watcher: per-base-name debounce table (IfeoNewAppDebounce)" ($gm -match 'IfeoNewAppDebounce') "watcher missing the debounce table -- one install burst could spam Add"
     Add-Assertion "Instant watcher: idempotent start guard (no double-register)" ($startBody -match 'if\s+\(\$script:IfeoNewAppWatcherActive\)') "watcher missing the active-guard -- could register duplicate watchers on repeat start"
@@ -269,7 +269,7 @@ if ($goneMatch.Success) {
     Add-Assertion "Test-BaseNameGoneEverywhere: re-scans per-user Programs (C:\\Users + AppData\\Local\\Programs)" ($goneBody -match 'C:\\Users' -and $goneBody -match 'AppData\\Local\\Programs') "re-scan does not check per-user Programs dirs"
     Add-Assertion "Test-BaseNameGoneEverywhere: recursive base-name search (Get-ChildItem -Recurse)" ($goneBody -match 'Get-ChildItem.*-Recurse') "re-scan is not recursive -- would miss the .exe in a versioned subfolder"
 }
-Add-Assertion "Instant watcher: Deleted handler attached (catches uninstalls)" ($startBody -match '\.Deleted\s*\+=') "watcher does not attach a Deleted event handler -- uninstalled programs would leave stale IFEO keys"
+Add-Assertion "Instant watcher: Deleted handler bound (Register-ObjectEvent, PS7, catches uninstalls)" ($startBody -match 'Register-ObjectEvent' -and $startBody -match "'Deleted'") "watcher does not bind a Deleted event handler via Register-ObjectEvent -- uninstalled programs would leave stale IFEO keys (PS7 removed the += adapter)"
 Add-Assertion "Instant watcher: deferred prune queue present (IfeoPruneQueue)" ($gm -match 'IfeoPruneQueue') "deferred prune queue missing -- Deleted events would have nowhere to enqueue"
 Add-Assertion "Instant watcher: grace-period scheduling (AddSeconds in Deleted handler)" ($startBody -match 'AddSeconds') "Deleted handler does not schedule a grace period -- updater swaps could be pruned mid-swap"
 Add-Assertion "Instant watcher: Deleted handler enqueues prune entry (BaseName + DueTime)" ($startBody -match 'BaseName' -and $startBody -match 'DueTime') "Deleted handler does not enqueue a structured prune entry -- drain cannot tell what to prune or when"
@@ -285,12 +285,12 @@ Add-Assertion "Instant watcher: still NO polling after prune feature (no Start-S
 # (the app reappeared -> updater swap, NOT an uninstall) so a gmproxy IFEO key
 # is never removed mid-update. The drain's re-scan is the belt-and-suspenders.
 Add-Assertion "Instant watcher: grace period bumped to 5s (AddSeconds(5) in Deleted handler)" ($startBody -match 'AddSeconds\(5\)') "grace period is not 5s -- a slow updater's new .exe could land after the prune fires and a launch in the gap would not be born as SYSTEM"
-$createdHandlerMatch = [regex]::Match($startBody, '(?s)\$w\.Created\s*\+=\s*\{(.*?)\n\s+\}\s*\n\s+\$w\.Renamed')
+$createdHandlerMatch = [regex]::Match($startBody, '(?s)\$createdAction\s*=\s*\{(.*?)\n\s+\}\s*\n\s+\$renamedAction')
 $createdHandlerBody = if ($createdHandlerMatch.Success) { $createdHandlerMatch.Groups[1].Value } else { "" }
-Add-Assertion "Instant watcher: Created handler re-arms (cancels pending prune on update)" ($createdHandlerBody -match 'IfeoPruneQueue' -and $createdHandlerBody -match 'RemoveAt') "Created handler does not cancel a pending stale-prune for the same base name -- a gmproxy IFEO key could be removed mid-updater-swap"
-$renamedHandlerMatch = [regex]::Match($startBody, '(?s)\$w\.Renamed\s*\+=\s*\{(.*?)\n\s+\}\s*\n\s+\$w\.Error')
+Add-Assertion "Instant watcher: Created handler re-arms (cancels pending prune on update)" ($createdHandlerBody -match 'Prune' -and $createdHandlerBody -match 'RemoveAt') "Created handler does not cancel a pending stale-prune for the same base name -- a gmproxy IFEO key could be removed mid-updater-swap"
+$renamedHandlerMatch = [regex]::Match($startBody, '(?s)\$renamedAction\s*=\s*\{(.*?)\n\s+\}\s*\n\s+\$errorAction')
 $renamedHandlerBody = if ($renamedHandlerMatch.Success) { $renamedHandlerMatch.Groups[1].Value } else { "" }
-Add-Assertion "Instant watcher: Renamed handler re-arms (cancels pending prune on .tmp->.exe update)" ($renamedHandlerBody -match 'IfeoPruneQueue' -and $renamedHandlerBody -match 'RemoveAt') "Renamed handler does not cancel a pending stale-prune -- updaters that land via .tmp->.exe rename could lose the hook mid-swap"
+Add-Assertion "Instant watcher: Renamed handler re-arms (cancels pending prune on .tmp->.exe update)" ($renamedHandlerBody -match 'Prune' -and $renamedHandlerBody -match 'RemoveAt') "Renamed handler does not cancel a pending stale-prune -- updaters that land via .tmp->.exe rename could lose the hook mid-swap"
 
 
 # --- 12. Detector A: smart SYSTEM-incompatibility drop (AppX/packaged + registered browsers) ---
@@ -399,5 +399,21 @@ Add-Assertion "Opt2 collision: Test-SystemProcessExists has -InteractiveOnly swi
 Add-Assertion "Opt2 collision: Monitor-ElevateProcess defines `$interactiveShells (cmd/powershell/pwsh/powershell_ise)" ($gm.Contains('$interactiveShells = @("cmd","powershell","pwsh","powershell_ise")')) "Monitor-ElevateProcess missing `$interactiveShells -- interactive shells cannot be routed to the in-place Phase 0 path"
 Add-Assertion "Opt2 collision: Test-GmPlumbingShell function defined (God Mode plumbing guard)" ($gm.Contains('function Test-GmPlumbingShell {')) "Test-GmPlumbingShell missing -- God Mode plumbing shells cannot be detected/protected from a mid-flight token swap"
 Add-Assertion "Opt2 collision: Monitor-ElevateProcess non-shell purge uses -InteractiveOnly" ($gm.Contains('Test-SystemProcessExists -ProcessName "$procName.exe" -InteractiveOnly')) "Monitor-ElevateProcess non-shell purge does not use -InteractiveOnly -- a Session-0 SYSTEM instance could falsely trigger a desktop purge"
+
+# --- 12f. PS7 event-watcher compat: FileSystemWatcher += -> Register-ObjectEvent (2026-07-20) ---
+# PowerShell 7 removed the `$obj.Event += {}` PSEventReceived adapter (it throws
+# "The property '<Event>' cannot be found on this object"), which silently broke
+# Start-IfeoNewAppWatcher's four FileSystemWatcher handlers (Created/Renamed/
+# Error/Deleted) on PS 7.x -- no newly-installed program was ever auto-hooked.
+# Fix: each handler is bound via Register-ObjectEvent with the shared queues
+# passed in via -MessageData (the -Action block runs in the event-subscription
+# runscape where $script: scope does NOT reliably resolve), and the source
+# identifiers are tracked in $script:IfeoNewAppSubscriptions for clean teardown.
+Add-Assertion "PS7 watcher: Start-IfeoNewAppWatcher binds handlers via Register-ObjectEvent (not +=)" ($startBody -match 'Register-ObjectEvent -InputObject \$w') "Start-IfeoNewAppWatcher still uses the PS7-broken += adapter -- FileSystemWatcher handlers would silently fail to register"
+Add-Assertion "PS7 watcher: NO .Created/.Renamed/.Deleted/.Error += left in Start-IfeoNewAppWatcher" ($startBody -notmatch '\.(Created|Renamed|Deleted|Error)\s*\+=') "Start-IfeoNewAppWatcher still has a .Event += attachment -- PS7 throws 'property cannot be found' and the handler never registers"
+Add-Assertion "PS7 watcher: shared queues passed via -MessageData hashtable (runscope-safe)" ($startBody -match 'MessageData \$shared' -and $startBody -match 'Queue = \$script:IfeoNewAppQueue' -and $startBody -match 'Prune = \$script:IfeoPruneQueue') "Start-IfeoNewAppWatcher does not pass the queues via -MessageData -- the -Action block (event runscape) could not reach the queues reliably"
+Add-Assertion "PS7 watcher: actions reach the queue via `$Event.MessageData (not `$script:)" ($startBody -match '\$Event\.MessageData') "Start-IfeoNewAppWatcher actions still reference script scope -- unreliable in the event-subscription runscape"
+Add-Assertion "PS7 watcher: Register-ObjectEvent source ids tracked (IfeoNewAppSubscriptions)" ($startBody -match 'IfeoNewAppSubscriptions \+= \$sid' -and $gm -match '\$script:IfeoNewAppSubscriptions = @\(\)') "Start-IfeoNewAppWatcher does not track Register-ObjectEvent source ids -- Stop could not unregister the subscriptions"
+Add-Assertion "PS7 watcher: Stop-IfeoNewAppWatcher unregisters the FileSystemWatcher subscriptions" ($gm -match 'function\s+Stop-IfeoNewAppWatcher[\s\S]{0,2000}?Unregister-Event -SourceIdentifier \$sid') "Stop-IfeoNewAppWatcher does not Unregister-Event the FileSystemWatcher subscriptions -- event jobs would leak across enable/disable cycles"
 
 Write-Summary
