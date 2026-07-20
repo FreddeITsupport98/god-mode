@@ -359,9 +359,29 @@ if ($compatMatch.Success) {
     Add-Assertion "Notepad fix: direct WindowsApps filesystem scan (C:\Program Files\WindowsApps + AppXManifest.xml manifest regex)" ($compatBody.Contains('C:\Program Files\WindowsApps') -and $compatBody.Contains('AppXManifest.xml') -and $compatBody.Contains('Executable="')) "direct WindowsApps filesystem scan missing -- packages Get-AppxPackage misses (Store Notepad on an admin account) are not caught"
 }
 Add-Assertion "Suggestion 1: Invoke-GmAutoExcludeReconcile function defined (orphaned 'A' prune)" ($gm.Contains('function Invoke-GmAutoExcludeReconcile')) "Invoke-GmAutoExcludeReconcile missing -- orphaned 'A' entries linger after a Store-app uninstall"
-Add-Assertion "Suggestion 1: reconcile prunes only reason 'A' entries (\$rsn -ne 'A' keep C/G/P)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to 'A' entries -- could drop runtime C/G/P learnings"
+Add-Assertion "Suggestion 1: reconcile restricts pruning to install-time 'A' + 'P' entries (\$rsn -ne 'A' guard preserved, keep C/G)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to install-time 'A'/'P' entries -- could drop runtime C/G learnings"
 Add-Assertion "Suggestion 1: reconcile checks stub + alias existence before pruning" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists') -and $gm.Contains('aliasBases')) "reconcile does not verify the stub/alias is gone -- could prune a still-installed Store app"
 Add-Assertion "Suggestion 1: monitor calls reconcile on a 5-min cadence (\$lastReconcile + FromMinutes(5))" ($gm.Contains('$lastReconcile = [datetime]::MinValue') -and $gm.Contains('[TimeSpan]::FromMinutes(5)') -and $gm.Contains('Invoke-GmAutoExcludeReconcile')) "monitor does not call reconcile on a 5-min cadence -- orphaned 'A' entries never pruned"
 Add-Assertion "Suggestion 2: Export-GodModeLogs builds a single \$reasonLegend hashtable ([ordered]@{) driving both legends" ($gm.Contains('$reasonLegend = [ordered]@{') -and $gm.Contains('$reasonParts = foreach ($k in $reasonLegend.Keys)') -and $gm.Contains('$reasonParts2 = foreach ($k in $reasonLegend.Keys)')) "Export-GodModeLogs missing the single $reasonLegend hashtable driving both legends -- the store + per-app legends can drift"
+
+# --- 12d. Final 3 hardening suggestions: WinRT PE heuristic + reconcile 'P'
+# prune (2026-07-20) ---
+# S2: Test-GmPeImportsWinrt + AppX source (6) generalizes the curated Win11-stub
+# list -- a C:\Windows/System32 .exe that IMPORTS a WinRT activation API
+# (RoActivateInstance/WindowsCreateString) is classified AppX. Conservative-safe
+# (a WinRT importer cannot run as SYSTEM anyway). Curated list (5) preserved.
+# S3: reconcile also prunes stale 'P' browser entries (StartMenuInternet client
+# vanished), fail-open on an empty browser scan; never touches runtime C/G.
+# (S1 gmhook alias-stub skip is covered by Test-GmProxySession.ps1 section 28 +
+# test-gmproxy-session.sh -- this file does not load gmhook.c.)
+Add-Assertion "S2 PE heuristic: Test-GmPeImportsWinrt helper defined" ($gm.Contains('function Test-GmPeImportsWinrt')) "Test-GmPeImportsWinrt missing -- no dynamic WinRT-import PE heuristic to catch future Win11 stubs"
+Add-Assertion "S2 PE heuristic: checks RoActivateInstance + WindowsCreateString imports" ($gm.Contains('RoActivateInstance') -and $gm.Contains('WindowsCreateString')) "PE heuristic does not check both WinRT activation API import names"
+Add-Assertion "S2 PE heuristic: verifies MZ DOS magic + PE signature (0x4D/0x5A + 0x50/0x45 + eLfanew)" ($gm.Contains('0x4D') -and $gm.Contains('0x5A') -and $gm.Contains('0x50') -and $gm.Contains('0x45') -and $gm.Contains('eLfanew')) "PE heuristic does not verify the MZ+PE signatures -- a non-PE file could be misread as a stub"
+Add-Assertion "S2 PE heuristic: 1MB size cap bounds the byte read" ($gm.Contains('1MB')) "PE heuristic missing the 1MB size cap -- unbounded read at Enable-time"
+Add-Assertion "S2 PE heuristic: AppX source (6) scan ($stubDirs + Test-GmPeImportsWinrt in the compat body)" ($compatBody.Contains('$stubDirs') -and $compatBody.Contains('Test-GmPeImportsWinrt')) "AppX source (6) PE-heuristic scan missing -- future Win11 stubs not caught dynamically"
+Add-Assertion "S2 PE heuristic: curated list (5) preserved ($win11StubNames still in the compat body)" ($compatBody.Contains('$win11StubNames')) "curated list (5) removed -- additive rule violated"
+Add-Assertion "S3 reconcile: builds $browserBases (StartMenuInternet) for the 'P' prune" ($gm.Contains('$browserBases') -and $gm.Contains('StartMenuInternet')) "reconcile does not build $browserBases -- stale 'P' browser entries cannot be pruned"
+Add-Assertion "S3 reconcile: prunes stale 'P' browser entries (\$rsn -ne 'P' guard)" ($gm.Contains('$rsn -ne ''P''')) "reconcile does not prune stale 'P' browser entries -- a browser uninstalled after enable lingers up to 30 days"
+Add-Assertion "S3 reconcile: 'P' prune is fail-open on an empty browser scan (\$browserBases.Count -eq 0)" ($gm.Contains('$browserBases.Count -eq 0')) "reconcile 'P' prune not fail-open -- an empty browser scan (registry ACL denied) would prune ALL 'P' entries"
 
 Write-Summary

@@ -3919,11 +3919,15 @@ function Invoke-GmAutoExcludeReconcile {
     .SYNOPSIS
         Reconcile the Detector B auto-exclude store against the live system:
         drop orphaned install-time AppX/Store-redirector stub entries (reason
-        'A') whose stub + alias no longer exist (the Store app was uninstalled).
-        Called from Start-Monitoring on a 5-minute cadence so the store stays
-        tidy after a Store-app uninstall instead of carrying a stale excluded=1
-        entry for up to 30 days. Never touches runtime C/G/P entries (those are
-        governed by gmproxy.c's 30-day stale drop). Fail-open: any error -> skip.
+        'A') whose stub + alias no longer exist (the Store app was uninstalled),
+        AND stale install-time browser entries (reason 'P') whose registered
+        StartMenuInternet client vanished (the browser was uninstalled). Called
+        from Start-Monitoring on a 5-minute cadence so the store stays tidy
+        after a Store-app or browser uninstall instead of carrying a stale
+        excluded=1 entry for up to 30 days. Never touches runtime C/G entries
+        (those are governed by gmproxy.c's 30-day stale drop). Fail-open: any
+        error -> skip; if the browser scan yields no clients (registry ACL
+        denied), all 'P' entries are kept (cannot confirm the browser is gone).
         Cross-privilege mutex-safe (same Global\GmProxyAutoExcludeMutex as
         Add-GmAutoExcludeEntries + gmproxy.c) so it cannot race a concurrent
         gmproxy launch mid-write.
@@ -3960,6 +3964,37 @@ function Invoke-GmAutoExcludeReconcile {
                     }
                 }
             } catch {}
+            # Pre-build the registered-browser base-name set (StartMenuInternet
+            # clients) so a 'P' entry whose browser was uninstalled is pruned.
+            # Mirrors Get-GmSystemCompatExclusions' browser scan (registry-only,
+            # cheap). Fail-open: any error -> empty set; the prune loop below
+            # keeps all 'P' entries when $browserBases.Count -eq 0 (cannot
+            # confirm the browser is gone -- next Enable re-scans).
+            $browserBases = @{}
+            try {
+                $roots = @(
+                    "HKLM:\SOFTWARE\Clients\StartMenuInternet",
+                    "HKCU:\SOFTWARE\Clients\StartMenuInternet",
+                    "HKLM:\SOFTWARE\WOW6432Node\Clients\StartMenuInternet"
+                )
+                foreach ($root in $roots) {
+                    if (-not (Test-Path $root)) { continue }
+                    try {
+                        Get-ChildItem -Path $root -ErrorAction SilentlyContinue | ForEach-Object {
+                            try {
+                                $cmdKey = Join-Path $_.PSPath "shell\open\command"
+                                if (-not (Test-Path $cmdKey)) { return }
+                                $cmd = (Get-ItemProperty -Path $cmdKey -Name "(default)" -ErrorAction SilentlyContinue).'(default)'
+                                if (-not $cmd) { return }
+                                if ($cmd -match '"?([^"]+\.exe)') {
+                                    $b = [System.IO.Path]::GetFileName($matches[1])
+                                    if ($b) { $browserBases[$b.ToLower()] = $true }
+                                }
+                            } catch {}
+                        }
+                    } catch {}
+                }
+            } catch {}
             $kept = @()
             $dropped = 0
             foreach ($ln in $lines) {
@@ -3967,17 +4002,26 @@ function Invoke-GmAutoExcludeReconcile {
                 $p = $ln -split '\|'
                 if ($p.Count -lt 4) { $kept += $ln; continue }
                 $rsn = if ($p.Count -ge 5 -and $p[4]) { $p[4] } else { '?' }
-                # Only prune install-time AppX/Store-stub drops (reason 'A').
-                # Runtime C/G/P entries are governed by gmproxy.c's 30-day stale
-                # drop -- never prune them here.
-                if ($rsn -ne 'A') { $kept += $ln; continue }
+                # Only prune install-time drops ('A' AppX/Store-stub + 'P'
+                # browser). Runtime C/G entries are governed by gmproxy.c's
+                # 30-day stale drop -- never prune them here.
+                if ($rsn -ne 'A' -and $rsn -ne 'P') { $kept += $ln; continue }
                 $base = $p[0]
-                $stubExists = (Test-Path ("C:\Windows\" + $base)) -or (Test-Path ("C:\Windows\System32\" + $base))
-                $aliasExists = $aliasBases.ContainsKey($base.ToLower())
-                if ($stubExists -or $aliasExists) {
-                    $kept += $ln
+                if ($rsn -eq 'A') {
+                    # 'A' AppX/Store-stub: prune only if the stub AND every
+                    # alias are gone (the Store app was uninstalled).
+                    $stubExists = (Test-Path ("C:\Windows\" + $base)) -or (Test-Path ("C:\Windows\System32\" + $base))
+                    $aliasExists = $aliasBases.ContainsKey($base.ToLower())
+                    if ($stubExists -or $aliasExists) { $kept += $ln } else { $dropped++ }
                 } else {
-                    $dropped++
+                    # 'P' browser: prune only if the registered StartMenuInternet
+                    # client vanished (browser uninstalled). Fail-open: if the
+                    # browser scan yielded NO clients (registry ACL denied / no
+                    # browsers detected), keep all 'P' entries (cannot confirm
+                    # the browser is gone -- next Enable re-scans).
+                    if ($browserBases.Count -eq 0) { $kept += $ln }
+                    elseif ($browserBases.ContainsKey($base.ToLower())) { $kept += $ln }
+                    else { $dropped++ }
                 }
             }
             if ($dropped -gt 0) {
@@ -3992,7 +4036,7 @@ function Invoke-GmAutoExcludeReconcile {
                 # consult re-reads the pruned store immediately.
                 $script:GmAutoExcludeCache = $null
                 $script:GmAutoExcludeCacheDt = $null
-                Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "INFO" -Message "Pruned $dropped orphaned 'A' AppX entries (Store app uninstalled)"
+                Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "INFO" -Message "Pruned $dropped orphaned 'A' AppX + 'P' browser entries (Store app / browser uninstalled)"
             }
         } finally {
             if ($owned -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
@@ -4865,6 +4909,45 @@ function Uninstall-ProcessHook {
     Write-DebugLog -FunctionName "Uninstall-ProcessHook" -Action "EXIT" -Message "Complete"
 }
 
+function Test-GmPeImportsWinrt {
+    <#
+    .SYNOPSIS
+        Heuristic: does the PE at $Path IMPORT a WinRT activation API
+        (RoActivateInstance / WindowsCreateString)? Used by Get-GmSystemCompatExclusions
+        AppX source (6) to classify a C:\Windows / System32 .exe as a Store-redirector
+        stub -- generalizes the curated Win11-stub name list (source 5) so FUTURE
+        Win11 stubs Microsoft ships are caught without maintaining a name list.
+    .DESCRIPTION
+        Reads the file bytes, verifies the MZ DOS magic + the PE signature at
+        e_lfanew, then ASCII-byte-searches for the WinRT activation API import
+        names. PE import-by-name entries store the function name as ASCII, so a
+        byte search finds them if the .exe imports the function. Conservative-
+        safe: any .exe importing RoActivateInstance needs WinRT activation (which
+        needs user identity) -> it CANNOT run as SYSTEM, so classifying it as AppX
+        (drop from IFEO + persist 'A') is correct EVEN for a non-stub -- a "false
+        positive" here is still the right call (the app would break under
+        gmproxy->SYSTEM anyway). Bounded to a 1MB size cap (stubs are small; bounds
+        the byte read at Enable-time). Fail-open: any read/parse error -> $false.
+    #>
+    param([string]$Path)
+    try {
+        if (-not $Path) { return $false }
+        $fi = Get-Item -LiteralPath $Path -ErrorAction SilentlyContinue
+        if (-not $fi) { return $false }
+        if ($fi.Length -gt 1MB) { return $false }  # stubs are small; bound the read
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        if ($bytes.Length -lt 0x80) { return $false }
+        if ($bytes[0] -ne 0x4D -or $bytes[1] -ne 0x5A) { return $false }  # 'MZ' DOS magic
+        $eLfanew = [BitConverter]::ToInt32($bytes, 0x3C)
+        if ($eLfanew -le 0 -or ($eLfanew + 4) -gt $bytes.Length) { return $false }
+        if ($bytes[$eLfanew] -ne 0x50 -or $bytes[$eLfanew + 1] -ne 0x45 -or $bytes[$eLfanew + 2] -ne 0 -or $bytes[$eLfanew + 3] -ne 0) { return $false }  # 'PE\0\0'
+        # Import-by-name entries store the function name as ASCII; a byte search
+        # for the WinRT activation API names finds them if imported.
+        $ascii = [System.Text.Encoding]::ASCII.GetString($bytes)
+        return ($ascii -match 'RoActivateInstance') -or ($ascii -match 'WindowsCreateString')
+    } catch { return $false }
+}
+
 function Get-GmSystemCompatExclusions {
     <#
     .SYNOPSIS
@@ -5022,6 +5105,39 @@ function Get-GmSystemCompatExclusions {
             $appx[$k] = $true
         }
     }
+
+    # --- AppX (6): dynamic C:\Windows stub-PE heuristic (generalizes the
+    #     curated list (5) -- catches FUTURE Win11 stubs Microsoft ships without
+    #     maintaining a name list). Scan the top-level *.exe in C:\Windows +
+    #     C:\Windows\System32 (no recursion -- stubs live at the root), skip
+    #     names already classified + files larger than 1MB (stubs are small;
+    #     bounds the byte read), and call Test-GmPeImportsWinrt to classify any
+    #     that IMPORT a WinRT activation API (RoActivateInstance /
+    #     WindowsCreateString). A Store-redirector stub activates the Store app
+    #     via RoActivateInstance, so its PE references that function.
+    #     Conservative-safe: any .exe importing RoActivateInstance needs WinRT
+    #     activation (user identity) -> it CANNOT run as SYSTEM, so classifying
+    #     it as AppX (drop from IFEO + persist 'A') is correct EVEN for a
+    #     non-stub -- a "false positive" here is still the right call (the app
+    #     would break under gmproxy->SYSTEM anyway). Fail-open: any read/parse
+    #     error skips that file. Only adds names not already in $appx. The
+    #     curated list (5) STAYS as the last-resort safety net (additive).
+    try {
+        $stubDirs = @("C:\Windows", "C:\Windows\System32")
+        foreach ($sd in $stubDirs) {
+            if (-not (Test-Path $sd)) { continue }
+            Get-ChildItem -Path $sd -Filter "*.exe" -File -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    if ($_.Length -gt 1MB) { return }
+                    $k = $_.Name.ToLower()
+                    if ($appx.ContainsKey($k)) { return }
+                    if (Test-GmPeImportsWinrt -Path $_.FullName) {
+                        $appx[$k] = $true
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
 
     # --- Browsers: registered StartMenuInternet client executables ---
     try {
@@ -6640,9 +6756,11 @@ function Start-Monitoring {
             # --- Auto-exclude store reconciliation (every 5 minutes): drop
             #     orphaned install-time AppX/Store-stub entries (reason 'A')
             #     whose stub + alias no longer exist (the Store app was
-            #     uninstalled), so the store stays tidy instead of carrying a
-            #     stale excluded=1 entry for up to 30 days. Never touches
-            #     runtime C/G/P entries (those are governed by gmproxy.c's
+            #     uninstalled) AND stale install-time browser entries (reason
+            #     'P') whose registered StartMenuInternet client vanished (the
+            #     browser was uninstalled), so the store stays tidy instead of
+            #     carrying a stale excluded=1 entry for up to 30 days. Never
+            #     touches runtime C/G entries (those are governed by gmproxy.c's
             #     30-day stale drop). Fail-open. ---
             if ((Get-Date) - $lastReconcile -gt [TimeSpan]::FromMinutes(5)) {
                 $lastReconcile = Get-Date

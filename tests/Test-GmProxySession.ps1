@@ -674,15 +674,49 @@ Add-Assertion "Suggestion 3: gmproxy impersonation uses ImpersonateLoggedOnUser 
 Add-Assertion "Suggestion 3: gmproxy same-dir copy gated on haveToken + hPrimary (fail-open)" ($proxy.Contains('!usedHardlink && haveToken && hPrimary')) "gmproxy same-dir copy not gated on haveToken/hPrimary -- would attempt impersonation without a token"
 Add-Assertion "Suggestion 3: gmproxy Temp copy remains the final fallback (GetTempPathW + gmproxy_%lu_%ls)" ($proxy.Contains('GetTempPathW') -and $proxy.Contains('gmproxy_%lu_%ls')) "gmproxy Temp fallback removed -- a same-dir copy failure would abort the launch"
 Add-Assertion "Suggestion 1: Invoke-GmAutoExcludeReconcile function defined" ($gm.Contains('function Invoke-GmAutoExcludeReconcile')) "Invoke-GmAutoExcludeReconcile missing -- orphaned 'A' entries linger after a Store-app uninstall"
-Add-Assertion "Suggestion 1: reconcile prunes only reason 'A' entries ($rsn -ne 'A' keep)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to 'A' entries -- could drop runtime C/G/P learnings"
+Add-Assertion "Suggestion 1: reconcile restricts pruning to install-time 'A' + 'P' entries ($rsn -ne 'A' guard preserved, keep C/G)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to install-time 'A'/'P' entries -- could drop runtime C/G learnings"
 Add-Assertion "Suggestion 1: reconcile checks stub + alias existence before pruning (stubExists + aliasExists + aliasBases)" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists') -and $gm.Contains('aliasBases')) "reconcile does not verify the stub/alias is gone -- could prune a still-installed Store app"
 Add-Assertion "Suggestion 1: reconcile is mutex-safe (Global\GmProxyAutoExcludeMutex)" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,3000}?GmProxyAutoExcludeMutex') "reconcile does not hold the cross-privilege mutex -- could race a concurrent gmproxy write"
 Add-Assertion "Suggestion 1: reconcile atomic write (temp + Move-Item -Force to GodModeAutoExcludeFile)" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,7000}?Move-Item\s+-Path\s+\$tmp\s+-Destination\s+\$GodModeAutoExcludeFile\s+-Force') "reconcile missing atomic temp+rename -- a mid-write crash could corrupt the store"
-Add-Assertion "Suggestion 1: reconcile invalidates the Test-GmAutoExcluded cache after a prune" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,7000}?GmAutoExcludeCache\s*=\s*\$null') "reconcile does not invalidate the cache -- a consult right after a prune could see stale entries"
+Add-Assertion "Suggestion 1: reconcile invalidates the Test-GmAutoExcluded cache after a prune" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,9000}?GmAutoExcludeCache\s*=\s*\$null') "reconcile does not invalidate the cache -- a consult right after a prune could see stale entries"
 Add-Assertion "Suggestion 1: monitor calls reconcile on a 5-min cadence ($lastReconcile + FromMinutes(5))" ($gm.Contains('$lastReconcile = [datetime]::MinValue') -and $gm.Contains('[TimeSpan]::FromMinutes(5)') -and $gm.Contains('Invoke-GmAutoExcludeReconcile')) "monitor does not call reconcile on a 5-min cadence -- orphaned 'A' entries never pruned"
 Add-Assertion "Suggestion 2: Export-GodModeLogs builds a single $reasonLegend hashtable ([ordered])" ($gm.Contains('$reasonLegend = [ordered]@{')) "Export-GodModeLogs missing the single $reasonLegend hashtable -- legends can drift"
 Add-Assertion "Suggestion 2: store legend emitted from $reasonLegend ($reasonParts -join)" ($gm.Contains('$reasonParts = foreach ($k in $reasonLegend.Keys)') -and $gm.Contains('($reasonParts -join '', '')')) "store legend not emitted from $reasonLegend -- drift risk"
 Add-Assertion "Suggestion 2: per-app REASON legend emitted from the same $reasonLegend ($reasonParts2)" ($gm.Contains('$reasonParts2 = foreach ($k in $reasonLegend.Keys)')) "per-app REASON legend not emitted from $reasonLegend -- the two legends can drift"
 Add-Assertion "Belt-and-suspenders: gmproxy GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" ($proxy.Contains("if (entries[idx].reason != L'A')")) "gmproxy record overwrites an install-time 'A' with a runtime G/C -- a stub that slips past Detector A loses its AppX classification"
+
+# --- 28. Final 3 hardening suggestions: gmhook alias-stub skip + WinRT PE
+# heuristic + reconcile 'P' prune (2026-07-20) ---
+# Three additive improvements (all backward-compatible + fail-open):
+#   S1 gmhook.c: GmHookIsAppExecutionAliasStub (mirrors gmproxy.c) -- a direct
+#     reparse-point skip in HookCreateProcessW for a Win11 App Execution Alias
+#     stub whose auto-exclude store entry was pruned by reconcile or never
+#     written (Detector A miss). Belt-and-suspenders alongside the store consult.
+#   S2 God-Mode-Windows.ps1: Test-GmPeImportsWinrt + AppX source (6) -- a dynamic
+#     C:\Windows/System32 stub-PE heuristic that classifies any .exe IMPORTING a
+#     WinRT activation API (RoActivateInstance/WindowsCreateString) as AppX,
+#     generalizing the curated name list (5) to catch FUTURE Win11 stubs.
+#     Conservative-safe (a WinRT importer cannot run as SYSTEM anyway). Curated
+#     list (5) preserved (additive -- never removed).
+#   S3 Invoke-GmAutoExcludeReconcile: also prunes stale 'P' browser entries
+#     whose registered StartMenuInternet client vanished (browser uninstalled),
+#     fail-open on an empty browser scan; never touches runtime C/G.
+Add-Assertion "S1 gmhook: GmHookIsAppExecutionAliasStub helper defined (mirrors gmproxy.c)" ($gmhook.Contains('GmHookIsAppExecutionAliasStub')) "gmhook GmHookIsAppExecutionAliasStub missing -- a stub whose store entry was pruned/never-written would still be born as SYSTEM"
+Add-Assertion "S1 gmhook: alias check uses the WindowsApps reparse point (Microsoft\WindowsApps + FILE_ATTRIBUTE_REPARSE_POINT)" ($gmhook.Contains('Microsoft\WindowsApps') -and $gmhook.Contains('FILE_ATTRIBUTE_REPARSE_POINT')) "gmhook alias check does not use the WindowsApps reparse point"
+Add-Assertion "S1 gmhook: HookCreateProcessW consults GmHookIsAppExecutionAliasStub(baseName) before SYSTEM birth" ($gmhook.Contains('GmHookIsAppExecutionAliasStub(baseName)')) "gmhook HookCreateProcessW does not consult the alias-stub check -- the belt-and-suspenders skip is not wired"
+Add-Assertion "S1 gmhook: alias-stub consult falls through to the real CreateProcessW (pOrigCreateProcessW)" ($gmhook -match 'GmHookIsAppExecutionAliasStub\(baseName\)[\s\S]{0,400}?pOrigCreateProcessW') "gmhook alias-stub consult does not fall through to the real CreateProcessW -- a stub would be born as SYSTEM instead of native launch"
+Add-Assertion "S1 gmhook: alias check reads LOCALAPPDATA (GetEnvironmentVariableW)" ($gmhook.Contains('GetEnvironmentVariableW(L"LOCALAPPDATA"')) "gmhook alias check does not read LOCALAPPDATA -- cannot build the WindowsApps alias path"
+Add-Assertion "S2 PE heuristic: Test-GmPeImportsWinrt helper defined" ($gm.Contains('function Test-GmPeImportsWinrt')) "Test-GmPeImportsWinrt missing -- no dynamic WinRT-import PE heuristic to catch future Win11 stubs"
+Add-Assertion "S2 PE heuristic: checks RoActivateInstance + WindowsCreateString imports" ($gm.Contains('RoActivateInstance') -and $gm.Contains('WindowsCreateString')) "PE heuristic does not check both WinRT activation API import names"
+Add-Assertion "S2 PE heuristic: verifies the MZ DOS magic (0x4D / 0x5A)" ($gm.Contains('0x4D') -and $gm.Contains('0x5A')) "PE heuristic does not verify the MZ DOS magic -- a non-PE file could be misread as a stub"
+Add-Assertion "S2 PE heuristic: verifies the PE signature at e_lfanew (0x50 / 0x45 + eLfanew)" ($gm.Contains('0x50') -and $gm.Contains('0x45') -and $gm.Contains('eLfanew')) "PE heuristic does not verify the PE signature at e_lfanew -- a non-PE file could be misread"
+Add-Assertion "S2 PE heuristic: 1MB size cap bounds the byte read (stubs are small)" ($gm.Contains('1MB')) "PE heuristic missing the 1MB size cap -- the byte read is unbounded at Enable-time"
+Add-Assertion "S2 PE heuristic: AppX source (6) scans C:\Windows/System32 + calls Test-GmPeImportsWinrt ($stubDirs)" ($compatBody.Contains('$stubDirs') -and $compatBody.Contains('Test-GmPeImportsWinrt')) "AppX source (6) PE-heuristic scan missing -- future Win11 stubs won't be caught dynamically"
+Add-Assertion "S2 PE heuristic: source (6) size-filters files >1MB before the byte read ($_.Length -gt 1MB)" ($compatBody.Contains('$_.Length -gt 1MB')) "source (6) does not size-filter before the byte read -- large System32 exes would be read needlessly"
+Add-Assertion "S2 PE heuristic: curated list (5) preserved ($win11StubNames still present in the body)" ($compatBody.Contains('$win11StubNames')) "curated list (5) was removed -- the last-resort safety net regressed (additive rule violated)"
+Add-Assertion "S3 reconcile: builds $browserBases (StartMenuInternet scan) alongside $aliasBases" ($gm.Contains('$browserBases') -and $gm.Contains('StartMenuInternet')) "reconcile does not build $browserBases -- stale 'P' browser entries cannot be pruned"
+Add-Assertion "S3 reconcile: prunes stale 'P' browser entries ($rsn -ne 'P' guard)" ($gm.Contains('$rsn -ne ''P''')) "reconcile does not prune stale 'P' browser entries -- a browser uninstalled after enable lingers up to 30 days"
+Add-Assertion "S3 reconcile: 'P' prune is fail-open on an empty browser scan ($browserBases.Count -eq 0)" ($gm.Contains('$browserBases.Count -eq 0')) "reconcile 'P' prune is not fail-open -- an empty browser scan (registry ACL denied) would prune ALL 'P' entries"
+Add-Assertion "S3 reconcile: keeps the 'A' stub+alias existence check (stubExists + aliasExists)" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists')) "reconcile lost the 'A' stub+alias existence check -- could prune a still-installed Store app"
 
 Write-Summary

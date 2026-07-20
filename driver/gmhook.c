@@ -528,6 +528,40 @@ static BOOL GmHookIsAutoExcluded(const wchar_t* baseName) {
     return FALSE;  /* fail-open: not found -> not excluded */
 }
 
+/* TRUE if baseName has an App Execution Alias reparse point at
+   %LOCALAPPDATA%\Microsoft\WindowsApps\<base> -- i.e. it is a Win11
+   Store-redirector stub (notepad, mspaint, calc, photos, ...). Mirrors
+   gmproxy.c's GmProxyIsAppExecutionAliasStub: a stub cannot run as SYSTEM
+   (AppX package activation needs user identity) AND birthing it as SYSTEM
+   here would break its Store redirect, so HookCreateProcessW falls through
+   to the real CreateProcessW (native user launch) for a stub. This is the
+   belt-and-suspenders for a stub whose auto-exclude store entry was pruned
+   by Invoke-GmAutoExcludeReconcile between the 2s cache TTL + mtime
+   invalidation (Store app uninstalled then reinstalled), or whose store
+   entry was never written (Detector A missed it) -- the install-time
+   Detector A drop + the GmHookIsAutoExcluded store consult above are the
+   primary gates; this direct reparse-point check is the no-hardcode,
+   always-fresh safety net. Fail-open: any error / missing alias file ->
+   FALSE (normal SYSTEM-birth behavior). LOCALAPPDATA is the host
+   process's; a SYSTEM-elevated host gets systemprofile's LOCALAPPDATA (no
+   user aliases) -> FALSE -> normal SYSTEM birth, which is correct (the
+   user-session stub case is covered by Detector A + the IFEO layer; a
+   SYSTEM host birthing a child uses the token path). */
+static BOOL GmHookIsAppExecutionAliasStub(const wchar_t* baseName) {
+    if (!baseName || !baseName[0]) return FALSE;
+    wchar_t localAppData[MAX_PATH] = {0};
+    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return FALSE;  /* fail-open */
+    wchar_t path[MAX_PATH] = {0};
+    /* %ls: wide (MinGW %s truncates wchar_t). Build
+       %LOCALAPPDATA%\Microsoft\WindowsApps\<base>. */
+    int n = swprintf(path, MAX_PATH, L"%ls\\Microsoft\\WindowsApps\\%ls", localAppData, baseName);
+    if (n <= 0 || (size_t)n >= MAX_PATH) return FALSE;
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return FALSE;  /* no alias file -> not a stub */
+    return (fa.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? TRUE : FALSE;
+}
+
 static BOOL WINAPI HookCreateProcessW(
     LPCWSTR lpApplicationName,
     LPWSTR lpCommandLine,
@@ -643,6 +677,30 @@ static BOOL WINAPI HookCreateProcessW(
        missing/corrupt/ACL-denied store -> GmHookIsAutoExcluded returns FALSE
        -> normal SYSTEM-birth behavior (never blocks elevation). */
     if (baseName && GmHookIsAutoExcluded(baseName)) {
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        InterlockedExchange(&inHook, 0);
+        return result;
+    }
+
+    /* Belt-and-suspenders alias-stub skip (mirrors gmproxy.c's
+       GmProxyIsAppExecutionAliasStub): a Win11 App Execution Alias stub
+       (notepad/mspaint/calc/...) at %LOCALAPPDATA%\Microsoft\WindowsApps\<base>
+       (a reparse point) is a Store-redirector that cannot run as SYSTEM (AppX
+       activation needs user identity) AND a stolen-token birth would break
+       its Store redirect. The Detector A install-time drop + the
+       GmHookIsAutoExcluded store consult above already make gmhook skip
+       these, but a stub whose store entry was pruned by
+       Invoke-GmAutoExcludeReconcile (Store app uninstalled then reinstalled)
+       between the 2s cache TTL + mtime invalidation, or whose store entry
+       has not been written yet (Detector A missed it), would otherwise be
+       born as SYSTEM here. This direct reparse-point check is the no-hardcode,
+       always-fresh safety net. Fail-open: any error / missing alias -> FALSE
+       -> normal SYSTEM-birth behavior. */
+    if (baseName && GmHookIsAppExecutionAliasStub(baseName)) {
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,

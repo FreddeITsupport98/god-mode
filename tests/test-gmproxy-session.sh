@@ -240,6 +240,13 @@ if [ -f "$GMHOOK_SRC" ]; then
     grep -qF 'cacheLoadTokenSid' "$GMHOOK_SRC" && record "src: gmhook captures the host token SID (cacheLoadTokenSid) for token-change invalidation" 1 || record "src: gmhook captures the host token SID (cacheLoadTokenSid)" 0 "not found -- a host-token change cannot trigger a reload"
     grep -qF 'tokenChanged' "$GMHOOK_SRC" && record "src: gmhook reloads on a host-token change (tokenChanged)" 1 || record "src: gmhook reloads on a host-token change (tokenChanged)" 0 "not found -- the 'always fresh' guarantee is incomplete"
     grep -qF 'EqualSid' "$GMHOOK_SRC" && record "src: gmhook token SID compare uses EqualSid (fail-open)" 1 || record "src: gmhook token SID compare uses EqualSid" 0 "not found"
+    # gmhook alias-stub skip (2026-07-20, S1): a direct reparse-point check
+    # (mirrors gmproxy.c GmProxyIsAppExecutionAliasStub) in HookCreateProcessW
+    # -- belt-and-suspenders for a stub whose store entry was pruned by
+    # reconcile or never written (Detector A miss). Fail-open.
+    grep -qF 'GmHookIsAppExecutionAliasStub' "$GMHOOK_SRC" && record "src: gmhook GmHookIsAppExecutionAliasStub helper present (alias-stub skip)" 1 || record "src: gmhook GmHookIsAppExecutionAliasStub helper present (alias-stub skip)" 0 "not found -- a stub whose store entry was pruned/never-written would still be born as SYSTEM"
+    grep -qF 'GmHookIsAppExecutionAliasStub(baseName)' "$GMHOOK_SRC" && record "src: gmhook HookCreateProcessW consults GmHookIsAppExecutionAliasStub(baseName)" 1 || record "src: gmhook HookCreateProcessW consults GmHookIsAppExecutionAliasStub(baseName)" 0 "not found -- the belt-and-suspenders alias-stub skip is not wired"
+    grep -qF 'Microsoft\\WindowsApps' "$GMHOOK_SRC" && record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 1 || record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 0 "not found -- the alias-stub check does not look at the WindowsApps reparse point"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"
 fi
