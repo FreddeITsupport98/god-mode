@@ -246,6 +246,11 @@ if [ -f "$GMHOOK_SRC" ]; then
     # reconcile or never written (Detector A miss). Fail-open.
     grep -qF 'GmHookIsAppExecutionAliasStub' "$GMHOOK_SRC" && record "src: gmhook GmHookIsAppExecutionAliasStub helper present (alias-stub skip)" 1 || record "src: gmhook GmHookIsAppExecutionAliasStub helper present (alias-stub skip)" 0 "not found -- a stub whose store entry was pruned/never-written would still be born as SYSTEM"
     grep -qF 'GmHookIsAppExecutionAliasStub(baseName)' "$GMHOOK_SRC" && record "src: gmhook HookCreateProcessW consults GmHookIsAppExecutionAliasStub(baseName)" 1 || record "src: gmhook HookCreateProcessW consults GmHookIsAppExecutionAliasStub(baseName)" 0 "not found -- the belt-and-suspenders alias-stub skip is not wired"
+    # gmhook ISE hardening (2026-07-20): powershell_ise.exe is a shell host that
+    # launches commands via CreateProcessW -- IAT-hooking it in-process faults
+    # with the same 0xC0000005 as powershell/pwsh/cmd. IsShellLauncherProcess now
+    # excludes it (never IAT-hooked); the monitor auto-elevates ISE in place.
+    grep -qF 'L"powershell_ise.exe"' "$GMHOOK_SRC" && record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 1 || record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 0 "not found -- ISE would be IAT-hooked (0xC0000005 crash risk)"
     grep -qF 'Microsoft\\WindowsApps' "$GMHOOK_SRC" && record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 1 || record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 0 "not found -- the alias-stub check does not look at the WindowsApps reparse point"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"

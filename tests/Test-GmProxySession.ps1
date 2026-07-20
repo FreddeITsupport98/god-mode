@@ -719,4 +719,46 @@ Add-Assertion "S3 reconcile: prunes stale 'P' browser entries ($rsn -ne 'P' guar
 Add-Assertion "S3 reconcile: 'P' prune is fail-open on an empty browser scan ($browserBases.Count -eq 0)" ($gm.Contains('$browserBases.Count -eq 0')) "reconcile 'P' prune is not fail-open -- an empty browser scan (registry ACL denied) would prune ALL 'P' entries"
 Add-Assertion "S3 reconcile: keeps the 'A' stub+alias existence check (stubExists + aliasExists)" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists')) "reconcile lost the 'A' stub+alias existence check -- could prune a still-installed Store app"
 
+# --- 29. Interactive-shell auto-elevation (option #2) + ISE hardening +
+# self-collision guard (2026-07-20) ---
+# Four additive improvements (all backward-compatible + fail-open):
+#   A. Test-SystemProcessExists gains -InteractiveOnly (only count a SYSTEM
+#      instance in Session>0) -- stops the monitor's OWN headless Session-0
+#      SYSTEM powershell.exe from falsely satisfying "a SYSTEM instance exists"
+#      for an interactive-shell name (which would make Stop-NonSystemInstances
+#      kill the user's admin shell instead of in-place-elevating it). Mirrors
+#      Find-SystemProcessCandidate Session>0 + gmhook FindSystemPid.
+#   B. Monitor-ElevateProcess: interactive shells (cmd/powershell/pwsh/ISE) SKIP
+#      the aggressive "SYSTEM instance exists -> purge non-SYSTEM" branch and go
+#      straight to Phase 0 in-place ReplaceProcessTokenForPid -- no kill, no
+#      flicker, every instance gets its own SYSTEM token (whoami -> SYSTEM).
+#   C. Test-GmPlumbingShell guard: God Mode's OWN plumbing shells (cmdline
+#      carries -ToggleOn/-ElevateAllProcesses/-SystemDesktop/GodMode.ps1) are
+#      left untouched so a mid-flight token swap never disturbs the
+#      monitor/watchdog/guardian/SystemDesktop work. Fail-open.
+#   D. ISE hardening: powershell_ise added to IsShellLauncherProcess (gmhook) +
+#      $GmCriticalIfeoExclude + $SkipNames + $CriticalProcs (both) + the
+#      interactive-shells set. Polling new-process scan now passes -ProcessId
+#      (mirrors the WMI watcher) so Phase 0 works from both paths.
+Add-Assertion "Opt2 A: Test-SystemProcessExists has -InteractiveOnly switch (session-aware)" ($gm.Contains('param([string]$ProcessName, [switch]$InteractiveOnly)')) "Test-SystemProcessExists missing the -InteractiveOnly switch -- cannot session-filter the SYSTEM-instance check"
+Add-Assertion "Opt2 A: Test-SystemProcessExists -InteractiveOnly skips Session 0 (`$p.SessionId -le 0 continue)" ($gm.Contains('if ($InteractiveOnly -and $p.SessionId -le 0) { continue }')) "Test-SystemProcessExists does not skip Session 0 under -InteractiveOnly -- the monitor's own Session-0 SYSTEM powershell would still falsely satisfy the check"
+Add-Assertion "Opt2 B: Monitor-ElevateProcess defines `$interactiveShells (cmd/powershell/pwsh/powershell_ise)" ($gm.Contains('$interactiveShells = @("cmd","powershell","pwsh","powershell_ise")')) "Monitor-ElevateProcess missing the `$interactiveShells set -- interactive shells cannot be routed to the in-place Phase 0 path"
+Add-Assertion "Opt2 B: Monitor-ElevateProcess consults Test-GmPlumbingShell for interactive shells" ($gm.Contains('if ($isInteractiveShell) {') -and $gm.Contains('Test-GmPlumbingShell -ProcessId $ProcessId')) "Monitor-ElevateProcess does not consult Test-GmPlumbingShell for interactive shells -- God Mode plumbing shells could be token-swapped mid-flight"
+Add-Assertion "Opt2 B: Monitor-ElevateProcess non-shell purge uses -InteractiveOnly" ($gm.Contains('Test-SystemProcessExists -ProcessName "$procName.exe" -InteractiveOnly')) "Monitor-ElevateProcess non-shell purge does not use -InteractiveOnly -- a Session-0 SYSTEM instance could falsely trigger a desktop purge"
+Add-Assertion "Opt2 B: interactive shells skip the purge branch (fall through to Phase 0)" ($gm.Contains('Fall through to Phase 0 in-place token replacement (skip the purge branch)')) "interactive shells do not skip the purge branch -- the monitor would kill the user's admin shell"
+Add-Assertion "Opt2 B: Phase 0 in-place swap still present (ReplaceProcessTokenForPid)" ($gm.Contains('[TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)')) "Phase 0 in-place token replacement removed -- shells would fall to kill+relaunch"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell function defined (God Mode plumbing guard)" ($gm.Contains('function Test-GmPlumbingShell {')) "Test-GmPlumbingShell missing -- God Mode plumbing shells cannot be detected/protected"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell checks the ElevateAll temp copy (GodMode_ElevateAll)" ($gm.Contains("'GodMode_ElevateAll'")) "Test-GmPlumbingShell does not check for GodMode_ElevateAll -- the ElevateAll task shell would be swapped mid-flight"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell checks the SystemDesktop temp copy (GodMode_SystemDesktop)" ($gm.Contains("'GodMode_SystemDesktop'")) "Test-GmPlumbingShell does not check for GodMode_SystemDesktop"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell checks GodMode CLI flags (-ToggleOn/-ToggleOff/-ElevateAllProcesses/-SystemDesktop)" ($gm.Contains("'-ToggleOn','-ToggleOff','-ElevateAllProcesses','-SystemDesktop'")) "Test-GmPlumbingShell does not check GodMode CLI flags -- plumbing shells would be swapped mid-flight"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell is fail-open (ProcessId -le 0 -> return `$false)" ($gm.Contains('if ($ProcessId -le 0) { return $false }')) "Test-GmPlumbingShell is not fail-open on ProcessId -le 0 -- a bad PID could throw"
+Add-Assertion "Opt2 C: Test-GmPlumbingShell is fail-open (catch -> return `$false)" ($gm.Contains('} catch { return $false }')) "Test-GmPlumbingShell is not fail-open on a query exception -- a WMI/CIM failure could break the consult"
+Add-Assertion "Opt2 D: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" ($gmhook.Contains('L"powershell_ise.exe"')) "gmhook IsShellLauncherProcess does not exclude powershell_ise.exe -- ISE would be IAT-hooked (0xC0000005 crash risk)"
+Add-Assertion "Opt2 D: `$GmCriticalIfeoExclude contains powershell_ise (never IFEO-redirected)" ($gm.Contains('"pwsh","powershell_ise","wt"')) "`$GmCriticalIfeoExclude missing powershell_ise -- ISE could be IFEO-redirected to gmproxy"
+Add-Assertion "Opt2 D: `$SkipNames (Invoke-GmProxyFeedbackElevation) contains powershell_ise" ($gm.Contains('"cmd","powershell_ise","conhost"')) "`$SkipNames missing powershell_ise -- a feedback PID for ISE could be token-swapped (defense-in-depth gap)"
+Add-Assertion "Opt2 D: Invoke-ExistingProcessElevation `$CriticalProcs contains powershell_ise.exe" ($gm.Contains('"powershell_ise.exe", "conhost.exe", "explorer.exe")')) "Invoke-ExistingProcessElevation `$CriticalProcs missing powershell_ise.exe -- the startup scan could kill+relaunch ISE"
+Add-Assertion "Opt2 D: Start-Monitoring `$CriticalProcs contains powershell_ise.exe" ($gm.Contains('"powershell_ise.exe", "conhost.exe", "explorer.exe", "ShellHost.exe"')) "Start-Monitoring `$CriticalProcs missing powershell_ise.exe -- the periodic scan could kill+relaunch ISE"
+Add-Assertion "Opt2 D: polling new-process scan passes -ProcessId `$proc.ProcessId (Phase 0 for shells)" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow')) "polling new-process scan does not pass -ProcessId -- shells would fall to kill+relaunch (loses session/cwd)"
+Add-Assertion "Opt2 D: WMI watcher drain still passes -ProcessId `$evt.ProcessId" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain no longer passes -ProcessId -- regression in the in-place elevation path"
+
 Write-Summary

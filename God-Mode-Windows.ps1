@@ -5223,7 +5223,7 @@ function Get-IfeoElevationCandidates {
         "csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost",
         "System","Registry","Memory Compression","Secure System","Idle",
         # Shells / terminals
-        "cmd","powershell","pwsh","wt","conhost","OpenConsole","WindowsTerminal","wsl","wslhost",
+        "cmd","powershell","pwsh","powershell_ise","wt","conhost","OpenConsole","WindowsTerminal","wsl","wslhost",
         # Shell/UX brokers (Start-Monitoring list + others)
         "RuntimeBroker","ApplicationFrameHost","ShellExperienceHost","SearchUI","SearchIndexer",
         "SearchProtocolHost","SearchFilterHost","SearchHost","StartMenuExperienceHost","TextInputHost",
@@ -5763,12 +5763,20 @@ function Test-BaseNameGoneEverywhere {
 }
 
 function Test-SystemProcessExists {
-    param([string]$ProcessName)
+    # Session-aware: by default any SYSTEM instance counts. With -InteractiveOnly,
+    # only a SYSTEM instance in an INTERACTIVE session (SessionId > 0) counts --
+    # mirrors Find-SystemProcessCandidate's Session>0 filter + gmhook.c FindSystemPid
+    # active-session filter. This stops the monitor's OWN headless Session-0 SYSTEM
+    # powershell.exe from falsely satisfying "a SYSTEM instance exists" for an
+    # interactive-shell name (which would trigger Stop-NonSystemInstances to kill
+    # the user's admin shell instead of in-place-elevating it). Fail-open.
+    param([string]$ProcessName, [switch]$InteractiveOnly)
     try {
         $procs = Get-CimInstance Win32_Process -Filter "Name='$ProcessName'" -ErrorAction SilentlyContinue
         if ($procs) {
             foreach ($p in $procs) {
                 try {
+                    if ($InteractiveOnly -and $p.SessionId -le 0) { continue }
                     $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
                     if ($owner.User -eq "SYSTEM") { return $true }
                 } catch { }
@@ -6404,7 +6412,7 @@ function Invoke-ExistingProcessElevation {
         return
     }
     # Critical processes that must never be killed/restarted (core OS + script host)
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe")
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "powershell_ise.exe", "conhost.exe", "explorer.exe")
     $systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0")
     try {
         $allProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue
@@ -6473,7 +6481,7 @@ function Invoke-GmProxyFeedbackElevation {
         $proc = Get-Process -Id $ProcessId -ErrorAction Stop
     } catch { return $false }
     # Defense-in-depth: never token-swap a shell host or critical OS process.
-    $SkipNames = @("powershell","pwsh","cmd","conhost","WindowsTerminal","OpenConsole","wsl","wslhost","wt","explorer","taskmgr","csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost","taskhostw","sihost","ShellHost","ctfmon","System","Registry","Secure System","Memory Compression","ApplicationFrameHost","RuntimeBroker")
+    $SkipNames = @("powershell","pwsh","cmd","powershell_ise","conhost","WindowsTerminal","OpenConsole","wsl","wslhost","wt","explorer","taskmgr","csrss","lsass","services","smss","winlogon","wininit","svchost","dwm","fontdrvhost","taskhostw","sihost","ShellHost","ctfmon","System","Registry","Secure System","Memory Compression","ApplicationFrameHost","RuntimeBroker")
     if ($SkipNames -contains $proc.Name) {
         Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is shell/critical; skipping in-place elevation"
         return $false
@@ -6504,6 +6512,42 @@ function Invoke-GmProxyFeedbackElevation {
     }
 }
 
+function Test-GmPlumbingShell {
+    # Detect God Mode's OWN shell-host plumbing (scheduled-task / Run-key / temp-copy
+    # launches of this script) by inspecting the process command line. Returns $true
+    # for a powershell/cmd/pwsh/ISE process whose command line carries the installed
+    # script name, a temp-copy name, or a GodMode CLI flag -- so Monitor-ElevateProcess
+    # leaves it alone (no mid-execution in-place SYSTEM token swap that could disturb
+    # the -ToggleOn / -ElevateAllProcesses / -SystemDesktop / watchdog / guardian /
+    # feedback-listener work). Fail-open: any query/parse failure -> $false (treat as
+    # a normal interactive shell -> eligible for in-place SYSTEM elevation). Mirrors
+    # the shell-exclusion design in IsShellLauncherProcess (gmhook.c) +
+    # $GmCriticalIfeoExclude (never IFEO-redirect God Mode's own plumbing).
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        if (-not $p) { return $false }
+        $cmd = $p.CommandLine
+        if (-not $cmd) { return $false }
+        # Script-path tokens: the installed script (GodMode.ps1), the source script
+        # (God-Mode-Windows.ps1), and the temp copies spawned by
+        # Invoke-ExistingProcessElevation (GodMode_ElevateAll_*.ps1) / SystemDesktop
+        # (GodMode_SystemDesktop_*.ps1).
+        if ($cmd -match 'GodMode\.ps1') { return $true }
+        if ($cmd -match 'God-Mode-Windows\.ps1') { return $true }
+        if ($cmd -match 'GodMode_ElevateAll') { return $true }
+        if ($cmd -match 'GodMode_SystemDesktop') { return $true }
+        # Distinctive GodMode CLI flags (param block). Unique enough that a normal
+        # user interactive shell would never carry them.
+        $gmFlags = @('-ToggleOn','-ToggleOff','-ElevateAllProcesses','-SystemDesktop','-InstallSystemDesktop','-UninstallSystemDesktop','-GodModeStatus','-LaunchTaskMgrAsSystem','-InstallGodMode','-UninstallGodMode','-DumpLogs','-ExportElevationDiagnostics')
+        foreach ($f in $gmFlags) {
+            if ($cmd -like "*$f*") { return $true }
+        }
+        return $false
+    } catch { return $false }
+}
+
 function Monitor-ElevateProcess {
     param([string]$Path, [string]$Arguments = "", [int]$ProcessId = 0, [switch]$HideWindow)
     if (-not (Test-Path $Path)) {
@@ -6520,10 +6564,36 @@ function Monitor-ElevateProcess {
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "SKIP" -Message "$procName.exe is auto-excluded (Detector B); leaving as user, not elevating"
         return $true
     }
-    if (Test-SystemProcessExists -ProcessName "$procName.exe") {
-        # Aggressive: if a SYSTEM instance exists, wipe all non-SYSTEM instances so the app is 100% SYSTEM
-        Stop-NonSystemInstances -ProcessName "$procName.exe"
-        return $true
+    # --- Interactive shells (cmd/powershell/pwsh/powershell_ise): auto-elevate EVERY
+    #     user-launched instance to SYSTEM via in-place token replacement (Phase 0
+    #     below) -- no kill, no flicker, `whoami` -> `nt authority\system`. This
+    #     SKIPs the aggressive "SYSTEM instance exists -> purge non-SYSTEM" branch
+    #     used for normal apps: that branch is name-based and would kill the user's
+    #     admin shell, because the monitor ITSELF is a headless Session-0 SYSTEM
+    #     powershell.exe so Test-SystemProcessExists("powershell.exe") is always
+    #     true. Skipping the purge means every interactive shell instance gets its
+    #     OWN in-place SYSTEM token (open 5 terminals -> 5 SYSTEM shells, none die).
+    #     God Mode's OWN plumbing shells (scheduled-task / Run-key / temp-copy
+    #     launches of this script carrying -ToggleOn/-ElevateAllProcesses/
+    #     -SystemDesktop/GodMode.ps1) are left untouched via Test-GmPlumbingShell so
+    #     a mid-flight token swap never disturbs the monitor/watchdog/guardian work. ---
+    $interactiveShells = @("cmd","powershell","pwsh","powershell_ise")
+    $isInteractiveShell = $interactiveShells -contains $procName
+    if ($isInteractiveShell) {
+        if ($ProcessId -gt 0 -and (Test-GmPlumbingShell -ProcessId $ProcessId)) {
+            Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "SKIP" -Message "$procName PID=$ProcessId is God Mode plumbing shell; leaving token untouched (no mid-flight swap)"
+            return $true
+        }
+        # Fall through to Phase 0 in-place token replacement (skip the purge branch).
+    } else {
+        if (Test-SystemProcessExists -ProcessName "$procName.exe" -InteractiveOnly) {
+            # Aggressive: if a SYSTEM instance exists ON THE INTERACTIVE DESKTOP, wipe
+            # all non-SYSTEM instances so the app is 100% SYSTEM. -InteractiveOnly
+            # stops a Session-0 SYSTEM instance (a same-named service) from falsely
+            # triggering a desktop purge.
+            Stop-NonSystemInstances -ProcessName "$procName.exe"
+            return $true
+        }
     }
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     # --- Phase 0: In-place token replacement (no kill, no relaunch) ---
@@ -6592,7 +6662,7 @@ function Start-Monitoring {
 
     # Critical processes that must never be re-elevated by the periodic loop.
     # Defined here so it is in scope for the periodic elevation block below.
-    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
+    $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "powershell_ise.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
 
     $lastElevated = @{}   # Process path -> last elevated time (for startup/periodic scans)
     $lastElevatedPid = @{} # Process ID -> elevated time (for new process detection)
@@ -6859,10 +6929,14 @@ function Start-Monitoring {
                     }
                 }
 
-                # PID-based tracking: each process instance gets elevated once
+                # PID-based tracking: each process instance gets elevated once.
+                # Pass -ProcessId so Monitor-ElevateProcess Phase 0 can do an in-place
+                # token swap (no kill) for interactive shells -- mirrors the WMI watcher
+                # drain. Without it, shells would fall through to the kill+relaunch
+                # Phase 1/2 path (loses the user's session/cwd/history).
                 if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
                     $lastElevatedPid[$proc.ProcessId] = Get-Date
-                    Monitor-ElevateProcess -Path $path -Arguments $arguments -HideWindow
+                    Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow
                 }
             }
         }

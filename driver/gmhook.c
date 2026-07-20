@@ -332,7 +332,7 @@ static BOOL IsCriticalProcess(const wchar_t* baseName) {
 static BOOL IsShellLauncherProcess(const wchar_t* baseName) {
     if (!baseName) return FALSE;
     const wchar_t* shells[] = {
-        L"pwsh.exe", L"powershell.exe", L"cmd.exe", L"wt.exe",
+        L"pwsh.exe", L"powershell.exe", L"powershell_ise.exe", L"cmd.exe", L"wt.exe",
         L"conhost.exe", L"OpenConsole.exe", L"WindowsTerminal.exe", NULL
     };
     for (int i = 0; shells[i]; i++) {

@@ -113,7 +113,7 @@ if ($arrMatch.Success) {
 # --- 4. App list EXCLUDES shells/terminals + explorer + taskmgr (scoped to the array) ---
 if ($arrMatch.Success) {
     $excludedApps = @(
-        "cmd.exe","powershell.exe","pwsh.exe","wt.exe","conhost.exe","OpenConsole.exe",
+        "cmd.exe","powershell.exe","pwsh.exe","powershell_ise.exe","wt.exe","conhost.exe","OpenConsole.exe",
         "WindowsTerminal.exe","wsl.exe","wslhost.exe","explorer.exe","taskmgr.exe"
     )
     foreach ($app in $excludedApps) {
@@ -383,5 +383,21 @@ Add-Assertion "S2 PE heuristic: curated list (5) preserved ($win11StubNames stil
 Add-Assertion "S3 reconcile: builds $browserBases (StartMenuInternet) for the 'P' prune" ($gm.Contains('$browserBases') -and $gm.Contains('StartMenuInternet')) "reconcile does not build $browserBases -- stale 'P' browser entries cannot be pruned"
 Add-Assertion "S3 reconcile: prunes stale 'P' browser entries (\$rsn -ne 'P' guard)" ($gm.Contains('$rsn -ne ''P''')) "reconcile does not prune stale 'P' browser entries -- a browser uninstalled after enable lingers up to 30 days"
 Add-Assertion "S3 reconcile: 'P' prune is fail-open on an empty browser scan (\$browserBases.Count -eq 0)" ($gm.Contains('$browserBases.Count -eq 0')) "reconcile 'P' prune not fail-open -- an empty browser scan (registry ACL denied) would prune ALL 'P' entries"
+
+# --- 12e. Interactive-shell auto-elevation (option #2) + ISE hardening +
+# self-collision guard (2026-07-20) ---
+# Mirrors Test-GmProxySession.ps1 section 29 for the IFEO-layer invariants:
+# ISE is added to $GmCriticalIfeoExclude (never IFEO-redirected to gmproxy, same
+# as cmd/powershell/pwsh) AND excluded from the curated IFEO app list (section 4
+# above now lists powershell_ise.exe). The monitor auto-elevates ISE in place
+# (Test-GmPlumbingShell guard + Monitor-ElevateProcess interactive-shell Phase 0
+# + Test-SystemProcessExists -InteractiveOnly) -- covered by Test-GmProxySession
+# section 29 + the test-gmproxy-session.sh gmhook grep (this file does not load
+# gmhook.c).
+Add-Assertion "Opt2 ISE: `$GmCriticalIfeoExclude contains powershell_ise (never IFEO-redirected)" ($gm.Contains('"pwsh","powershell_ise","wt"')) "`$GmCriticalIfeoExclude missing powershell_ise -- ISE could be IFEO-redirected to gmproxy (breaks ISE, which launches commands via CreateProcessW)"
+Add-Assertion "Opt2 collision: Test-SystemProcessExists has -InteractiveOnly switch (session-aware)" ($gm.Contains('param([string]$ProcessName, [switch]$InteractiveOnly)')) "Test-SystemProcessExists missing -InteractiveOnly -- the monitor's own Session-0 SYSTEM powershell would falsely trigger a purge of the user's shell"
+Add-Assertion "Opt2 collision: Monitor-ElevateProcess defines `$interactiveShells (cmd/powershell/pwsh/powershell_ise)" ($gm.Contains('$interactiveShells = @("cmd","powershell","pwsh","powershell_ise")')) "Monitor-ElevateProcess missing `$interactiveShells -- interactive shells cannot be routed to the in-place Phase 0 path"
+Add-Assertion "Opt2 collision: Test-GmPlumbingShell function defined (God Mode plumbing guard)" ($gm.Contains('function Test-GmPlumbingShell {')) "Test-GmPlumbingShell missing -- God Mode plumbing shells cannot be detected/protected from a mid-flight token swap"
+Add-Assertion "Opt2 collision: Monitor-ElevateProcess non-shell purge uses -InteractiveOnly" ($gm.Contains('Test-SystemProcessExists -ProcessName "$procName.exe" -InteractiveOnly')) "Monitor-ElevateProcess non-shell purge does not use -InteractiveOnly -- a Session-0 SYSTEM instance could falsely trigger a desktop purge"
 
 Write-Summary
