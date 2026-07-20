@@ -340,4 +340,28 @@ Add-Assertion "Detector A AppX drop: prior-hook cleanup is gmproxy-guarded (Debu
 Add-Assertion "Detector A AppX drop: debug EXIT reports droppedAppx + persistedAppx + appxHookRemoved" ($installBody.Contains('droppedAppx=$seedDroppedAppx') -and $installBody.Contains('persistedAppx=') -and $installBody.Contains('appxHookRemoved=')) "debug EXIT does not report the AppX drop counts -- regression visibility lost"
 Add-Assertion "Detector A AppX drop: Add-IfeoElevationForApp skips App Execution Alias stubs (ReparsePoint)" ($addBody.Contains('WindowsApps') -and $addBody.Contains('ReparsePoint') -and $addBody.Contains('SKIP-APPAlias')) "Add-IfeoElevationForApp does not skip App Execution Alias stubs -- a newly-installed Store app could be IFEO-hooked (broken renamed copy)"
 
+# --- 12c. notepad detection-miss fix + 3 hardening suggestions (2026-07-19) ---
+# Get-GmSystemCompatExclusions gains (4) a direct C:\Program Files\WindowsApps
+# manifest scan + (5) a curated Win11 Store-redirector stub fallback
+# (notepad/mspaint/calc/snippingtool, Test-Path-validated) so the classic Win11
+# stubs are classified AppX even when Get-AppxPackage misses them on an admin
+# account -- the actual fix for "notepad still does not start" (Detector A then
+# drops them from IFEO + persists 'A' + gmhook consults the store -> native
+# launch). Plus Invoke-GmAutoExcludeReconcile (5-min monitor prune of orphaned
+# 'A' entries) + the single $reasonLegend hashtable driving both legends.
+$compatMatch = [regex]::Match($gm, '(?s)function\s+Get-GmSystemCompatExclusions\s*\{(.*?)\nfunction\s+Get-IfeoElevationCandidates\s*\{')
+$compatBody = if ($compatMatch.Success) { $compatMatch.Groups[1].Value } else { "" }
+Add-Assertion "Notepad fix: Get-GmSystemCompatExclusions body extractable (12c)" ($compatMatch.Success) "could not isolate Get-GmSystemCompatExclusions body"
+if ($compatMatch.Success) {
+    Add-Assertion "Notepad fix: curated Win11-stub fallback list present (\$win11StubNames + notepad/mspaint/calc/snippingtool)" ($compatBody.Contains('$win11StubNames') -and $compatBody.Contains('notepad.exe') -and $compatBody.Contains('mspaint.exe') -and $compatBody.Contains('calc.exe') -and $compatBody.Contains('snippingtool.exe')) "curated Win11-stub fallback missing -- notepad/mspaint/calc/snippingtool stay IFEO-hooked on VMs where Get-AppxPackage misses them (the actual notepad-doesn't-start bug)"
+    Add-Assertion "Notepad fix: curated fallback validates each stub via Test-Path C:\Windows + System32 (per-VM honest)" ($compatBody.Contains('Test-Path ("C:\Windows\" + $stub)') -and $compatBody.Contains('C:\Windows\System32')) "curated fallback does not Test-Path-gate each stub -- would drop names absent on this VM"
+    Add-Assertion "Notepad fix: curated fallback only adds names not already detected (\$appx.ContainsKey skip)" ($compatBody.Contains('$appx.ContainsKey($k)')) "curated fallback does not skip already-detected names -- redundant"
+    Add-Assertion "Notepad fix: direct WindowsApps filesystem scan (C:\Program Files\WindowsApps + AppXManifest.xml manifest regex)" ($compatBody.Contains('C:\Program Files\WindowsApps') -and $compatBody.Contains('AppXManifest.xml') -and $compatBody.Contains('Executable="')) "direct WindowsApps filesystem scan missing -- packages Get-AppxPackage misses (Store Notepad on an admin account) are not caught"
+}
+Add-Assertion "Suggestion 1: Invoke-GmAutoExcludeReconcile function defined (orphaned 'A' prune)" ($gm.Contains('function Invoke-GmAutoExcludeReconcile')) "Invoke-GmAutoExcludeReconcile missing -- orphaned 'A' entries linger after a Store-app uninstall"
+Add-Assertion "Suggestion 1: reconcile prunes only reason 'A' entries (\$rsn -ne 'A' keep C/G/P)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to 'A' entries -- could drop runtime C/G/P learnings"
+Add-Assertion "Suggestion 1: reconcile checks stub + alias existence before pruning" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists') -and $gm.Contains('aliasBases')) "reconcile does not verify the stub/alias is gone -- could prune a still-installed Store app"
+Add-Assertion "Suggestion 1: monitor calls reconcile on a 5-min cadence (\$lastReconcile + FromMinutes(5))" ($gm.Contains('$lastReconcile = [datetime]::MinValue') -and $gm.Contains('[TimeSpan]::FromMinutes(5)') -and $gm.Contains('Invoke-GmAutoExcludeReconcile')) "monitor does not call reconcile on a 5-min cadence -- orphaned 'A' entries never pruned"
+Add-Assertion "Suggestion 2: Export-GodModeLogs builds a single \$reasonLegend hashtable ([ordered]@{) driving both legends" ($gm.Contains('$reasonLegend = [ordered]@{') -and $gm.Contains('$reasonParts = foreach ($k in $reasonLegend.Keys)') -and $gm.Contains('$reasonParts2 = foreach ($k in $reasonLegend.Keys)')) "Export-GodModeLogs missing the single $reasonLegend hashtable driving both legends -- the store + per-app legends can drift"
+
 Write-Summary

@@ -169,6 +169,15 @@ grep -qF 'if (!autoExcluded)' "$SRC" && record "src: A3 -- SignalGmProxyFeedback
 grep -qF 'GmProxyIsAppExecutionAliasStub' "$SRC" && record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 1 || record "src: GmProxyIsAppExecutionAliasStub helper present (Detector B alias-stub guard)" 0 "not found -- CLEAN-GUI refusals for Store stubs would pollute the store"
 grep -qF 'is an App Execution Alias stub' "$SRC" && record "src: alias guard skip-record DiagLog present (App Execution Alias stub)" 1 || record "src: alias guard skip-record DiagLog present" 0 "not found -- the rename-breaks-stub cause would not be logged"
 grep -qF 'code == 0 && GmProxyIsAppExecutionAliasStub(base)' "$SRC" && record "src: alias guard wraps the CLEAN-GUI record (code == 0 && GmProxyIsAppExecutionAliasStub(base))" 1 || record "src: alias guard wraps the CLEAN-GUI record" 0 "not found -- a stub CLEAN exit would still be recorded"
+# IFEO-bypass same-directory copy fallback (2026-07-19, Suggestion 3) + 'A'
+# reason preserve: source invariants (runtime proof is source-level here -- the
+# refuse test's dummy is in a writable temp dir so the hardlink succeeds and the
+# same-dir copy fallback + impersonation paths are not exercised at runtime).
+grep -qF 'CopyFileW(argv[1], hardlinkPath, FALSE)' "$SRC" && record "src: same-dir copy fallback present (CopyFileW to hardlinkPath before Temp)" 1 || record "src: same-dir copy fallback present" 0 "not found"
+grep -qF 'ImpersonateLoggedOnUser' "$SRC" && record "src: same-dir copy SYSTEM impersonation present (ImpersonateLoggedOnUser)" 1 || record "src: same-dir copy SYSTEM impersonation present" 0 "not found"
+grep -qF 'RevertToSelf' "$SRC" && record "src: impersonation always reverts (RevertToSelf)" 1 || record "src: impersonation always reverts (RevertToSelf)" 0 "not found"
+grep -qF 'TokenImpersonation' "$SRC" && record "src: SYSTEM token duplicated as impersonation (TokenImpersonation)" 1 || record "src: SYSTEM token duplicated as impersonation (TokenImpersonation)" 0 "not found"
+grep -qF "if (entries[idx].reason != L'A')" "$SRC" && record "src: GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" 1 || record "src: GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" 0 "not found -- an install-time 'A' is downgraded to a runtime G/C"
 # Detector B reason field (5th, additive): store line is base|count|ts|excluded|reason
 # (C=crash, G=clean-gui, P=pre-drop, ?=old 4-field line). Informational for
 # Export-GodModeLogs; the parser defaults to '?' so old lines still parse.

@@ -613,7 +613,7 @@ Add-Assertion "H4 God-Mode-Windows.ps1: Test-GmAutoExcluded returns the stored V
 Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries mutex create fallback (New-Object Threading.Mutex)" ($gm.Contains('New-Object System.Threading.Mutex($false, $mutexName)')) "Add-GmAutoExcludeEntries missing the mutex create fallback -- first-install window could race a concurrent gmproxy"
 Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries new entries use the -Reason param (default 'P', 'A' for AppX)" ($gm.Contains('"$key|2|$nowTs|1|$Reason"')) "Add-GmAutoExcludeEntries new entries do not use the -Reason param -- AppX drops cannot be tagged 'A'"
 Add-Assertion "H5 God-Mode-Windows.ps1: Add-GmAutoExcludeEntries preserves an existing reason on merge" ($gm.Contains('$parts.Count -ge 5 -and $parts[4]')) "Add-GmAutoExcludeEntries does not preserve an existing reason on merge"
-Add-Assertion "H5 God-Mode-Windows.ps1: Export-GodModeLogs reason legend (C=CRASH / G=CLEAN-GUI / P=PRE-DROP)" ($gm.Contains('C=CRASH') -and $gm.Contains('G=CLEAN-GUI') -and $gm.Contains('P=PRE-DROP')) "Export-GodModeLogs reason legend missing -- user cannot tell why an app was excluded"
+Add-Assertion "H5 God-Mode-Windows.ps1: Export-GodModeLogs reason legend (C=CRASH / G=CLEAN-GUI / P=PRE-DROP via $reasonLegend hashtable)" ($gm.Contains("'C' = 'CRASH") -and $gm.Contains("'G' = 'CLEAN-GUI") -and $gm.Contains("'P' = 'PRE-DROP")) "Export-GodModeLogs reason legend missing -- user cannot tell why an app was excluded"
 Add-Assertion "H5 God-Mode-Windows.ps1: Export-GodModeLogs store line-format note includes the reason field" ($gm.Contains('basename|crashCount|lastCrashUnixTs|excluded|reason')) "Export-GodModeLogs line-format note does not include the reason field"
 
 # --- 26. AppX/Store-redirector stub drop + gmproxy alias guard + reset cache + per-app REASON + gmhook token invalidation (2026-07-19) ---
@@ -640,9 +640,49 @@ Add-Assertion "AppX drop: God-Mode-Windows.ps1 Add-IfeoElevationForApp skips App
 Add-Assertion "Reset cache: Reset-GmProxyAutoExcludeStore clears GmAutoExcludeCache + GmAutoExcludeCacheDt" ($gm -match 'function\s+Reset-GmProxyAutoExcludeStore[\s\S]{0,4000}?GmAutoExcludeCache\s*=\s*\$null[\s\S]{0,80}?GmAutoExcludeCacheDt\s*=\s*\$null') "Reset-GmProxyAutoExcludeStore does not clear the Test-GmAutoExcluded cache -- a scan right after reset could see stale exclusions for 15s"
 Add-Assertion "Per-app REASON: Export-GodModeLogs builds a reasonMap from the store (5th field)" ($gm.Contains('reasonMap') -and $gm.Contains('p[4]')) "Export-GodModeLogs does not build a reasonMap -- the REASON column cannot be populated"
 Add-Assertion "Per-app REASON: Export-GodModeLogs per-app table has a REASON column header" ($gm.Contains('USER-AUTOEXCLUDE  REASON')) "Export-GodModeLogs per-app table missing the REASON column header"
-Add-Assertion "Per-app REASON: Export-GodModeLogs A=ALIAS-STUB legend present" ($gm.Contains('A=ALIAS-STUB')) "Export-GodModeLogs A=ALIAS-STUB legend missing -- the user cannot tell AppX drops from browser drops"
+Add-Assertion "Per-app REASON: Export-GodModeLogs A=ALIAS-STUB legend present (via $reasonLegend hashtable)" ($gm.Contains("'A' = 'ALIAS-STUB")) "Export-GodModeLogs A=ALIAS-STUB legend missing -- the user cannot tell AppX drops from browser drops"
 Add-Assertion "gmhook token: GmHookIsAutoExcluded captures the host token SID (cacheLoadTokenSid)" ($gmhook.Contains('cacheLoadTokenSid')) "gmhook does not capture the host token SID -- a host-token change cannot trigger a reload"
 Add-Assertion "gmhook token: GmHookIsAutoExcluded reloads on a token change (tokenChanged + EqualSid)" ($gmhook.Contains('tokenChanged') -and $gmhook.Contains('EqualSid')) "gmhook does not reload on a host-token change -- the 'always fresh' guarantee is incomplete"
 Add-Assertion "gmhook token: GmHookIsAutoExcluded token query is fail-open (OpenProcessToken + haveCurSid)" ($gmhook.Contains('OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY') -and $gmhook.Contains('haveCurSid')) "gmhook token query is not fail-open -- a token query failure could break the store consult"
+
+# --- 27. notepad detection-miss fix + 3 hardening suggestions (2026-07-19) ---
+# Five additive improvements: (1) Get-GmSystemCompatExclusions gains a curated
+# Win11 Store-redirector stub fallback (notepad/mspaint/calc/snippingtool,
+# Test-Path-validated) + a direct C:\Program Files\WindowsApps manifest scan,
+# so the classic Win11 stubs are classified AppX + dropped from IFEO + persisted
+# 'A' even when Get-AppxPackage misses them (the actual "notepad doesn't start"
+# fix -- gmhook then consults the store and lets them launch natively). (2) gmproxy
+# same-directory copy fallback (current token, then SYSTEM impersonation) keeps
+# the canonical-directory context for path-relative targets whose hardlink fails.
+# (3) Invoke-GmAutoExcludeReconcile prunes orphaned 'A' entries on a 5-min monitor
+# cadence (Store-app uninstall tidy-up; never touches C/G/P). (4) Export-GodModeLogs
+# reason legend is driven by a single $reasonLegend hashtable (no drift). (5) gmproxy
+# GmProxyAutoExcludeRecord preserves an install-time 'A' reason (not downgraded to
+# G/C for a stub that slips past Detector A). Additive + fail-open.
+$compatMatch = [regex]::Match($gm, '(?s)function\s+Get-GmSystemCompatExclusions\s*\{(.*?)\nfunction\s+Get-IfeoElevationCandidates\s*\{')
+$compatBody = if ($compatMatch.Success) { $compatMatch.Groups[1].Value } else { "" }
+Add-Assertion "Notepad fix: Get-GmSystemCompatExclusions body extractable" ($compatMatch.Success) "could not isolate Get-GmSystemCompatExclusions body"
+if ($compatMatch.Success) {
+    Add-Assertion "Notepad fix: curated Win11-stub fallback list present ($win11StubNames + 4 stubs)" ($compatBody.Contains('$win11StubNames') -and $compatBody.Contains('notepad.exe') -and $compatBody.Contains('mspaint.exe') -and $compatBody.Contains('calc.exe') -and $compatBody.Contains('snippingtool.exe')) "curated Win11-stub fallback missing -- notepad/mspaint/calc/snippingtool stay IFEO-hooked on VMs where Get-AppxPackage misses them"
+    Add-Assertion "Notepad fix: curated fallback validates each stub via Test-Path C:\Windows + System32" ($compatBody.Contains('Test-Path ("C:\Windows\" + $stub)') -and $compatBody.Contains('C:\Windows\System32')) "curated fallback does not Test-Path-gate each stub -- would drop names absent on this VM"
+    Add-Assertion "Notepad fix: curated fallback only adds names not already detected (ContainsKey skip)" ($compatBody.Contains('$appx.ContainsKey($k)')) "curated fallback does not skip already-detected names -- redundant"
+    Add-Assertion "Notepad fix: direct WindowsApps filesystem scan (C:\Program Files\WindowsApps + AppXManifest.xml)" ($compatBody.Contains('C:\Program Files\WindowsApps') -and $compatBody.Contains('AppXManifest.xml')) "direct WindowsApps filesystem scan missing -- packages Get-AppxPackage misses (Store Notepad on admin) are not caught"
+}
+Add-Assertion "Suggestion 3: gmproxy same-dir copy fallback (CopyFileW to hardlinkPath before Temp)" ($proxy.Contains('CopyFileW(argv[1], hardlinkPath, FALSE)')) "gmproxy same-dir copy fallback missing -- a hardlink failure jumps straight to Temp (loses canonical-directory context)"
+Add-Assertion "Suggestion 3: gmproxy same-dir copy retries under SYSTEM impersonation (DuplicateTokenEx TokenImpersonation)" ($proxy.Contains('DuplicateTokenEx(hPrimary, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &hImp)')) "gmproxy same-dir copy does not impersonate SYSTEM -- C:\Windows/System32 targets the admin can't write stay broken"
+Add-Assertion "Suggestion 3: gmproxy impersonation uses ImpersonateLoggedOnUser + RevertToSelf (always reverts)" ($proxy.Contains('ImpersonateLoggedOnUser(hImp)') -and $proxy.Contains('RevertToSelf()')) "gmproxy impersonation does not RevertToSelf -- gmproxy would keep running as SYSTEM after the copy"
+Add-Assertion "Suggestion 3: gmproxy same-dir copy gated on haveToken + hPrimary (fail-open)" ($proxy.Contains('!usedHardlink && haveToken && hPrimary')) "gmproxy same-dir copy not gated on haveToken/hPrimary -- would attempt impersonation without a token"
+Add-Assertion "Suggestion 3: gmproxy Temp copy remains the final fallback (GetTempPathW + gmproxy_%lu_%ls)" ($proxy.Contains('GetTempPathW') -and $proxy.Contains('gmproxy_%lu_%ls')) "gmproxy Temp fallback removed -- a same-dir copy failure would abort the launch"
+Add-Assertion "Suggestion 1: Invoke-GmAutoExcludeReconcile function defined" ($gm.Contains('function Invoke-GmAutoExcludeReconcile')) "Invoke-GmAutoExcludeReconcile missing -- orphaned 'A' entries linger after a Store-app uninstall"
+Add-Assertion "Suggestion 1: reconcile prunes only reason 'A' entries ($rsn -ne 'A' keep)" ($gm.Contains('$rsn -ne ''A''')) "reconcile does not restrict pruning to 'A' entries -- could drop runtime C/G/P learnings"
+Add-Assertion "Suggestion 1: reconcile checks stub + alias existence before pruning (stubExists + aliasExists + aliasBases)" ($gm.Contains('$stubExists') -and $gm.Contains('$aliasExists') -and $gm.Contains('aliasBases')) "reconcile does not verify the stub/alias is gone -- could prune a still-installed Store app"
+Add-Assertion "Suggestion 1: reconcile is mutex-safe (Global\GmProxyAutoExcludeMutex)" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,3000}?GmProxyAutoExcludeMutex') "reconcile does not hold the cross-privilege mutex -- could race a concurrent gmproxy write"
+Add-Assertion "Suggestion 1: reconcile atomic write (temp + Move-Item -Force to GodModeAutoExcludeFile)" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,7000}?Move-Item\s+-Path\s+\$tmp\s+-Destination\s+\$GodModeAutoExcludeFile\s+-Force') "reconcile missing atomic temp+rename -- a mid-write crash could corrupt the store"
+Add-Assertion "Suggestion 1: reconcile invalidates the Test-GmAutoExcluded cache after a prune" ($gm -match 'function\s+Invoke-GmAutoExcludeReconcile[\s\S]{0,7000}?GmAutoExcludeCache\s*=\s*\$null') "reconcile does not invalidate the cache -- a consult right after a prune could see stale entries"
+Add-Assertion "Suggestion 1: monitor calls reconcile on a 5-min cadence ($lastReconcile + FromMinutes(5))" ($gm.Contains('$lastReconcile = [datetime]::MinValue') -and $gm.Contains('[TimeSpan]::FromMinutes(5)') -and $gm.Contains('Invoke-GmAutoExcludeReconcile')) "monitor does not call reconcile on a 5-min cadence -- orphaned 'A' entries never pruned"
+Add-Assertion "Suggestion 2: Export-GodModeLogs builds a single $reasonLegend hashtable ([ordered])" ($gm.Contains('$reasonLegend = [ordered]@{')) "Export-GodModeLogs missing the single $reasonLegend hashtable -- legends can drift"
+Add-Assertion "Suggestion 2: store legend emitted from $reasonLegend ($reasonParts -join)" ($gm.Contains('$reasonParts = foreach ($k in $reasonLegend.Keys)') -and $gm.Contains('($reasonParts -join '', '')')) "store legend not emitted from $reasonLegend -- drift risk"
+Add-Assertion "Suggestion 2: per-app REASON legend emitted from the same $reasonLegend ($reasonParts2)" ($gm.Contains('$reasonParts2 = foreach ($k in $reasonLegend.Keys)')) "per-app REASON legend not emitted from $reasonLegend -- the two legends can drift"
+Add-Assertion "Belt-and-suspenders: gmproxy GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" ($proxy.Contains("if (entries[idx].reason != L'A')")) "gmproxy record overwrites an install-time 'A' with a runtime G/C -- a stub that slips past Detector A loses its AppX classification"
 
 Write-Summary

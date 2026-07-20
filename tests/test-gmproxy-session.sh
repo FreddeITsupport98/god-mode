@@ -209,6 +209,21 @@ grep -qF 'GmProxyIsAppExecutionAliasStub' "$SRC" && record "src: GmProxyIsAppExe
 grep -qF 'is an App Execution Alias stub' "$SRC" && record "src: alias guard skip-record DiagLog present (App Execution Alias stub)" 1 || record "src: alias guard skip-record DiagLog present" 0 "not found -- the rename-breaks-stub cause would not be logged"
 grep -qF 'code == 0 && GmProxyIsAppExecutionAliasStub(base)' "$SRC" && record "src: alias guard wraps the CLEAN-GUI record (code == 0 && GmProxyIsAppExecutionAliasStub(base))" 1 || record "src: alias guard wraps the CLEAN-GUI record" 0 "not found -- a stub CLEAN exit would still be recorded"
 
+# IFEO-bypass same-directory copy fallback (2026-07-19, Suggestion 3): when the
+# same-dir hardlink fails, gmproxy now tries a same-dir CopyFileW under its
+# current token, then under the stolen SYSTEM token (ImpersonateLoggedOnUser +
+# RevertToSelf) so ACL-protected dirs (C:\Windows/System32) the admin can't write
+# stay in-context, then falls back to Temp. Keeps canonical-directory context
+# for path-relative targets. The MinGW build below must still compile with this.
+grep -qF 'CopyFileW(argv[1], hardlinkPath, FALSE)' "$SRC" && record "src: same-dir copy fallback present (CopyFileW to hardlinkPath before Temp)" 1 || record "src: same-dir copy fallback present" 0 "not found -- a hardlink failure jumps straight to Temp (loses canonical-directory context)"
+grep -qF 'ImpersonateLoggedOnUser' "$SRC" && record "src: same-dir copy SYSTEM impersonation present (ImpersonateLoggedOnUser)" 1 || record "src: same-dir copy SYSTEM impersonation present" 0 "not found -- C:\Windows/System32 targets the admin can't write stay broken"
+grep -qF 'RevertToSelf' "$SRC" && record "src: impersonation always reverts (RevertToSelf)" 1 || record "src: impersonation always reverts (RevertToSelf)" 0 "not found -- gmproxy would keep running as SYSTEM after the copy"
+grep -qF 'TokenImpersonation' "$SRC" && record "src: SYSTEM token duplicated as impersonation (TokenImpersonation for ImpersonateLoggedOnUser)" 1 || record "src: SYSTEM token duplicated as impersonation (TokenImpersonation)" 0 "not found -- ImpersonateLoggedOnUser needs an impersonation token, not the TokenPrimary used for CreateProcess"
+# gmproxy GmProxyAutoExcludeRecord preserves an install-time 'A' reason (2026-
+# 07-19 belt-and-suspenders): a stub that slips past Detector A must not lose
+# its 'A' classification to a runtime G/C. The MinGW build below must still compile.
+grep -qF "if (entries[idx].reason != L'A')" "$SRC" && record "src: GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" 1 || record "src: GmProxyAutoExcludeRecord preserves reason 'A' (if reason != L'A')" 0 "not found -- an install-time 'A' is downgraded to a runtime G/C for a stub that slips past Detector A"
+
 # gmhook.c store consult (Part B): gmhook reads the auto-exclude store before
 # birthing a child as SYSTEM; a store-excluded base name falls through to the
 # real CreateProcessW (born as the host's normal user token, not SYSTEM). 2s

@@ -3502,12 +3502,21 @@ function Export-GodModeLogs {
         $LogContent += "`r`n      current user (USER-AUTOEXCLUDE mode) instead of as SYSTEM on its next"
         $LogContent += "`r`n      launch. Entries auto-drop after 30 days or via menu [18] RESET AUTO-EXCLUDE STORE."
         $LogContent += "`r`n      Line format: basename|crashCount|lastCrashUnixTs|excluded|reason"
-        $LogContent += "`r`n      reason: C=CRASH (non-zero exit as SYSTEM), G=CLEAN-GUI (exit 0 + GUI PE ="
-        $LogContent += "`r`n      a WinUI/AppX silent refusal), P=PRE-DROP (install-time browser drop),"
-        $LogContent += "`r`n      A=ALIAS-STUB (install-time AppX/Store-redirector drop -- notepad/mspaint/"
-        $LogContent += "`r`n      calc/photos; these cannot run as SYSTEM + gmproxy rename breaks their"
-        $LogContent += "`r`n      Store redirect, so they launch natively as the user via the alias),"
-        $LogContent += "`r`n      ?=old 4-field line (reason added after the fact)."
+        # reason legend: the single $reasonLegend hashtable is the source of
+        # truth for the auto-exclude reason codes -- it drives this store legend
+        # AND the per-app REASON legend below so adding a future code (or
+        # rewording a description) updates both in lockstep (no drift). Ordered
+        # for a stable, severity-ish listing. Defined here (always reached
+        # before the per-app legend) so both emitters see it.
+        $reasonLegend = [ordered]@{
+            'C' = 'CRASH (non-zero exit as SYSTEM, any subsystem)'
+            'G' = 'CLEAN-GUI (exit 0 + GUI PE = a WinUI/AppX silent refusal)'
+            'P' = 'PRE-DROP (install-time browser drop)'
+            'A' = 'ALIAS-STUB (install-time AppX/Store-redirector drop -- notepad/mspaint/calc/photos; cannot run as SYSTEM + gmproxy rename breaks their Store redirect, so they launch natively as the user via the alias)'
+            '?' = 'old 4-field line, or not in the store (reason added after the fact / never excluded / no runtime refusal recorded yet)'
+        }
+        $reasonParts = foreach ($k in $reasonLegend.Keys) { "$k=$($reasonLegend[$k])" }
+        $LogContent += "`r`n      reason: " + ($reasonParts -join ', ')
 
         # --- GM-PROXY PER-APP LAUNCH REPORT (big debug): aggregates every
         #     gmproxy invocation into a per-app summary so the user can report
@@ -3606,10 +3615,12 @@ function Export-GodModeLogs {
                     $LogContent += "`r`n      CLEAN as a graceful refusal."
                     $LogContent += "`r`n      Report the per-app EXITED(class=CRASH) counts so the IFEO"
                     $LogContent += "`r`n      exclusion can be scoped to exactly the apps that break as SYSTEM."
+                    # REASON legend emitted from the same $reasonLegend
+                    # hashtable as the store legend above (single source of truth
+                    # -- no drift when a future reason code is added).
+                    $reasonParts2 = foreach ($k in $reasonLegend.Keys) { "$k=$($reasonLegend[$k])" }
                     $LogContent += "`r`n      REASON column = the stored auto-exclude reason for that app (the"
-                    $LogContent += "`r`n      store's 5th field): C=CRASH, G=CLEAN-GUI, P=PRE-DROP (browser),"
-                    $LogContent += "`r`n      A=ALIAS-STUB (AppX/Store-redirector install-time drop), ?=not in the"
-                    $LogContent += "`r`n      store (never excluded / no runtime refusal recorded yet)."
+                    $LogContent += "`r`n      store's 5th field): " + ($reasonParts2 -join ', ') + "."
                 }
                 # --- ELEVATION FAULTS (root-cause): parse the [GM-PROXY] CREATEPROC:
                 #     result=FAIL lines (which CreateProcess method failed + gle) and the
@@ -3901,6 +3912,96 @@ function Reset-GmProxyAutoExcludeStore {
         Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "ERROR" -Message "Outer catch: $_"
     }
     Write-DebugLog -FunctionName "Reset-GmProxyAutoExcludeStore" -Action "EXIT"
+}
+
+function Invoke-GmAutoExcludeReconcile {
+    <#
+    .SYNOPSIS
+        Reconcile the Detector B auto-exclude store against the live system:
+        drop orphaned install-time AppX/Store-redirector stub entries (reason
+        'A') whose stub + alias no longer exist (the Store app was uninstalled).
+        Called from Start-Monitoring on a 5-minute cadence so the store stays
+        tidy after a Store-app uninstall instead of carrying a stale excluded=1
+        entry for up to 30 days. Never touches runtime C/G/P entries (those are
+        governed by gmproxy.c's 30-day stale drop). Fail-open: any error -> skip.
+        Cross-privilege mutex-safe (same Global\GmProxyAutoExcludeMutex as
+        Add-GmAutoExcludeEntries + gmproxy.c) so it cannot race a concurrent
+        gmproxy launch mid-write.
+    #>
+    Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "ENTRY"
+    try {
+        if (-not (Test-Path $GodModeAutoExcludeFile)) { return }
+        # Cross-privilege mutex (same name as gmproxy.c + Add-GmAutoExcludeEntries).
+        $mutex = $null
+        $mutexName = "Global\GmProxyAutoExcludeMutex"
+        $owned = $false
+        try { $mutex = [System.Threading.Mutex]::OpenExisting($mutexName) } catch {}
+        if (-not $mutex) { try { $mutex = New-Object System.Threading.Mutex($false, $mutexName) } catch { $mutex = $null } }
+        if ($mutex) { try { $owned = $mutex.WaitOne(1000) } catch { $owned = $false } }
+        try {
+            $lines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+            if (-not $lines) { return }
+            # Pre-build the set of App Execution Alias base names across ALL user
+            # profiles -- an 'A' entry is orphaned only if the stub AND every
+            # alias are gone (a surviving per-user alias means the Store app is
+            # still installed for that user). Mirrors Get-GmSystemCompatExclusions'
+            # WindowsApps reparse scan.
+            $aliasBases = @{}
+            try {
+                if (Test-Path "C:\Users") {
+                    Get-ChildItem -Path "C:\Users" -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                        try {
+                            $ad = Join-Path $_.FullName "AppData\Local\Microsoft\WindowsApps"
+                            if (-not (Test-Path $ad)) { return }
+                            Get-ChildItem -Path $ad -Filter "*.exe" -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                                try { if ($_.Attributes.ToString() -match "ReparsePoint") { $aliasBases[$_.Name.ToLower()] = $true } } catch {}
+                            }
+                        } catch {}
+                    }
+                }
+            } catch {}
+            $kept = @()
+            $dropped = 0
+            foreach ($ln in $lines) {
+                if (-not $ln) { continue }
+                $p = $ln -split '\|'
+                if ($p.Count -lt 4) { $kept += $ln; continue }
+                $rsn = if ($p.Count -ge 5 -and $p[4]) { $p[4] } else { '?' }
+                # Only prune install-time AppX/Store-stub drops (reason 'A').
+                # Runtime C/G/P entries are governed by gmproxy.c's 30-day stale
+                # drop -- never prune them here.
+                if ($rsn -ne 'A') { $kept += $ln; continue }
+                $base = $p[0]
+                $stubExists = (Test-Path ("C:\Windows\" + $base)) -or (Test-Path ("C:\Windows\System32\" + $base))
+                $aliasExists = $aliasBases.ContainsKey($base.ToLower())
+                if ($stubExists -or $aliasExists) {
+                    $kept += $ln
+                } else {
+                    $dropped++
+                }
+            }
+            if ($dropped -gt 0) {
+                $tmp = "$GodModeAutoExcludeFile.tmp"
+                $content = ($kept | ForEach-Object { $_ }) -join "`n"
+                if ($content) { $content += "`n" }
+                Set-Content -Path $tmp -Value $content -Encoding UTF8 -ErrorAction SilentlyContinue
+                if (Test-Path $tmp) {
+                    Move-Item -Path $tmp -Destination $GodModeAutoExcludeFile -Force -ErrorAction SilentlyContinue
+                }
+                # Invalidate the Test-GmAutoExcluded 15s cache so the next
+                # consult re-reads the pruned store immediately.
+                $script:GmAutoExcludeCache = $null
+                $script:GmAutoExcludeCacheDt = $null
+                Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "INFO" -Message "Pruned $dropped orphaned 'A' AppX entries (Store app uninstalled)"
+            }
+        } finally {
+            if ($owned -and $mutex) { try { $mutex.ReleaseMutex() } catch {} }
+            if ($mutex) { try { $mutex.Close() } catch {} }
+        }
+    } catch {
+        Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "WARN" -Message "Failed: $_"
+    }
+    Write-DebugLog -FunctionName "Invoke-GmAutoExcludeReconcile" -Action "EXIT"
 }
 
 function Enable-DangerousMode {
@@ -4866,6 +4967,61 @@ function Get-GmSystemCompatExclusions {
             } catch {}
         }
     } catch {}
+
+    # --- AppX (4): direct filesystem scan of C:\Program Files\WindowsApps
+    #     (catches packages Get-AppxPackage misses on accounts where the package
+    #     isn't registered/listed -- e.g. the Win11 Store Notepad on an admin
+    #     account where per-user Get-AppxPackage returns nothing and -AllUsers
+    #     surfaces a stale/empty list). The dir is TrustedInstaller-ACL'd but
+    #     admin can usually enumerate the package dirs + read AppXManifest.xml;
+    #     any access denial is swallowed (fail-open -> that package is just not
+    #     classified, same as today). Mirrors the Get-AppxPackage manifest
+    #     Executable= regex. This is the dynamic safety net for the classic
+    #     Win11 stubs that sources (1)-(3) miss on some VMs.
+    try {
+        $waRoot = "C:\Program Files\WindowsApps"
+        if (Test-Path $waRoot) {
+            Get-ChildItem -Path $waRoot -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    $manifestPath = Join-Path $_.FullName "AppXManifest.xml"
+                    if (-not (Test-Path $manifestPath)) { return }
+                    $manifest = Get-Content $manifestPath -Raw -ErrorAction SilentlyContinue
+                    if (-not $manifest) { return }
+                    $exeMatches = [regex]::Matches($manifest, 'Executable="([^"]+\.exe)"', 'IgnoreCase')
+                    foreach ($em in $exeMatches) {
+                        $b = [System.IO.Path]::GetFileName($em.Groups[1].Value)
+                        if ($b) { $appx[$b.ToLower()] = $true }
+                    }
+                } catch {}
+            }
+        }
+    } catch {}
+
+    # --- AppX (5): curated Win11 Store-redirector stub fallback. Sources
+    #     (1)-(4) can ALL miss the classic Win11 stubs (notepad/mspaint/calc/
+    #     snippingtool) on a VM where the package isn't registered for the
+    #     running account, the user's WindowsApps has no alias, AND the
+    #     WindowsApps dir ACL denies the manifest read. These are a FIXED,
+    #     KNOWN set of Win11 apps Microsoft replaced with Store versions:
+    #     C:\Windows\<name> (or System32) is a small redirector stub that
+    #     activates the Store app via App Paths / package activation, which
+    #     gmproxy's IFEO-bypass RENAME breaks (exit 0, no window, token-
+    #     independent) -- the exact "notepad doesn't start" symptom. Validate
+    #     each by Test-Path so a name absent on this VM is NOT classified, and
+    #     only add a name not already detected dynamically. This is the safety
+    #     net that makes the classic Win11 stubs launch natively as the user
+    #     even when all dynamic detection misses them -- the actual fix for
+    #     "notepad still does not start". Consistent with the existing curated
+    #     $IfeoElevationApps seed (a curated name list is an established idiom
+    #     here; the Test-Path gate keeps it honest per-VM).
+    $win11StubNames = @("notepad.exe","mspaint.exe","calc.exe","snippingtool.exe")
+    foreach ($stub in $win11StubNames) {
+        $k = $stub.ToLower()
+        if ($appx.ContainsKey($k)) { continue }
+        if ((Test-Path ("C:\Windows\" + $stub)) -or (Test-Path ("C:\Windows\System32\" + $stub))) {
+            $appx[$k] = $true
+        }
+    }
 
     # --- Browsers: registered StartMenuInternet client executables ---
     try {
@@ -6327,6 +6483,7 @@ function Start-Monitoring {
     $lastKillCheck = [datetime]::MinValue
     $lastExistingElevate = [datetime]::MinValue
     $lastPidCleanup = [datetime]::MinValue
+    $lastReconcile = [datetime]::MinValue
     $loopCount = 0
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
@@ -6478,6 +6635,18 @@ function Start-Monitoring {
                         }
                     } catch { }
                 }
+            }
+
+            # --- Auto-exclude store reconciliation (every 5 minutes): drop
+            #     orphaned install-time AppX/Store-stub entries (reason 'A')
+            #     whose stub + alias no longer exist (the Store app was
+            #     uninstalled), so the store stays tidy instead of carrying a
+            #     stale excluded=1 entry for up to 30 days. Never touches
+            #     runtime C/G/P entries (those are governed by gmproxy.c's
+            #     30-day stale drop). Fail-open. ---
+            if ((Get-Date) - $lastReconcile -gt [TimeSpan]::FromMinutes(5)) {
+                $lastReconcile = Get-Date
+                $null = Invoke-GmAutoExcludeReconcile
             }
 
             # --- Periodic Existing Process Elevation: Re-elevate every 15 seconds ---

@@ -554,7 +554,15 @@ static void GmProxyAutoExcludeRecord(const wchar_t* baseName, wchar_t reason) {
     entries[idx].crashCount++;
     entries[idx].lastCrashTs = now;
     entries[idx].excluded = (entries[idx].crashCount >= GM_AUTOEXCLUDE_THRESHOLD);
-    entries[idx].reason = reason;   /* latest refusal flavor (overwrite) */
+    /* Preserve an install-time 'A' (AppX/Store-redirector stub drop by Detector
+       A in God-Mode-Windows.ps1): it is more specific than a runtime 'G'/'C'
+       and a stub that slips past Detector A must NOT lose its 'A' (the
+       Export-GodModeLogs legend + the Invoke-GmAutoExcludeReconcile 'A'-only
+       prune key on it). Only overwrite the stored reason when it is not 'A'.
+       Fail-open (the count/ts/excluded fields still update normally). */
+    if (entries[idx].reason != L'A') {
+        entries[idx].reason = reason;   /* latest refusal flavor (overwrite) */
+    }
     GmProxyAutoExcludeWrite(entries, n);
     GmProxyAutoExcludeMutexRelease();
 }
@@ -1255,7 +1263,8 @@ int wmain(int argc, wchar_t* argv[]) {
     // checks IFEO again and launches gmproxy.exe recursively. To prevent this,
     // create a hardlink with a unique name in the same directory. IFEO keys are
     // matched by exact filename, so chrome.exe.gmproxy won't trigger IFEO.
-    // If hardlink fails (different volume), fall back to CopyFile in TEMP.
+    // If hardlink fails, try a same-directory COPY (current token, then SYSTEM
+    // impersonation for ACL-protected dirs), then fall back to CopyFile in TEMP.
     const wchar_t* baseName = wcsrchr(argv[1], L'\\');
     if (baseName) baseName++; else baseName = argv[1];
 
@@ -1269,10 +1278,37 @@ int wmain(int argc, wchar_t* argv[]) {
 
     BOOL usedHardlink = CreateHardLinkW(hardlinkPath, argv[1], NULL);
     if (!usedHardlink) {
-        wchar_t tempDir[MAX_PATH] = {0};
-        GetTempPathW(MAX_PATH, tempDir);
-        swprintf(hardlinkPath, MAX_PATH, L"%ls\\gmproxy_%lu_%ls", tempDir, GetCurrentProcessId(), baseName);   /* %ls: wide tempDir + baseName */
+        /* Same-directory COPY fallback (Suggestion 3): keeps the app's
+           canonical-directory context (sibling DLLs/resources) for path-
+           relative targets whose hardlink fails -- e.g. a hardlink-hostile
+           filesystem on a writable Program Files dir, or a C:\Windows /
+           System32 target the admin user can't hardlink into. Try the same-
+           dir copy under gmproxy's current token first; if that fails AND a
+           SYSTEM token was acquired (haveToken), impersonate the stolen SYSTEM
+           token (DuplicateTokenEx -> TokenImpersonation) so CopyFileW can
+           write into ACL-protected dirs (C:\Windows / System32) the admin
+           user cannot. RevertToSelf immediately after so the rest of gmproxy
+           runs under its own token. Only if both fail, fall back to a Temp
+           copy (the prior behavior). Fail-open: every failure path falls
+           through to Temp so the launch never regresses. The existing
+           DeleteFileW(hardlinkPath) cleanup below covers the same-dir copy. */
         usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
+        if (!usedHardlink && haveToken && hPrimary) {
+            HANDLE hImp = NULL;
+            if (DuplicateTokenEx(hPrimary, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenImpersonation, &hImp) && hImp) {
+                if (ImpersonateLoggedOnUser(hImp)) {
+                    usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
+                    RevertToSelf();
+                }
+                CloseHandle(hImp);
+            }
+        }
+        if (!usedHardlink) {
+            wchar_t tempDir[MAX_PATH] = {0};
+            GetTempPathW(MAX_PATH, tempDir);
+            swprintf(hardlinkPath, MAX_PATH, L"%ls\\gmproxy_%lu_%ls", tempDir, GetCurrentProcessId(), baseName);   /* %ls: wide tempDir + baseName */
+            usedHardlink = CopyFileW(argv[1], hardlinkPath, FALSE);
+        }
     }
 
     if (!usedHardlink) {
