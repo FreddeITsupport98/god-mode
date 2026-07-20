@@ -6744,6 +6744,11 @@ function Start-Monitoring {
     # Critical processes that must never be re-elevated by the periodic loop.
     # Defined here so it is in scope for the periodic elevation block below.
     $CriticalProcs = @("csrss.exe", "lsass.exe", "services.exe", "smss.exe", "winlogon.exe", "wininit.exe", "svchost.exe", "taskhostw.exe", "sihost.exe", "dwm.exe", "fontdrvhost.exe", "Memory Compression", "Registry", "System", "Secure System", "powershell.exe", "pwsh.exe", "cmd.exe", "powershell_ise.exe", "conhost.exe", "explorer.exe", "ShellHost.exe", "ctfmon.exe", "VBoxTray.exe", "ApplicationFrameHost.exe", "RuntimeBroker.exe", "SearchIndexer.exe", "SearchProtocolHost.exe")
+    # Interactive shells -- the WMI process-creation watcher's actual targets.
+    # CriticalProcs (above) lists them so the 15s periodic scan SKIPs them (no
+    # kill+relaunch), but the event-driven + 5s-polling drains MUST still elevate
+    # them in-place. $shellNames exempts them from the CriticalProcs guard below.
+    $shellNames = @("cmd.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe")
 
     $lastElevated = @{}   # Process path -> last elevated time (for startup/periodic scans)
     $lastElevatedPid = @{} # Process ID -> elevated time (for new process detection)
@@ -6785,9 +6790,31 @@ function Start-Monitoring {
             # --- Fast event-driven elevation: drain WMI process-creation queue ---
             if ($script:ProcessCreationWatcherActive -and $script:ProcessCreationQueue -ne $null -and $script:ProcessCreationQueue.Count -gt 0) {
                 while ($script:ProcessCreationQueue.Count -gt 0) {
-                    $evt = $null
-                    [void]$script:ProcessCreationQueue.TryDequeue([ref]$evt)
+                    # $script:ProcessCreationQueue is a Synchronized ArrayList (see
+                    # init at top of file), NOT a Queue/ConcurrentQueue -- it has NO
+                    # TryDequeue method. The earlier TryDequeue call here threw on
+                    # every tick once the PS7 Register-ObjectEvent fix actually
+                    # started populating the queue (the registration bug had masked
+                    # it: the queue was always empty, so TryDequeue was never
+                    # called). The throw was caught by the loop's catch -> 5s sleep
+                    # -> retry -> throw again, so the watcher enqueued shells but the
+                    # drain never dequeued them and no shell was ever elevated. Use
+                    # the [0]+RemoveAt(0) pattern (same as GmProxyFeedbackQueue and
+                    # IfeoNewAppQueue drains below).
+                    $evt = $script:ProcessCreationQueue[0]
+                    $script:ProcessCreationQueue.RemoveAt(0)
                     if ($evt -and $evt.ProcessId -gt 0 -and $evt.ExecutablePath -and $evt.ExecutablePath -like "*.exe") {
+                        $procBase = [System.IO.Path]::GetFileName($evt.ExecutablePath)
+                        # Guard: never in-place-swap truly-critical desktop processes
+                        # (dwm/explorer/conhost/ctfmon/ShellHost/...) -- swapping
+                        # explorer/dwm to SYSTEM breaks the taskbar/desktop. But DO
+                        # elevate the interactive shells ($shellNames exempts them
+                        # from this guard). Non-shell non-critical apps are left to
+                        # the 15s periodic scan; auto-excluded apps (AppX stubs the
+                        # store learned are SYSTEM-incompatible) are skipped too,
+                        # mirroring the periodic scan guards at L6941/L6945.
+                        if (($CriticalProcs -contains $procBase) -and ($shellNames -notcontains $procBase)) { continue }
+                        if (Test-GmAutoExcluded $procBase) { continue }
                         $path = $evt.ExecutablePath
                         $arguments = $evt.Arguments
                         if (-not $lastElevatedPid.ContainsKey($evt.ProcessId)) {
@@ -7003,6 +7030,13 @@ function Start-Monitoring {
 
         foreach ($proc in $newProcesses) {
             if ($proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe") {
+                $pollBase = [System.IO.Path]::GetFileName($proc.ExecutablePath)
+                # Same guard as the WMI watcher drain: never in-place-swap critical
+                # desktop processes (dwm/explorer/conhost/...) but DO elevate the
+                # interactive shells ($shellNames exempts them); skip auto-excluded
+                # AppX stubs too -- mirrors the periodic scan guards at L6941/L6945.
+                if (($CriticalProcs -contains $pollBase) -and ($shellNames -notcontains $pollBase)) { continue }
+                if (Test-GmAutoExcluded $pollBase) { continue }
                 $path = $proc.ExecutablePath
                 $arguments = ""
                 if ($proc.CommandLine) {

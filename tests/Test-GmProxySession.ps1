@@ -786,4 +786,31 @@ Add-Assertion "PS7 WMI: defensive Add-Type System.Management (assembly load)" ($
 Add-Assertion "PS7 WMI: Start-Monitoring registers the watcher (persistent SYSTEM monitor)" ($gm -match 'function\s+Start-Monitoring[\s\S]{0,8000}?\$null = Register-ProcessCreationWatcher') "Start-Monitoring does NOT call Register-ProcessCreationWatcher -- the watcher was only registered in Enable-GodMode (one-shot, exits) so the persistent monitor's event-driven shell elevator is dead"
 Add-Assertion "PS7 WMI: Unregister-ProcessCreationWatcher tears down the event subscription + job" ($gm -match 'function\s+Unregister-ProcessCreationWatcher[\s\S]{0,2000}?Unregister-Event -SourceIdentifier ''GMProcessCreationWatcher''') "Unregister-ProcessCreationWatcher does not Unregister-Event the subscription -- re-registration / Disable-GodMode would leak the event job"
 
+# --- 31. WMI watcher drain ArrayList-dequeue fix + CriticalProcs/shell guards
+# (2026-07-20) ---
+# Two residual bugs after the PS7 Register-ObjectEvent fix (section 30) kept
+# interactive shells from elevating even though the watcher now registered:
+# (1) the Start-Monitoring drain called $script:ProcessCreationQueue.TryDequeue
+#     on a Synchronized ARRAYLIST (it has no TryDequeue method). The PS7
+#     registration bug had MASKED this -- the queue was always empty so
+#     TryDequeue was never reached. Once Register-ObjectEvent actually
+#     populated the queue, TryDequeue threw every tick, was caught by the
+#     loop's catch (5s sleep + retry), and the drain NEVER dequeued -- shells
+#     were enqueued by the watcher but never elevated. Fix: [0]+RemoveAt(0)
+#     (same pattern as GmProxyFeedbackQueue / IfeoNewAppQueue).
+# (2) neither the event drain nor the 5s polling fallback had a CriticalProcs
+#     skip (unlike the 15s periodic scan), so once the drain worked it would
+#     in-place-swap explorer.exe/dwm.exe/conhost.exe to SYSTEM and break the
+#     desktop. Fix: skip CriticalProcs EXCEPT the interactive shells
+#     ($shellNames exempts them -- they are the watcher's targets) and skip
+#     auto-excluded AppX stubs (Test-GmAutoExcluded), mirroring the periodic
+#     scan guards at L6941/L6945.
+Add-Assertion "Drain fix: NO TryDequeue on `$script:ProcessCreationQueue (ArrayList has no such method)" (-not $gm.Contains('ProcessCreationQueue.TryDequeue')) "WMI watcher drain still calls TryDequeue on the Synchronized ArrayList -- throws every tick once the queue is populated, caught by the loop catch, never drains (shells enqueued but never elevated)"
+Add-Assertion "Drain fix: uses [0] + RemoveAt(0) (ArrayList-safe dequeue)" ($gm.Contains('$script:ProcessCreationQueue[0]') -and $gm.Contains('$script:ProcessCreationQueue.RemoveAt(0)')) "WMI watcher drain does not use the [0]+RemoveAt(0) ArrayList dequeue pattern -- the drain cannot remove queued shell PIDs"
+Add-Assertion "Drain guard: `$shellNames defined in Start-Monitoring (cmd/powershell/pwsh/ISE)" ($gm.Contains('$shellNames = @("cmd.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe")')) "Start-Monitoring missing `$shellNames -- the CriticalProcs-except-shells guard cannot exempt interactive shells"
+Add-Assertion "Drain guard: event drain skips CriticalProcs except shells (`$shellNames -notcontains `$procBase)" ($gm.Contains('($CriticalProcs -contains $procBase) -and ($shellNames -notcontains $procBase)')) "WMI watcher drain has no CriticalProcs-except-shells guard -- explorer/dwm/conhost would be in-place-swapped to SYSTEM (desktop break)"
+Add-Assertion "Drain guard: event drain skips auto-excluded apps (Test-GmAutoExcluded `$procBase)" ($gm.Contains('if (Test-GmAutoExcluded $procBase)')) "WMI watcher drain does not consult Test-GmAutoExcluded -- an auto-excluded AppX stub could be kill+relaunched (breaks the stub)"
+Add-Assertion "Drain guard: 5s polling skips CriticalProcs except shells (`$shellNames -notcontains `$pollBase)" ($gm.Contains('($CriticalProcs -contains $pollBase) -and ($shellNames -notcontains $pollBase)')) "5s polling fallback has no CriticalProcs-except-shells guard -- explorer/dwm would be in-place-swapped when the watcher is down"
+Add-Assertion "Drain guard: 5s polling skips auto-excluded apps (Test-GmAutoExcluded `$pollBase)" ($gm.Contains('if (Test-GmAutoExcluded $pollBase)')) "5s polling fallback does not consult Test-GmAutoExcluded -- an auto-excluded AppX stub could be kill+relaunched"
+
 Write-Summary
