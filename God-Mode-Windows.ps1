@@ -33,7 +33,9 @@ param (
     [switch]$InstallSystemDesktop,
     [switch]$UninstallSystemDesktop,
     [switch]$DebugMode,
-    [switch]$LaunchTaskMgrAsSystem
+    [switch]$LaunchTaskMgrAsSystem,
+    [switch]$LaunchShellAsSystem,
+    [string]$Shell = ""
 )
 
 # ============================================================================
@@ -58,6 +60,10 @@ if ($PSVersionTable.PSVersion.Major -le 5) {
             }
         }
         if ($Bound) { $ArgList += $Bound }
+        # Forward string params (the switch loop above only handles switches).
+        # -Shell pairs with -LaunchShellAsSystem; lose it across a PS5->PS7
+        # relaunch and the on-demand SYSTEM shell defaults to powershell.
+        if ($PSBoundParameters.ContainsKey('Shell') -and $Shell) { $ArgList += @("-Shell", $Shell) }
         Start-Process -FilePath $Pwsh7.Source -ArgumentList $ArgList -Wait -NoNewWindow
         Exit
     }
@@ -93,8 +99,10 @@ if (-not $Principal.IsInRole($Role)) {
         if ($ExportElevationDiagnostics) { $ArgsString += " -ExportElevationDiagnostics" }
         if ($ElevateAllProcesses) { $ArgsString += " -ElevateAllProcesses" }
         if ($LaunchTaskMgrAsSystem) { $ArgsString += " -LaunchTaskMgrAsSystem" }
+        if ($LaunchShellAsSystem) { $ArgsString += " -LaunchShellAsSystem" }
+        if ($PSBoundParameters.ContainsKey('Shell') -and $Shell) { $ArgsString += " -Shell $Shell" }
 
-        $ProcessInfo.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" $ArgsString"
+        $ProcessInfo.Arguments = " -NoProfile -ExecutionPolicy Bypass -File `$PSCommandPath`" $ArgsString"
         $ProcessInfo.Verb = "runAs"
         $ProcessInfo.UseShellExecute = $true
         [System.Diagnostics.Process]::Start($ProcessInfo) | Out-Null
@@ -2427,6 +2435,95 @@ function Start-ProcessWithStolenToken {
         }
     } catch {
         Write-DebugLog -FunctionName "Start-ProcessWithStolenToken" -Action "ERROR" -Message "Unhandled exception: $($_.Exception.Message)" -ErrorRecord $_
+        return $false
+    }
+}
+
+function Start-SystemShell {
+    # On-demand interactive SYSTEM shell launcher (CLI -LaunchShellAsSystem +
+    # menu [19]). Mirrors the -LaunchTaskMgrAsSystem path: steals a Session>0
+    # SYSTEM token via CreateProcessWithTokenW ([TokenOps]::CreateProcessFromToken)
+    # -- which only requires SeImpersonatePrivilege (held by an interactive
+    # Administrator), NOT SeAssignPrimaryTokenPrivilege -- and births the shell
+    # in the active console session so it is visible + interactive (whoami ->
+    # nt authority\system). The monitor's WMI watcher / 5s polling will see the
+    # new shell, but Monitor-ElevateProcess's Test-PidIsSystem guard skips the
+    # redundant SYSTEM->SYSTEM in-place swap. Fail-open: on any SYSTEM-token
+    # failure, fall back to a normal (non-SYSTEM) launch so the user still gets
+    # a shell.
+    param([string]$ShellName = "powershell")
+    Write-DebugLog -FunctionName "Start-SystemShell" -Action "ENTRY" -Message "ShellName=$ShellName"
+    # Normalize + validate the shell name (default powershell on any unknown value).
+    $validShells = @("cmd","powershell","pwsh","ise")
+    $shellKey = "$ShellName".Trim().ToLower()
+    if ($validShells -notcontains $shellKey) {
+        Write-Log -Message "Start-SystemShell: unknown shell '$ShellName'; defaulting to powershell." -Type "WARN" -Color Yellow
+        $shellKey = "powershell"
+    }
+    # Resolve the shell executable path.
+    $shellExe = ""
+    switch ($shellKey) {
+        "cmd"        { $shellExe = Join-Path $env:WINDIR "System32\cmd.exe" }
+        "powershell" { $shellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe" }
+        "ise"        { $shellExe = Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell_ise.exe" }
+        "pwsh" {
+            $shellExe = Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe"
+            if (-not (Test-Path $shellExe)) {
+                $alt = "C:\Program Files\PowerShell\7\pwsh.exe"
+                if (Test-Path $alt) { $shellExe = $alt }
+            }
+        }
+    }
+    if (-not $shellExe -or -not (Test-Path $shellExe)) {
+        Write-Log -Message "Start-SystemShell: shell executable not found for '$shellKey' ($shellExe)." -Type "ERROR" -Color Red
+        Write-Host "[ERROR] Shell executable not found: $shellExe" -ForegroundColor Red
+        return $false
+    }
+    Enable-ElevationPrivileges
+    # CreateProcessWithTokenW is serviced by seclogon; ensure it is running so the
+    # SYSTEM launch does not silently fall back to an unelevated start (mirrors
+    # -LaunchTaskMgrAsSystem). Best-effort.
+    try {
+        $seclogon = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+        if ($seclogon) {
+            if ($seclogon.StartType -eq 'Disabled') {
+                Set-Service -Name seclogon -StartupType Manual -ErrorAction SilentlyContinue
+                Write-DebugLog -FunctionName "Start-SystemShell" -Action "INFO" -Message "seclogon was Disabled; set to Manual"
+            }
+            if ($seclogon.Status -ne 'Running') {
+                Start-Service -Name seclogon -ErrorAction SilentlyContinue
+                Write-DebugLog -FunctionName "Start-SystemShell" -Action "INFO" -Message "seclogon start attempted"
+            }
+        }
+    } catch {
+        Write-DebugLog -FunctionName "Start-SystemShell" -Action "WARN" -Message "seclogon ensure failed: $($_.Exception.Message)"
+    }
+    $systemPid = Find-SystemProcessCandidate
+    if ($systemPid -ne 0) {
+        # Visible ($false) -- this is an INTERACTIVE shell the user wants to see.
+        $result = [TokenOps]::CreateProcessFromToken($systemPid, $shellExe, $shellExe, $false)
+        if ($result -eq 0) {
+            Write-Log -Message "$shellKey shell launched as SYSTEM (token source PID=$systemPid): $shellExe" -Type "INFO" -Color Green
+            Write-Host "[SUCCESS] $shellKey launched as SYSTEM. Run 'whoami' in it -> nt authority\system." -ForegroundColor Green
+            Write-DebugLog -FunctionName "Start-SystemShell" -Action "EXIT" -Message "Success $shellKey PID-source=$systemPid"
+            return $true
+        } else {
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessWithTokenW"
+            Write-Log -Message "$shellKey SYSTEM launch failed (error $($result): $($errMsg)). Falling back to normal launch." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Start-SystemShell" -Action "WARN" -Message "CreateProcessFromToken error=$result | $errMsg"
+        }
+    } else {
+        Write-Log -Message "Start-SystemShell: no SYSTEM token available (Find-SystemProcessCandidate=0); falling back to normal launch." -Type "WARN" -Color Yellow
+    }
+    # Fallback: normal (non-SYSTEM) launch so the user still gets a shell.
+    try {
+        Start-Process $shellExe
+        Write-Host "[WARN] Fell back to a normal (non-SYSTEM) $shellKey launch." -ForegroundColor Yellow
+        Write-DebugLog -FunctionName "Start-SystemShell" -Action "EXIT" -Message "Fallback normal launch for $shellKey"
+        return $false
+    } catch {
+        Write-Log -Message "Start-SystemShell: fallback Start-Process failed: $_" -Type "ERROR" -Color Red
+        Write-DebugLog -FunctionName "Start-SystemShell" -Action "ERROR" -Message "Fallback Start-Process exception: $($_.Exception.Message)"
         return $false
     }
 }
@@ -5786,6 +5883,26 @@ function Test-SystemProcessExists {
     return $false
 }
 
+function Test-PidIsSystem {
+    # Per-PID SYSTEM check (fail-open): returns $true ONLY when the process is
+    # confirmed running as SYSTEM. Any query/parse failure -> $false so the
+    # caller (Monitor-ElevateProcess) still proceeds with elevation and never
+    # strands a shell on a transient WMI hiccup. Used to skip a redundant
+    # SYSTEM->SYSTEM in-place token swap on a shell that is ALREADY SYSTEM --
+    # e.g. one launched on demand via -LaunchShellAsSystem / menu [19] with
+    # CreateProcessFromToken (the monitor's WMI watcher + 5s polling will still
+    # see the new shell, but Test-PidIsSystem short-circuits the re-elevation).
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $p = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue
+        if (-not $p) { return $false }
+        $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+        if ($owner -and $owner.User -eq "SYSTEM") { return $true }
+    } catch {}
+    return $false
+}
+
 function Stop-NonSystemInstances {
     param([string]$ProcessName)
     try {
@@ -5793,6 +5910,14 @@ function Stop-NonSystemInstances {
         if ($procs) {
             foreach ($p in $procs) {
                 try {
+                    # Never kill God Mode's OWN plumbing shells (scheduled-task /
+                    # Run-key / temp-copy launches of this script carrying
+                    # -ToggleOn/-ElevateAllProcesses/-SystemDesktop/GodMode.ps1)
+                    # even if momentarily non-SYSTEM -- defense-in-depth alongside
+                    # Monitor-ElevateProcess's Test-GmPlumbingShell consult, so a
+                    # purge called from ANY path (Phase 1/2 fallback, periodic scan)
+                    # can never take down the monitor/watchdog/guardian plumbing.
+                    if (Test-GmPlumbingShell -ProcessId $p.ProcessId) { continue }
                     $owner = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
                     # Blank/unresolvable owner (common in the brief window right after an IFEO/gmproxy
                     # launch, before WMI can resolve the new logon session) must NOT be treated as
@@ -6683,7 +6808,7 @@ function Test-GmPlumbingShell {
         if ($cmd -match 'GodMode_SystemDesktop') { return $true }
         # Distinctive GodMode CLI flags (param block). Unique enough that a normal
         # user interactive shell would never carry them.
-        $gmFlags = @('-ToggleOn','-ToggleOff','-ElevateAllProcesses','-SystemDesktop','-InstallSystemDesktop','-UninstallSystemDesktop','-GodModeStatus','-LaunchTaskMgrAsSystem','-InstallGodMode','-UninstallGodMode','-DumpLogs','-ExportElevationDiagnostics')
+        $gmFlags = @('-ToggleOn','-ToggleOff','-ElevateAllProcesses','-SystemDesktop','-InstallSystemDesktop','-UninstallSystemDesktop','-GodModeStatus','-LaunchTaskMgrAsSystem','-LaunchShellAsSystem','-InstallGodMode','-UninstallGodMode','-DumpLogs','-ExportElevationDiagnostics')
         foreach ($f in $gmFlags) {
             if ($cmd -like "*$f*") { return $true }
         }
@@ -6727,6 +6852,15 @@ function Monitor-ElevateProcess {
             Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "SKIP" -Message "$procName PID=$ProcessId is God Mode plumbing shell; leaving token untouched (no mid-flight swap)"
             return $true
         }
+        # Already-SYSTEM shell (e.g. launched on demand via -LaunchShellAsSystem /
+        # menu [19] with CreateProcessFromToken): skip the in-place swap -- a
+        # SYSTEM->SYSTEM ReplaceProcessTokenForPid is redundant and could race on
+        # an already-running SYSTEM process. Fail-open (Test-PidIsSystem returns
+        # $false on any query failure -> elevation proceeds as before).
+        if ($ProcessId -gt 0 -and (Test-PidIsSystem -ProcessId $ProcessId)) {
+            Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "SKIP" -Message "$procName PID=$ProcessId is already SYSTEM; leaving token untouched (no redundant swap)"
+            return $true
+        }
         # Fall through to Phase 0 in-place token replacement (skip the purge branch).
     } else {
         if (Test-SystemProcessExists -ProcessName "$procName.exe" -InteractiveOnly) {
@@ -6762,10 +6896,21 @@ function Monitor-ElevateProcess {
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
-            $result = [TokenOps]::CreateProcessAsSystem($systemPid, $Path, $cmdLine, [bool]$HideWindow)
+            # Interactive shells must be VISIBLE (the user wants to see the shell);
+            # $HideWindow comes from the drain calls and would hide a fallback
+            # SYSTEM shell. Non-shell apps honor the caller's HideWindow.
+            $launchHidden = [bool]$HideWindow -and -not $isInteractiveShell
+            $result = [TokenOps]::CreateProcessAsSystem($systemPid, $Path, $cmdLine, $launchHidden)
             if ($result -eq 0) {
                 Start-Sleep -Milliseconds 500
-                Stop-NonSystemInstances -ProcessName "$procName.exe"
+                if ($isInteractiveShell) {
+                    # Shells: kill ONLY the specific admin instance that failed
+                    # in-place elevation (Phase 0) -- NOT every non-SYSTEM sibling,
+                    # which would take down the user's other admin/SYSTEM shells.
+                    if ($ProcessId -gt 0) { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue }
+                } else {
+                    Stop-NonSystemInstances -ProcessName "$procName.exe"
+                }
                 Write-Log -Message "Monitor elevated: $procName (direct token + active session)" -Type "INFO" -Color Gray
                 Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
                 return $true
@@ -6775,11 +6920,19 @@ function Monitor-ElevateProcess {
         }
     }
     # --- Phase 2: Service-based elevation (last resort) ---
-    $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$HideWindow
+    # Interactive shells: visible (HideWindow forced off) + targeted kill of only
+    # the failed in-place instance (same rationale as Phase 1 -- never purge the
+    # user's other admin/SYSTEM shells).
+    $svcHidden = [bool]$HideWindow -and -not $isInteractiveShell
+    $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$svcHidden
     if ($elevated) {
-        # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
         Start-Sleep -Milliseconds 500
-        Stop-NonSystemInstances -ProcessName "$procName.exe"
+        if ($isInteractiveShell) {
+            if ($ProcessId -gt 0) { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue }
+        } else {
+            # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
+            Stop-NonSystemInstances -ProcessName "$procName.exe"
+        }
         Write-Log -Message "Monitor elevated: $procName (service + purge)" -Type "INFO" -Color Gray
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
     } else {
@@ -8211,6 +8364,18 @@ if ($LaunchTaskMgrAsSystem) {
     Write-DebugLog -FunctionName "CLI-LaunchTaskMgrAsSystem" -Action "EXIT"
     Exit
 }
+if ($LaunchShellAsSystem) {
+    Write-DebugLog -FunctionName "CLI-LaunchShellAsSystem" -Action "ENTRY"
+    if (-not (Test-BuiltInAdmin)) {
+        $sidInfo = Get-CurrentUserSidInfo
+        Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can launch a SYSTEM shell.`n" -ForegroundColor Red
+        Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
+        return
+    }
+    $null = Start-SystemShell -ShellName $Shell
+    Write-DebugLog -FunctionName "CLI-LaunchShellAsSystem" -Action "EXIT"
+    return
+}
 if ($SystemDesktop) {
     Start-SystemDesktopExplorer
     Exit
@@ -8324,8 +8489,10 @@ Write-Host "[14] INSTALL/ENABLE PROCESS HOOK (gmhook.dll)" -ForegroundColor Cyan
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "[18] RESET AUTO-EXCLUDE STORE (clear gmproxy SYSTEM-crash learnings)" -ForegroundColor Cyan
     Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "[19] LAUNCH SHELL AS SYSTEM (cmd/powershell/pwsh/ise)" -ForegroundColor Magenta
+    Write-Host "-----------------------------------------------------" -ForegroundColor DarkGray
 
-    $Choice = Read-Host "Select an administrative action (1-18)"
+    $Choice = Read-Host "Select an administrative action (1-19)"
     $IntegrityStatus = Test-IntegrityStatus
 
     switch ($Choice) {
@@ -8482,6 +8649,23 @@ Write-Host "[14] INSTALL/ENABLE PROCESS HOOK (gmhook.dll)" -ForegroundColor Cyan
         }
         "18" {
             Reset-GmProxyAutoExcludeStore
+            Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        }
+        "19" {
+            if (-not (Test-BuiltInAdmin)) {
+                $sidInfo = Get-CurrentUserSidInfo
+                Write-Host "`n[ACCESS DENIED] Only the Built-in Administrator (SID ending in -500) can launch a SYSTEM shell.`n" -ForegroundColor Red
+                Write-Host "Your SID: $($sidInfo.SID) | IsAdmin: $($sidInfo.IsAdmin) | IsBuiltInAdmin: $($sidInfo.IsBuiltInAdmin)" -ForegroundColor Yellow
+            } else {
+                Write-Host "`nLaunch an interactive shell as NT AUTHORITY\SYSTEM (whoami -> nt authority\system)." -ForegroundColor Cyan
+                Write-Host "  1) cmd" -ForegroundColor Gray
+                Write-Host "  2) powershell (default)" -ForegroundColor Gray
+                Write-Host "  3) pwsh (PowerShell 7)" -ForegroundColor Gray
+                Write-Host "  4) powershell_ise" -ForegroundColor Gray
+                $shellChoice = Read-Host "Select shell (1-4, default 2)"
+                $shellName = switch ($shellChoice) { "1" {"cmd"} "3" {"pwsh"} "4" {"ise"} default {"powershell"} }
+                $null = Start-SystemShell -ShellName $shellName
+            }
             Write-Host "`n[ PRESS ANY KEY TO RETURN TO MENU ]" -ForegroundColor DarkGray; $null = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
         }
         "11" { Export-GodModeLogs; Start-Sleep -Seconds 2 }

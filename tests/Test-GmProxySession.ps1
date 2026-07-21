@@ -558,7 +558,7 @@ Add-Assertion "God-Mode-Windows.ps1: per-app modeKey normalizes hyphen (USER-AUT
 Add-Assertion "God-Mode-Windows.ps1: per-app table has USER-AUTOEXCLUDE column header" ($gm.Contains('USER-AUTOEXCLUDE')) "per-app table USER-AUTOEXCLUDE column missing"
 Add-Assertion "God-Mode-Windows.ps1: Reset-GmProxyAutoExcludeStore helper defined (menu [18])" ($gm.Contains('function Reset-GmProxyAutoExcludeStore')) "Reset-GmProxyAutoExcludeStore missing"
 Add-Assertion "God-Mode-Windows.ps1: menu offers [18] RESET AUTO-EXCLUDE STORE" ($gm.Contains('[18] RESET AUTO-EXCLUDE STORE')) "menu [18] missing"
-Add-Assertion "God-Mode-Windows.ps1: menu Read-Host range is 1-18" ($gm.Contains('Select an administrative action (1-18)')) "menu range not updated to 1-18"
+Add-Assertion "God-Mode-Windows.ps1: menu Read-Host range is 1-19" ($gm.Contains('Select an administrative action (1-19)')) "menu range not updated to 1-19"
 Add-Assertion "God-Mode-Windows.ps1: switch case 18 calls Reset-GmProxyAutoExcludeStore" ($gm.Contains('Reset-GmProxyAutoExcludeStore')) "switch case 18 does not call Reset-GmProxyAutoExcludeStore"
 Add-Assertion "God-Mode-Windows.ps1: reset helper invokes gmproxy.exe --gm-reset-autoexclude (mutex-safe)" ($gm.Contains('--gm-reset-autoexclude')) "reset helper does not use the mutex-safe gmproxy reset hook"
 
@@ -848,5 +848,52 @@ Add-Assertion "Heartbeat B: heartbeat auto-re-registers a dead watcher (Register
 Add-Assertion "Heartbeat B: heartbeat reads `$script:ProcessCreationWatcherState.Beats (delivery proof)" ($gm.Contains('$script:ProcessCreationWatcherState.Beats')) "heartbeat does not read the watcher Beats counter -- no delivery-proof liveness signal"
 Add-Assertion "Heartbeat B: `$lastWatcherHealthCheck + `$lastWatcherBeats initialized" ($gm.Contains('$lastWatcherHealthCheck = [datetime]::MinValue') -and $gm.Contains('$lastWatcherBeats = 0')) "Start-Monitoring missing $lastWatcherHealthCheck / $lastWatcherBeats -- the heartbeat timers cannot work"
 Add-Assertion "Heartbeat: `$script:ProcessCreationWatcherJob + `$script:ProcessCreationWatcherState defined" ($gm.Contains('$script:ProcessCreationWatcherJob = $null') -and $gm.Contains('$script:ProcessCreationWatcherState = [hashtable]::Synchronized')) "watcher ThreadJob job + heartbeat state vars missing -- the liveness heartbeat cannot inspect/re-register the watcher"
+
+# --- 33. On-demand SYSTEM shell (-LaunchShellAsSystem / menu [19]) + collision hardening (2026-07-21) ---
+# Final improvement batch (the four proposals left on the table when the prior
+# round was interrupted). Two were ALREADY landed in c6d3ba1 (Test-SystemProcessExists
+# -InteractiveOnly Session-0 filter + Monitor-ElevateProcess Test-GmPlumbingShell
+# consult); this section covers the remaining two + supporting hardening:
+#   A. -LaunchShellAsSystem CLI flag + -Shell <cmd|powershell|pwsh|ise> (default
+#      powershell) + menu [19]: an on-demand interactive SYSTEM shell launcher
+#      (Start-SystemShell) that mirrors -LaunchTaskMgrAsSystem -- steals a
+#      Session>0 SYSTEM token via CreateProcessWithTokenW (SeImpersonate only,
+#      held by an interactive Administrator) and births the shell visible in the
+#      active console session (whoami -> nt authority\system). Fails open to a
+#      normal launch. Gated on the Built-in Administrator (RID-500).
+#   B. Stop-NonSystemInstances gains a Test-GmPlumbingShell exemption so a purge
+#      called from ANY path can never kill God Mode's own plumbing shells.
+#   C. Monitor-ElevateProcess: an already-SYSTEM shell (the [19] on-demand launch)
+#      is skipped via Test-PidIsSystem (no redundant SYSTEM->SYSTEM swap); Phase 1
+#      + Phase 2 fallbacks for shells now kill ONLY the specific failed in-place
+#      instance (not every non-SYSTEM sibling -- preserves the user's other
+#      admin/SYSTEM shells) AND force the fallback SYSTEM shell VISIBLE (the
+#      drain calls pass -HideWindow, which would hide a fallback shell).
+Add-Assertion "Shell A: param block has [switch]`$LaunchShellAsSystem" ($gm.Contains('[switch]$LaunchShellAsSystem')) "param block missing -LaunchShellAsSystem switch"
+Add-Assertion "Shell A: param block has [string]`$Shell = `"`" (default empty so non-shell CLIs are unaffected)" ($gm.Contains('[string]$Shell = ""')) "param block missing -Shell string param (or non-empty default would leak -Shell into every elevated relaunch)"
+Add-Assertion "Shell A: auto-elevation forwards -LaunchShellAsSystem" ($gm.Contains('if ($LaunchShellAsSystem) { $ArgsString += " -LaunchShellAsSystem" }')) "auto-elevation does not forward -LaunchShellAsSystem -- a non-admin -LaunchShellAsSystem would drop the flag on re-elevation"
+Add-Assertion "Shell A: auto-elevation forwards -Shell value (ContainsKey + non-empty)" ($gm.Contains('if ($PSBoundParameters.ContainsKey(''Shell'') -and $Shell) { $ArgsString += " -Shell $Shell" }')) "auto-elevation does not forward -Shell -- the chosen shell would default to powershell on re-elevation"
+Add-Assertion "Shell A: PS7 preferred launcher forwards the -Shell string param" ($gm.Contains('if ($PSBoundParameters.ContainsKey(''Shell'') -and $Shell) { $ArgList += @("-Shell", $Shell) }')) "PS5->PS7 relaunch does not forward -Shell -- the switch loop only handles switches"
+Add-Assertion "Shell A: Start-SystemShell function defined" ($gm.Contains('function Start-SystemShell {')) "Start-SystemShell missing -- the on-demand SYSTEM shell launcher is not implemented"
+Add-Assertion "Shell A: Start-SystemShell validates the shell name (`$validShells cmd/powershell/pwsh/ise)" ($gm.Contains('$validShells = @("cmd","powershell","pwsh","ise")')) "Start-SystemShell does not validate the shell name -- an unknown shell would launch garbage"
+Add-Assertion "Shell A: Start-SystemShell resolves cmd.exe (System32)" ($gm.Contains('Join-Path $env:WINDIR "System32\cmd.exe"')) "Start-SystemShell does not resolve cmd.exe"
+Add-Assertion "Shell A: Start-SystemShell resolves powershell.exe (WindowsPowerShell v1.0)" ($gm.Contains('Join-Path $env:WINDIR "System32\WindowsPowerShell\v1.0\powershell.exe"')) "Start-SystemShell does not resolve powershell.exe"
+Add-Assertion "Shell A: Start-SystemShell resolves pwsh.exe (PowerShell 7 + C:\ fallback)" ($gm.Contains('Join-Path $env:ProgramFiles "PowerShell\7\pwsh.exe"') -and $gm.Contains('"C:\Program Files\PowerShell\7\pwsh.exe"')) "Start-SystemShell does not resolve pwsh.exe with a fallback"
+Add-Assertion "Shell A: Start-SystemShell ensures seclogon running (CreateProcessWithTokenW)" ($gm -match 'function\s+Start-SystemShell\s*\{[\s\S]{0,5000}?Get-Service -Name seclogon') "Start-SystemShell does not ensure seclogon -- CreateProcessWithTokenW could silently fail"
+Add-Assertion "Shell A: Start-SystemShell launches VISIBLE via CreateProcessFromToken (`$false)" ($gm.Contains('[TokenOps]::CreateProcessFromToken($systemPid, $shellExe, $shellExe, $false)')) "Start-SystemShell does not launch the shell visible -- the on-demand SYSTEM shell would be invisible"
+Add-Assertion "Shell A: Start-SystemShell falls back to a normal Start-Process on SYSTEM-token failure" ($gm.Contains('Start-Process $shellExe')) "Start-SystemShell does not fail-open to a normal launch -- a SYSTEM-token failure would leave the user with no shell"
+Add-Assertion "Shell A: CLI handler -LaunchShellAsSystem gates on the Built-in Administrator" ($gm -match 'if \(\$LaunchShellAsSystem\) \{[\s\S]{0,600}?Test-BuiltInAdmin') "CLI -LaunchShellAsSystem does not gate on the Built-in Administrator -- a non-RID-500 admin could launch a SYSTEM shell"
+Add-Assertion "Shell A: CLI handler calls Start-SystemShell -ShellName `$Shell" ($gm -match 'if \(\$LaunchShellAsSystem\) \{[\s\S]{0,900}?Start-SystemShell -ShellName \$Shell') "CLI -LaunchShellAsSystem does not call Start-SystemShell"
+Add-Assertion "Shell A: menu offers [19] LAUNCH SHELL AS SYSTEM" ($gm.Contains('[19] LAUNCH SHELL AS SYSTEM')) "menu [19] LAUNCH SHELL AS SYSTEM missing"
+Add-Assertion "Shell A: menu switch case 19 calls Start-SystemShell -ShellName `$shellName" ($gm -match '"19" \{[\s\S]{0,1500}?Start-SystemShell -ShellName \$shellName') "menu switch case 19 does not call Start-SystemShell"
+Add-Assertion "Shell A: menu [19] sub-prompt offers cmd/powershell/pwsh/ise (1-4)" ($gm.Contains('Select shell (1-4, default 2)')) "menu [19] sub-prompt missing -- the user cannot pick the shell type"
+Add-Assertion "Shell B: Stop-NonSystemInstances exempts God Mode plumbing (Test-GmPlumbingShell)" ($gm -match 'function\s+Stop-NonSystemInstances\s*\{[\s\S]{0,1500}?Test-GmPlumbingShell -ProcessId \$p\.ProcessId') "Stop-NonSystemInstances does not exempt God Mode plumbing shells -- a purge could kill the monitor/watchdog plumbing"
+Add-Assertion "Shell C: Test-PidIsSystem helper defined (per-PID SYSTEM check)" ($gm.Contains('function Test-PidIsSystem {')) "Test-PidIsSystem missing -- Monitor-ElevateProcess cannot skip an already-SYSTEM shell"
+Add-Assertion "Shell C: Test-PidIsSystem is fail-open (ProcessId -le 0 -> return `$false)" ($gm -match 'function Test-PidIsSystem \{[\s\S]{0,900}?if \(\$ProcessId -le 0\) \{ return \$false \}') "Test-PidIsSystem is not fail-open on ProcessId -le 0 -- a bad PID could throw"
+Add-Assertion "Shell C: Monitor-ElevateProcess skips an already-SYSTEM shell (Test-PidIsSystem consult)" ($gm.Contains('Test-PidIsSystem -ProcessId $ProcessId')) "Monitor-ElevateProcess does not consult Test-PidIsSystem -- an already-SYSTEM shell (the [19] launch) would get a redundant SYSTEM->SYSTEM swap"
+Add-Assertion "Shell C: Phase 1 shells use a targeted kill (Stop-Process -Id `$ProcessId), not a blanket purge" ($gm.Contains('$launchHidden = [bool]$HideWindow -and -not $isInteractiveShell') -and $gm.Contains('[TokenOps]::CreateProcessAsSystem($systemPid, $Path, $cmdLine, $launchHidden)')) "Phase 1 does not force shells visible + targeted kill -- a fallback SYSTEM shell would be hidden and the user's other admin shells killed"
+Add-Assertion "Shell C: Phase 1/2 targeted shell kill appears on BOTH fallback paths (>= 2)" (([regex]::Matches($gm, 'if \(\$isInteractiveShell\) \{[\s\S]{0,300}?Stop-Process -Id \$ProcessId -Force')).Count -ge 2) "Phase 1/2 targeted shell kill is not on both fallback paths -- one path still blanket-purges the user's other shells"
+Add-Assertion "Shell C: Phase 2 shells forced visible (`$svcHidden) + targeted kill" ($gm.Contains('$svcHidden = [bool]$HideWindow -and -not $isInteractiveShell') -and $gm.Contains('Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$svcHidden')) "Phase 2 does not force shells visible + targeted kill -- a service-fallback SYSTEM shell would be hidden"
+Add-Assertion "Shell A: Test-GmPlumbingShell `$gmFlags includes -LaunchShellAsSystem (CLI launcher protected)" ($gm.Contains("'-LaunchShellAsSystem'")) "Test-GmPlumbingShell `$gmFlags missing -LaunchShellAsSystem -- the on-demand CLI launcher could be in-place token-swapped mid-launch"
 
 Write-Summary
