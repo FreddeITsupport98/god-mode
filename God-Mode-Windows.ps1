@@ -1854,6 +1854,21 @@ function Test-BuiltInAdmin {
     return ($sid -like "*-500" -or $sid -eq "S-1-5-18")
 }
 
+function Test-GodModeActive {
+    # Reads the God Mode active flag ($GodModeFlagRegPath.$GodModeFlagRegName == 1).
+    # Used by Start-SystemShell to warn when God Mode is INACTIVE -- the on-demand
+    # SYSTEM shell is most useful with God Mode ON (the monitor's Session>0 SYSTEM
+    # shells are the token source Find-SystemProcessCandidate steals from). With
+    # God Mode off there may be no Session>0 SYSTEM process, so the launch falls
+    # back to a normal (non-SYSTEM) shell. Fail-open: any registry error -> $false
+    # (treat as inactive so the best-effort warning fires).
+    try {
+        $flag = Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue
+        if ($flag -and $flag.$GodModeFlagRegName -eq 1) { return $true }
+    } catch {}
+    return $false
+}
+
 function Test-SystemContext {
     Write-Host "`n[VERIFY] Running whoami as SYSTEM..." -ForegroundColor Cyan
     $Result = Invoke-AsSystem -Command "whoami & whoami /groups"
@@ -2479,6 +2494,15 @@ function Start-SystemShell {
         Write-Host "[ERROR] Shell executable not found: $shellExe" -ForegroundColor Red
         return $false
     }
+    # God Mode inactive warning (suggestion): the on-demand SYSTEM shell is most
+    # useful with God Mode ON -- the monitor's Session>0 SYSTEM shells are the
+    # token source Find-SystemProcessCandidate steals from. With God Mode off
+    # there may be no Session>0 SYSTEM process, so the launch falls back to a
+    # normal (non-SYSTEM) shell. Best-effort either way; this just sets expectations.
+    if (-not (Test-GodModeActive)) {
+        Write-Host "[INFO] God Mode is INACTIVE -- launching with best effort (falls back to a normal shell if no Session>0 SYSTEM token is available)." -ForegroundColor Yellow
+        Write-DebugLog -FunctionName "Start-SystemShell" -Action "INFO" -Message "GodMode flag not set; on-demand SYSTEM shell may fall back to a normal launch"
+    }
     Enable-ElevationPrivileges
     # CreateProcessWithTokenW is serviced by seclogon; ensure it is running so the
     # SYSTEM launch does not silently fall back to an unelevated start (mirrors
@@ -2501,12 +2525,43 @@ function Start-SystemShell {
     $systemPid = Find-SystemProcessCandidate
     if ($systemPid -ne 0) {
         # Visible ($false) -- this is an INTERACTIVE shell the user wants to see.
+        # Snapshot the shell exe's existing PIDs BEFORE launch so we can identify
+        # the NEW child (CreateProcessFromToken returns 0 on success but discards
+        # the child PID) and verify it actually came up as SYSTEM.
+        $shellBaseName = [System.IO.Path]::GetFileName($shellExe)
+        $beforePids = @()
+        try {
+            $beforePids = @(Get-CimInstance Win32_Process -Filter "Name='$shellBaseName'" -ErrorAction SilentlyContinue | ForEach-Object { $_.ProcessId })
+        } catch {}
         $result = [TokenOps]::CreateProcessFromToken($systemPid, $shellExe, $shellExe, $false)
         if ($result -eq 0) {
-            Write-Log -Message "$shellKey shell launched as SYSTEM (token source PID=$systemPid): $shellExe" -Type "INFO" -Color Green
-            Write-Host "[SUCCESS] $shellKey launched as SYSTEM. Run 'whoami' in it -> nt authority\system." -ForegroundColor Green
-            Write-DebugLog -FunctionName "Start-SystemShell" -Action "EXIT" -Message "Success $shellKey PID-source=$systemPid"
-            return $true
+            # Post-launch SYSTEM owner verification (suggestion): a seclogon race
+            # or token filter can silently de-elevate the birth even though
+            # CreateProcessWithTokenW returned success. Find the new PID (not in
+            # the before-snapshot) and confirm SYSTEM; warn if it is not so the
+            # user knows to run 'whoami' to confirm.
+            Start-Sleep -Milliseconds 800
+            $verifiedSystem = $false
+            $newShellPid = 0
+            try {
+                $afterProcs = Get-CimInstance Win32_Process -Filter "Name='$shellBaseName'" -ErrorAction SilentlyContinue
+                $newProc = $afterProcs | Where-Object { $beforePids -notcontains $_.ProcessId } | Select-Object -First 1
+                if ($newProc -and $newProc.ProcessId -gt 0) {
+                    $newShellPid = [int]$newProc.ProcessId
+                    if (Test-PidIsSystem -ProcessId $newShellPid) { $verifiedSystem = $true }
+                }
+            } catch {}
+            if ($verifiedSystem) {
+                Write-Log -Message "$shellKey shell launched as SYSTEM (token source PID=$systemPid, child PID=$newShellPid, verified SYSTEM): $shellExe" -Type "INFO" -Color Green
+                Write-Host "[SUCCESS] $shellKey launched as SYSTEM (verified). Run 'whoami' in it -> nt authority$system." -ForegroundColor Green
+                Write-DebugLog -FunctionName "Start-SystemShell" -Action "EXIT" -Message "Success $shellKey PID-source=$systemPid child=$newShellPid verifiedSystem=$true"
+                return $true
+            } else {
+                Write-Log -Message "$shellKey shell launched (CreateProcessFromToken=0) but could NOT verify SYSTEM (child PID=$newShellPid); a seclogon/token-filter race may have de-elevated it. Run 'whoami' to confirm." -Type "WARN" -Color Yellow
+                Write-Host "[WARN] $shellKey launched, but could NOT verify it is SYSTEM (child PID=$newShellPid). Run 'whoami' in the new shell to confirm (a seclogon/token-filter race may have de-elevated it)." -ForegroundColor Yellow
+                Write-DebugLog -FunctionName "Start-SystemShell" -Action "WARN" -Message "Launch success but verify failed $shellKey PID-source=$systemPid child=$newShellPid"
+                return $true
+            }
         } else {
             $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessWithTokenW"
             Write-Log -Message "$shellKey SYSTEM launch failed (error $($result): $($errMsg)). Falling back to normal launch." -Type "WARN" -Color Yellow
@@ -4413,22 +4468,42 @@ function Disable-DangerousMode {
 }
 
 function Register-StealthTask {
-    # Don't kill an already-running monitoring loop.
-    # Multiple -ToggleOn persistence layers fire at startup and would otherwise
-    # unregister each other's stealth task, causing Start-Monitoring to flap and
-    # never stabilize (post-reboot elevation bug).
-    $RunningStealth = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.State -eq 'Running' }
-    if ($RunningStealth) {
-        Write-Log -Message "Stealth monitoring task already running ($($RunningStealth.TaskName)). Skipping re-registration to prevent flapping." -Type "INFO" -Color Gray
+    # Flap-proof monitor startup (the fix for "shells don't auto-elevate to SYSTEM
+    # after [7]+reboot"). The prior logic unregistered ALL $GodModeTaskPrefix*
+    # tasks whenever none was momentarily "Running" -- but right after
+    # Start-ScheduledTask the task is briefly in a transitional (Queued/Ready)
+    # state, not "Running", so a CONCURRENT -ToggleOn persistence layer (guardian
+    # / Run key / WMI consumer / backup task firing within milliseconds at boot)
+    # would Unregister-StealthTask + recreate it, KILLing Start-Monitoring
+    # mid-startup. After a reboot this flapping left no stable monitor running ->
+    # the WMI watcher + 5s polling never elevated interactive shells (whoami
+    # stayed admin). Now: if a stealth task already EXISTS in ANY state, just
+    # (re)start it and return -- NEVER unregister an existing one from here. Only
+    # create a new stealth task when none exists. Disable-GodMode still calls
+    # Unregister-StealthTask for teardown; the watchdog (Register-SystemWatchdog,
+    # 30s) + the RestartCount 99 policy relaunch a truly-dead task.
+    $existing = Get-ScheduledTask -TaskName "$GodModeTaskPrefix*" -ErrorAction SilentlyContinue
+    if ($existing) {
+        $running = $existing | Where-Object { $_.State -eq 'Running' }
+        if ($running) {
+            Write-Log -Message "Stealth monitoring task already running ($($running.TaskName)). Skipping re-registration to prevent flapping." -Type "INFO" -Color Gray
+            return
+        }
+        # Exists but not Running (Queued/Ready/Disabled): nudge it (do NOT
+        # unregister). Pick the first; Task Scheduler + the restart policy handle
+        # the rest. This is the flap-proof path.
+        $nudge = $existing | Select-Object -First 1
+        try { Start-ScheduledTask -TaskName $nudge.TaskName -ErrorAction SilentlyContinue } catch {}
+        Write-Log -Message "Stealth monitoring task exists ($($nudge.TaskName), state=$($nudge.State)); (re)started, no re-registration (flap-proof)." -Type "INFO" -Color Gray
         return
     }
 
+    # No stealth task exists at all -- create one (fresh install / first enable /
+    # after Disable-GodMode tore everything down).
     $taskName = $GodModeTaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
-    Unregister-StealthTask
 
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -Launch"
+        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `$"$GodModeInstallScript`$" -Launch"
 
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
@@ -6881,9 +6956,32 @@ function Monitor-ElevateProcess {
         if ($systemPid -ne 0) {
             $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
             if ($result) {
-                Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement)" -Type "INFO" -Color Gray
-                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId"
-                return $true
+                # Interactive shells: VERIFY the in-place swap actually took effect.
+                # NtSetInformationProcess(ProcessAccessToken) can report STATUS_SUCCESS
+                # yet leave the running threads on the old token on some builds (the
+                # process primary token is swapped but whoami may still read a stale
+                # context), so the user would see `whoami -> admin` and conclude the
+                # auto-elevation is broken after [7]+reboot. Re-check the owner after
+                # a brief settle; if it is NOT SYSTEM, do NOT return -- fall through
+                # to Phase 1 (CreateProcessAsSystem, born-as-SYSTEM) so the user
+                # ALWAYS gets a SYSTEM shell. Non-shells keep the fast return (the
+                # 15s periodic scan is their safety net; no per-app latency).
+                if ($isInteractiveShell) {
+                    Start-Sleep -Milliseconds 300
+                    if (Test-PidIsSystem -ProcessId $ProcessId) {
+                        Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement, verified SYSTEM)" -Type "INFO" -Color Gray
+                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId (verified SYSTEM)"
+                        return $true
+                    } else {
+                        Write-Log -Message "Monitor: in-place swap reported success but $procName PID=$ProcessId is NOT SYSTEM after settle; falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "WARN" -Message "Phase 0 silent-failure for $procName PID=$ProcessId (reported success, not SYSTEM after settle); falling through to Phase 1"
+                        # Fall through to Phase 1 (do NOT return).
+                    }
+                } else {
+                    Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement)" -Type "INFO" -Color Gray
+                    Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId"
+                    return $true
+                }
             } else {
                 Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch"
             }
@@ -7041,7 +7139,16 @@ function Start-Monitoring {
                         $arguments = $evt.Arguments
                         if (-not $lastElevatedPid.ContainsKey($evt.ProcessId)) {
                             $lastElevatedPid[$evt.ProcessId] = Get-Date
-                            Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow
+                            $meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow
+                            # Interactive shells: if EVERY elevation phase failed
+                            # (transient -- no SYSTEM token source this instant),
+                            # clear the dedup so the next 5s polling tick retries.
+                            # The admin shell is still alive (Phase 1 only kills on
+                            # success); the user expects whoami -> SYSTEM after
+                            # [7]+reboot, so a transient failure must not strand it.
+                            if (-not $meResult -and ($shellNames -contains $procBase)) {
+                                $lastElevatedPid.Remove($evt.ProcessId) | Out-Null
+                            }
                         }
                     }
                 }
@@ -7318,7 +7425,15 @@ function Start-Monitoring {
                 # Phase 1/2 path (loses the user's session/cwd/history).
                 if (-not $lastElevatedPid.ContainsKey($proc.ProcessId)) {
                     $lastElevatedPid[$proc.ProcessId] = Get-Date
-                    Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow
+                    $meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow
+                    # Interactive shells: retry on total failure (mirrors the WMI
+                    # watcher drain above) so a transient "no SYSTEM token source"
+                    # does not strand the shell as admin forever. The 3s polling
+                    # throttle bounds the retry rate; once a SYSTEM token source
+                    # appears the shell is elevated (in-place or born-as-SYSTEM).
+                    if (-not $meResult -and ($shellNames -contains $pollBase)) {
+                        $lastElevatedPid.Remove($proc.ProcessId) | Out-Null
+                    }
                 }
             }
         }

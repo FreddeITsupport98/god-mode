@@ -896,4 +896,55 @@ Add-Assertion "Shell C: Phase 1/2 targeted shell kill appears on BOTH fallback p
 Add-Assertion "Shell C: Phase 2 shells forced visible (`$svcHidden) + targeted kill" ($gm.Contains('$svcHidden = [bool]$HideWindow -and -not $isInteractiveShell') -and $gm.Contains('Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$svcHidden')) "Phase 2 does not force shells visible + targeted kill -- a service-fallback SYSTEM shell would be hidden"
 Add-Assertion "Shell A: Test-GmPlumbingShell `$gmFlags includes -LaunchShellAsSystem (CLI launcher protected)" ($gm.Contains("'-LaunchShellAsSystem'")) "Test-GmPlumbingShell `$gmFlags missing -LaunchShellAsSystem -- the on-demand CLI launcher could be in-place token-swapped mid-launch"
 
+# --- 34. Shell auto-elevation after [7]+reboot: flap-proof stealth task +
+# Phase 0 verify/fallback + drain retry + Start-SystemShell verify/inactive (2026-07-21) ---
+# The user's core requirement: after [7] Enable + reboot, running cmd/powershell/
+# pwsh/ISE normally -> whoami shows nt authority\system (the monitor's in-place
+# token swap, NOT the manual [19]). Three runtime gaps that left whoami -> admin:
+#   A. Boot flapping: Register-StealthTask unregistered ALL stealth tasks whenever
+#      none was momentarily "Running" -- concurrent -ToggleOn layers at boot killed
+#      Start-Monitoring mid-startup -> no stable monitor -> shells never elevated.
+#      Flap-proof fix: if a stealth task EXISTS in ANY state, nudge it (never
+#      unregister from here); only create when none exists.
+#   B. Silent in-place swap: ReplaceProcessTokenForPid can report STATUS_SUCCESS
+#      yet leave the shell admin (whoami -> admin). Phase 0 now VERIFIES the swap
+#      for interactive shells (Test-PidIsSystem after a 300ms settle) and falls
+#      through to Phase 1 (born-as-SYSTEM) on silent failure -- the user ALWAYS
+#      gets a SYSTEM shell.
+#   C. No retry: the lastElevatedPid dedup marked a shell before elevation; if all
+#      phases failed, it was never retried. The drains now remove the PID on
+#      $false for shells so the next 5s polling tick retries.
+# Plus the two Start-SystemShell suggestions: post-launch SYSTEM verify (before/
+# after PID snapshot + Test-PidIsSystem) + a "God Mode inactive" best-effort
+# warning (Test-GodModeActive). All additive + fail-open; section 33 intact.
+Add-Assertion "ShellAuto: Test-GodModeActive helper defined" ($gm.Contains('function Test-GodModeActive')) "Test-GodModeActive missing -- Start-SystemShell cannot warn when God Mode is inactive"
+$tgmaMatch = [regex]::Match($gm, '(?s)function\s+Test-GodModeActive\s*\{(.*?)\nfunction\s+Test-SystemContext\s*\{')
+$tgmaBody = if ($tgmaMatch.Success) { $tgmaMatch.Groups[1].Value } else { "" }
+Add-Assertion "ShellAuto: Test-GodModeActive body extractable" ($tgmaMatch.Success) "could not isolate Test-GodModeActive body"
+if ($tgmaMatch.Success) {
+    Add-Assertion "ShellAuto: Test-GodModeActive reads the flag (GodModeFlagRegPath + GodModeFlagRegName -eq 1)" ($tgmaBody.Contains('$GodModeFlagRegPath') -and $tgmaBody.Contains('$GodModeFlagRegName') -and $tgmaBody.Contains('-eq 1')) "Test-GodModeActive does not read the GodMode flag -- cannot report active state"
+    Add-Assertion "ShellAuto: Test-GodModeActive is fail-open (catch/missing -> false)" ($tgmaBody.Contains('return $false')) "Test-GodModeActive is not fail-open -- a registry error could throw"
+}
+Add-Assertion "ShellAuto: Start-SystemShell warns when God Mode inactive (Test-GodModeActive consult)" ($gm -match 'function\s+Start-SystemShell\s*\{[\s\S]{0,6000}?\(Test-GodModeActive\)') "Start-SystemShell does not warn when God Mode is inactive -- the on-demand SYSTEM shell's best-effort expectation is unset"
+Add-Assertion "ShellAuto: Start-SystemShell snapshots PIDs before launch + resolves shell base name" ($gm.Contains('$beforePids') -and $gm.Contains('$shellBaseName')) "Start-SystemShell does not snapshot before-PIDs / resolve the shell base name -- cannot identify the new child for verify"
+Add-Assertion "ShellAuto: Start-SystemShell verifies the new child is SYSTEM (Test-PidIsSystem -ProcessId newShellPid)" ($gm.Contains('Test-PidIsSystem -ProcessId $newShellPid')) "Start-SystemShell does not verify the new child is SYSTEM -- a silent de-elevation would look like success"
+Add-Assertion "ShellAuto: Start-SystemShell warns when verify fails (could NOT verify SYSTEM)" ($gm.Contains('could NOT verify SYSTEM')) "Start-SystemShell does not warn on verify failure -- the user would not know to run whoami to confirm"
+$stealthMatch = [regex]::Match($gm, '(?s)function\s+Register-StealthTask\s*\{(.*?)\nfunction\s+Unregister-StealthTask\s*\{')
+$stealthBody = if ($stealthMatch.Success) { $stealthMatch.Groups[1].Value } else { "" }
+Add-Assertion "ShellAuto: Register-StealthTask body extractable" ($stealthMatch.Success) "could not isolate Register-StealthTask body"
+if ($stealthMatch.Success) {
+    Add-Assertion "ShellAuto: Register-StealthTask flap-proof -- existing task nudged (Start-ScheduledTask -TaskName nudge.TaskName)" ($stealthBody.Contains('Start-ScheduledTask -TaskName $nudge.TaskName')) "Register-StealthTask does not nudge an existing stealth task -- a transitional-state task would be recreated (flap)"
+    Add-Assertion "ShellAuto: Register-StealthTask flap-proof -- NO Unregister-StealthTask call inside the body" (-not ($stealthBody -match '(?m)^\s*Unregister-StealthTask\b')) "Register-StealthTask still calls Unregister-StealthTask -- a concurrent -ToggleOn at boot would kill a just-started monitor (flap -> shells never elevate after reboot)"
+    Add-Assertion "ShellAuto: Register-StealthTask flap-proof -- Running-state skip preserved" ($stealthBody.Contains('State -eq ''Running''')) "Register-StealthTask lost the Running-state skip -- an already-running monitor could be touched"
+    Add-Assertion "ShellAuto: Register-StealthTask creates a new task only when none exists" ($stealthBody.Contains('$taskName = $GodModeTaskPrefix')) "Register-StealthTask does not gate the create path on no-existing-task -- could accumulate stealth tasks"
+}
+Add-Assertion "ShellAuto: Phase 0 verifies the in-place swap for shells (Test-PidIsSystem within Phase 0)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?\$isInteractiveShell[\s\S]{0,400}?Test-PidIsSystem -ProcessId \$ProcessId') "Phase 0 does not verify the in-place swap for shells -- a silent NtSetInformationProcess success would leave whoami -> admin with no fallback"
+Add-Assertion "ShellAuto: Phase 0 settle sleep before the verify (Start-Sleep -Milliseconds 300)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?Start-Sleep -Milliseconds 300') "Phase 0 does not settle before verifying -- the owner query could race the token swap"
+Add-Assertion "ShellAuto: Phase 0 falls through to Phase 1 on silent swap failure (born-as-SYSTEM WARN)" ($gm.Contains('falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM')) "Phase 0 does not fall through to Phase 1 on silent swap failure -- the user could be left with an admin shell"
+Add-Assertion "ShellAuto: Phase 0 keeps the fast return for NON-shells (in-place token replacement, no verify)" ($gm.Contains('Monitor elevated: $procName PID=$ProcessId (in-place token replacement)')) "Phase 0 lost the non-shell fast return -- per-app latency would be added to every elevation"
+Add-Assertion "ShellAuto: WMI watcher drain captures the elevation result (meResult)" ($gm.Contains('$meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain does not capture the elevation result -- cannot retry on failure"
+Add-Assertion "ShellAuto: WMI watcher drain retries shells on failure (lastElevatedPid.Remove evt.ProcessId + shellNames procBase)" ($gm.Contains('$lastElevatedPid.Remove($evt.ProcessId)') -and $gm.Contains('$shellNames -contains $procBase')) "WMI watcher drain does not retry shells on failure -- a transient no-SYSTEM-token strands the shell as admin forever"
+Add-Assertion "ShellAuto: 5s polling drain captures the elevation result (meResult)" ($gm.Contains('$meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow')) "5s polling drain does not capture the elevation result -- cannot retry on failure"
+Add-Assertion "ShellAuto: 5s polling drain retries shells on failure (lastElevatedPid.Remove proc.ProcessId + shellNames pollBase)" ($gm.Contains('$lastElevatedPid.Remove($proc.ProcessId)') -and $gm.Contains('$shellNames -contains $pollBase')) "5s polling drain does not retry shells on failure -- a transient failure strands the shell as admin forever"
+
 Write-Summary
