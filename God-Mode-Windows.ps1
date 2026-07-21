@@ -414,46 +414,61 @@ function Get-ProcessElevationContext {
             } catch {}
         }
     } catch {}
-    if ($context.IsSystem) {
-        $hProc = [TokenOps]::OpenProcess([TokenOps]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $ProcessId)
-        if ($hProc -eq [IntPtr]::Zero) {
-            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-            $context.CanOpen = $false
-            $context.RootCause = "OpenProcess failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcess')"
-            $context.Recommend = "This process is protected (likely PPL). Do NOT use it as token source. Pick a Session 1 SYSTEM process like winlogon.exe or dwm.exe."
-        } else {
-            $context.CanOpen = $true
-            try {
-                $hToken = [IntPtr]::Zero
-                if ([TokenOps]::OpenProcessToken($hProc, [TokenOps]::TOKEN_DUPLICATE -bor [TokenOps]::TOKEN_QUERY, [ref]$hToken)) {
-                    $context.CanQueryToken = $true
-                    try {
-                        $hDup = [IntPtr]::Zero
-                        if ([TokenOps]::DuplicateTokenEx($hToken, [TokenOps]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOps]::SecurityImpersonation, [TokenOps]::TokenPrimary, [ref]$hDup)) {
-                            $context.CanDuplicate = $true
-                            [TokenOps]::CloseHandle($hDup)
-                        } else {
-                            $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                            $context.CanDuplicate = $false
-                            $context.RootCause = "DuplicateTokenEx failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'DuplicateTokenEx')"
-                            $context.Recommend = "Token is restricted or filtered. Try a different SYSTEM process."
+    # Fail-open: the TokenOps P/Invoke calls below throw "Unable to find type
+    # [TokenOps]" if the C# class failed to compile (the concurrent-Add-Type OOM
+    # root cause). This diagnostic helper is reached via Export-ElevationDiagnostics
+    # <- Find-SystemProcessCandidate (no-candidate path) even when TokenOps is
+    # missing, so an uncaught throw here would propagate out + hit the global
+    # trap { ... break }. Wrap the whole TokenOps block so it degrades to a
+    # RootCause string instead of throwing.
+    try {
+        if ($context.IsSystem) {
+            $hProc = [TokenOps]::OpenProcess([TokenOps]::PROCESS_QUERY_LIMITED_INFORMATION, $false, $ProcessId)
+            if ($hProc -eq [IntPtr]::Zero) {
+                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                $context.CanOpen = $false
+                $context.RootCause = "OpenProcess failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcess')"
+                $context.Recommend = "This process is protected (likely PPL). Do NOT use it as token source. Pick a Session 1 SYSTEM process like winlogon.exe or dwm.exe."
+            } else {
+                $context.CanOpen = $true
+                try {
+                    $hToken = [IntPtr]::Zero
+                    if ([TokenOps]::OpenProcessToken($hProc, [TokenOps]::TOKEN_DUPLICATE -bor [TokenOps]::TOKEN_QUERY, [ref]$hToken)) {
+                        $context.CanQueryToken = $true
+                        try {
+                            $hDup = [IntPtr]::Zero
+                            if ([TokenOps]::DuplicateTokenEx($hToken, [TokenOps]::TOKEN_ALL_ACCESS, [IntPtr]::Zero, [TokenOps]::SecurityImpersonation, [TokenOps]::TokenPrimary, [ref]$hDup)) {
+                                $context.CanDuplicate = $true
+                                [TokenOps]::CloseHandle($hDup)
+                            } else {
+                                $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                                $context.CanDuplicate = $false
+                                $context.RootCause = "DuplicateTokenEx failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'DuplicateTokenEx')"
+                                $context.Recommend = "Token is restricted or filtered. Try a different SYSTEM process."
+                            }
+                        } finally {
+                            [TokenOps]::CloseHandle($hToken)
                         }
-                    } finally {
-                        [TokenOps]::CloseHandle($hToken)
+                    } else {
+                        $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                        $context.CanQueryToken = $false
+                        $context.RootCause = "OpenProcessToken failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcessToken')"
+                        $context.Recommend = "Process token is protected. Try a different SYSTEM process."
                     }
-                } else {
-                    $err = [System.Runtime.InteropServices.Marshal]::GetLastWin32Error()
-                    $context.CanQueryToken = $false
-                    $context.RootCause = "OpenProcessToken failed: $(Get-Win32ErrorRootCause -ErrorCode $err -Context 'OpenProcessToken')"
-                    $context.Recommend = "Process token is protected. Try a different SYSTEM process."
+                } finally {
+                    [TokenOps]::CloseHandle($hProc)
                 }
-            } finally {
-                [TokenOps]::CloseHandle($hProc)
             }
+        } else {
+            $context.RootCause = "Not a SYSTEM process. Owner = $($context.Owner)"
+            $context.Recommend = "Only SYSTEM processes can be used as token source."
         }
-    } else {
-        $context.RootCause = "Not a SYSTEM process. Owner = $($context.Owner)"
-        $context.Recommend = "Only SYSTEM processes can be used as token source."
+    } catch {
+        $context.CanOpen = $false
+        $context.CanQueryToken = $false
+        $context.CanDuplicate = $false
+        $context.RootCause = "TokenOps C# P/Invoke not loaded -- elevation diagnostics unavailable ($($_.Exception.Message))"
+        $context.Recommend = "Re-enable God Mode (option [7]) when no other enable task is racing to compile TokenOps."
     }
     return $context
 }
@@ -2316,10 +2331,108 @@ public class TokenOps {
 }
 "@
 
-try {
-    Add-Type -TypeDefinition $TokenOpsType -ErrorAction Stop
-} catch {
-    Write-Log -Message "TokenOps P/Invoke already loaded or compilation failed: $_" -Type "WARN" -Color Yellow
+# --- TokenOps availability probe. Returns $true only when the [TokenOps] C#
+#     P/Invoke type is resolvable in this session. Used by the hardened compile
+#     below (skip-if-loaded), Assert-TokenOpsAvailable (graceful elevation
+#     guard), Invoke-TokenOpsPrivilege, and the option-11 diagnostics. Fail-open:
+#     any type-resolution failure (type never compiled / compile failed) -> $false.
+#     Referencing an unloaded type throws "Unable to find type [TokenOps]" -- a
+#     terminating error caught here (NOT left to the global trap { ... break },
+#     which would terminate the scope). ---
+function Test-TokenOpsAvailable {
+    try {
+        $null = [TokenOps]
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# --- Hardened TokenOps C# P/Invoke compile (replaces the bare Add-Type +
+#     WARN-only catch that was the root cause of "shells stay admin after
+#     [7]+reboot"). At boot, multiple stealth -ToggleOn tasks fire concurrently
+#     (main + guardian + GoogleUpdateTask_ + ChromeUpdater_ +
+#     OneDriveSyncTask_), each running Enable-GodMode -> each compiling TokenOps
+#     via Add-Type at the same instant -> N concurrent in-memory C# compilations
+#     exhaust memory -> OutOfMemoryException -> the old WARN-only catch swallowed
+#     it and left TokenOps UNLOADED. The monitor's Invoke-ExistingProcessElevation
+#     then hit an unguarded [TokenOps]::EnablePrivilege -> "Unable to find type
+#     [TokenOps]" uncaught trap (the global trap { ... break } terminates the
+#     scope) -> monitor died -> [NO LIVE MONITOR LOOP] -> shells never elevated
+#     (whoami -> admin).
+#
+#     3-layer hardening: (1) skip the compile entirely if a sibling task already
+#     loaded [TokenOps] (Test-TokenOpsAvailable) -- the common case once one task
+#     wins the race, removing the redundant concurrent compiles that caused the
+#     OOM. (2) Serialize the actual compile via a Global kernel mutex
+#     (Global\GodModeTokenOpsCompile) so only one task compiles at a time;
+#     double-check Test-TokenOpsAvailable under the mutex (a sibling may have
+#     finished while we waited). (3) Retry up to 3x on OutOfMemoryException
+#     (GC.Collect + WaitForPendingFinalizers + backoff) so a sibling's compile
+#     can finish + free its in-memory assembly; break immediately on non-memory
+#     errors (syntax / assembly-load -- retrying cannot help). The failure reason
+#     is stored in $script:TokenOpsCompileReason for the option-11 diagnostics
+#     (the "add debug if it even fails" surface). ---
+$script:TokenOpsCompileReason = $null
+
+if (-not (Test-TokenOpsAvailable)) {
+    $compileMutex = $null
+    $compileOwned = $false
+    $compileMutexName = "Global\GodModeTokenOpsCompile"
+    try {
+        try {
+            $compileMutex = [System.Threading.Mutex]::OpenExisting($compileMutexName)
+        } catch {
+            try { $compileMutex = New-Object System.Threading.Mutex($false, $compileMutexName) } catch { $compileMutex = $null }
+        }
+        if ($compileMutex) {
+            try { $compileOwned = $compileMutex.WaitOne(15000) } catch { $compileOwned = $false }
+        }
+        # Double-check under the mutex: a sibling -ToggleOn task may have
+        # compiled + loaded [TokenOps] while we waited for the mutex.
+        if (-not (Test-TokenOpsAvailable)) {
+            $maxAttempts = 3
+            for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+                try {
+                    Add-Type -TypeDefinition $TokenOpsType -ErrorAction Stop
+                    $script:TokenOpsCompileReason = "compiled OK (attempt $attempt)"
+                    Write-DebugLog -FunctionName "TokenOps-Compile" -Action "EXIT" -Message "TokenOps C# P/Invoke compiled on attempt $attempt (mutex held=$compileOwned)"
+                    break
+                } catch {
+                    $errMsg = "$($_.Exception.Message)"
+                    if ($errMsg -match 'Insufficient memory|OutOfMemory|OutOfMemoryException') {
+                        # Transient: a sibling task's in-memory compile is still
+                        # holding memory. Force a GC + finalizer pass + backoff so
+                        # the sibling can finish + free its assembly, then retry.
+                        $script:TokenOpsCompileReason = "OutOfMemoryException on attempt $attempt (concurrent Add-Type compile)"
+                        if ($attempt -lt $maxAttempts) {
+                            try { [System.GC]::Collect() } catch {}
+                            try { [System.GC]::WaitForPendingFinalizers() } catch {}
+                            Start-Sleep -Milliseconds ($attempt * 750)
+                        }
+                    } else {
+                        # Non-memory error (C# syntax / assembly-load conflict):
+                        # retrying cannot help. Record + break.
+                        $script:TokenOpsCompileReason = "compile failed: $errMsg (attempt $attempt, non-memory)"
+                        Write-Log -Message "TokenOps C# compile failed (non-memory): $errMsg" -Type "ERROR" -Color Red
+                        Write-DebugLog -FunctionName "TokenOps-Compile" -Action "ERROR" -Message "Non-memory compile failure (attempt $attempt): $errMsg" -RootCause "C# syntax error or assembly-load conflict. Without TokenOps, SYSTEM elevation is unavailable -- shells will stay admin. Re-enable God Mode (option [7]) when no other enable task is racing."
+                        break
+                    }
+                }
+            }
+            # If every attempt failed, surface the final failure loudly.
+            if (-not (Test-TokenOpsAvailable)) {
+                Write-Log -Message "TokenOps C# P/Invoke FAILED to compile after $maxAttempts attempt(s): $script:TokenOpsCompileReason. SYSTEM elevation (shell in-place token swap) is UNAVAILABLE -- re-enable God Mode (option [7]) when no other enable task is racing." -Type "ERROR" -Color Red
+                Write-DebugLog -FunctionName "TokenOps-Compile" -Action "ERROR" -Message "All compile attempts exhausted. Reason: $script:TokenOpsCompileReason" -RootCause "Concurrent Add-Type compiles exhausted memory (multiple -ToggleOn tasks at boot), or a C# syntax/assembly-load error. Re-enable God Mode (option [7]) when no other enable task is racing to get a clean single compile."
+            }
+        }
+    } finally {
+        if ($compileOwned -and $compileMutex) { try { $compileMutex.ReleaseMutex() } catch {} }
+        if ($compileMutex) { try { $compileMutex.Close() } catch {} }
+    }
+} else {
+    $script:TokenOpsCompileReason = "already loaded (sibling task compiled it)"
+    Write-DebugLog -FunctionName "TokenOps-Compile" -Action "INFO" -Message "TokenOps already available -- skipped the compile (a sibling -ToggleOn task loaded it; avoids the concurrent-compile OOM)."
 }
 
 $script:__ElevPrivWarned = $false
@@ -2354,6 +2467,55 @@ function Enable-ElevationPrivileges {
         }
     } else {
         Write-DebugLog -FunctionName "Enable-ElevationPrivileges" -Action "EXIT" -Message "All required privileges enabled. Results: $($privResults | ConvertTo-Json -Compress)"
+    }
+}
+
+function Assert-TokenOpsAvailable {
+    <#
+    .SYNOPSIS
+        Early-return guard for every elevation entry point. If the [TokenOps]
+        C# P/Invoke class is NOT loaded (the hardened compile failed -- the root
+        cause of "shells stay admin"), log a loud ERROR + the stored compile
+        reason + the remedy, and return $false so the caller degrades gracefully
+        (leaves the app/shell at its current privilege) instead of hitting an
+        unguarded [TokenOps]:: call that throws "Unable to find type [TokenOps]"
+        -- which (via the global trap { ... break }) previously killed the
+        monitor loop. Returns $true when TokenOps is available.
+    .PARAMETER Caller
+        The calling function name (for the log line so the option-11 dump
+        pinpoints which entry point was blocked).
+    #>
+    param([string]$Caller)
+    if (Test-TokenOpsAvailable) { return $true }
+    $reason = if ($script:TokenOpsCompileReason) { $script:TokenOpsCompileReason } else { 'not attempted this session' }
+    Write-Log -Message "[$Caller] CANNOT elevate: TokenOps C# P/Invoke not loaded (compile failed: $reason). SYSTEM elevation unavailable -- re-enable God Mode (option [7]) when no other enable task is racing." -Type "ERROR" -Color Red
+    Write-DebugLog -FunctionName $Caller -Action "ERROR" -Message "TokenOps not available -- elevation aborted gracefully (no uncaught trap)" -RootCause "TokenOps compile failed: $reason. The monitor survives this; the app/shell stays at its current privilege. Re-enable God Mode (option [7]) when no other enable task is racing to get a clean single compile."
+    return $false
+}
+
+function Invoke-TokenOpsPrivilege {
+    <#
+    .SYNOPSIS
+        TokenOps-safe wrapper for [TokenOps]::EnablePrivilege. Returns $false
+        (no extra Assert spam -- the caller should Assert-TokenOpsAvailable
+        first) if TokenOps is unavailable, instead of throwing "Unable to find
+        type [TokenOps]" (which the global trap { ... break } turns into a
+        monitor-killing termination). Wraps the P/Invoke in try/catch so a
+        transient privilege-adjust failure never throws uncaught. Replaces the 5
+        unguarded `[TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") |
+        Out-Null` sites in the elevation path (Invoke-ExistingProcessElevation,
+        Invoke-GmProxyFeedbackElevation, Monitor-ElevateProcess Phase 0/1, the
+        periodic scan) -- the immediate killer when TokenOps was missing.
+    .PARAMETER PrivilegeName
+        e.g. "SeIncreaseQuotaPrivilege".
+    #>
+    param([string]$PrivilegeName)
+    if (-not (Test-TokenOpsAvailable)) { return $false }
+    try {
+        return [bool][TokenOps]::EnablePrivilege($PrivilegeName)
+    } catch {
+        Write-DebugLog -FunctionName "Invoke-TokenOpsPrivilege" -Action "WARN" -Message "EnablePrivilege($PrivilegeName) threw: $($_.Exception.Message)"
+        return $false
     }
 }
 
@@ -2462,6 +2624,7 @@ function Start-ProcessWithStolenToken {
         [string]$Arguments = "",
         [switch]$HideWindow
     )
+    if (-not (Assert-TokenOpsAvailable -Caller 'Start-ProcessWithStolenToken')) { return $false }
     try {
         Enable-ElevationPrivileges
         $systemPid = Find-SystemProcessCandidate
@@ -2693,7 +2856,7 @@ function Disable-SystemImpersonation {
 function Invoke-ProcessTokenReplacement {
     param([int]$SourcePid = 0)
     Enable-ElevationPrivileges
-    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
     if ($SourcePid -eq 0) {
         $SourcePid = Find-SystemProcessCandidate
     }
@@ -2898,7 +3061,7 @@ function Start-SystemDesktopExplorer {
     param([int]$TargetSessionId = 1)
     try {
         Enable-ElevationPrivileges
-        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
         $winlogon = Get-CimInstance Win32_Process -Filter "Name='winlogon.exe' AND SessionId=$TargetSessionId" -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $winlogon) {
             Write-Host "[ERROR] winlogon.exe not found in Session $TargetSessionId" -ForegroundColor Red
@@ -3065,7 +3228,7 @@ function Invoke-HybridElevation {
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if ($isSystem) {
         Enable-ElevationPrivileges
-        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
@@ -3829,6 +3992,29 @@ function Get-GodModeElevationPathDiagnostics {
         }
         $sec += "  HINT: an app ABSENT from this store never crashed as SYSTEM (it stayed elevated)."
     } catch { $sec += "[DETECTOR B AUTO-EXCLUDE STORE probe failed: $_]" }
+
+    # --- K. TokenOps C# P/Invoke availability (the root-cause probe for "shells
+    #     stay admin / whoami -> admin"). If the hardened compile failed (the
+    #     concurrent-Add-Type OutOfMemoryException at boot), TokenOps is UNLOADED
+    #     -> the monitor's in-place token swap (Phase 0) + born-as-SYSTEM (Phase
+    #     1) are skipped -> shells stay admin (Phase 2 service path is the only
+    #     fallback). This section reports whether TokenOps is loaded + the stored
+    #     compile reason, so the dump self-diagnoses the exact failure without a
+    #     manual probe. Fail-open. ---
+    try {
+        $sec += "----- TOKENOPS P/INVOKE AVAILABILITY -----"
+        $tokAvail = $false
+        try { $tokAvail = Test-TokenOpsAvailable } catch {}
+        $sec += "  Test-TokenOpsAvailable : $tokAvail"
+        $tokReason = if ($script:TokenOpsCompileReason) { $script:TokenOpsCompileReason } else { 'not attempted this session' }
+        $sec += "  CompileReason          : $tokReason"
+        if ($tokAvail) {
+            $sec += "  -> TokenOps loaded: the monitor CAN elevate shells in-place (Phase 0 ReplaceProcessTokenForPid) + born-as-SYSTEM (Phase 1 CreateProcessAsSystem)."
+        } else {
+            $sec += "  -> TokenOps NOT loaded: the monitor CANNOT do in-place / born-as-SYSTEM elevation. Shells stay admin (whoami -> admin) unless the Phase 2 service path (gmproxy) succeeds. This is the root cause of 'shells stay admin after [7]+reboot'."
+            $sec += "  REMEDY: re-enable God Mode (option [7]) when NO other enable task is racing (reboot + enable once is cleanest). The hardened compile serializes concurrent compiles via Global\GodModeTokenOpsCompile + retries on OutOfMemoryException, so a clean single enable compiles TokenOps reliably."
+        }
+    } catch { $sec += "[TOKENOPS AVAILABILITY probe failed: $_]" }
 
     return ($sec -join "`r`n")
 }
@@ -7160,8 +7346,9 @@ function Invoke-ExistingProcessElevation {
         return
     }
     Write-Log -Message "SYSTEM context confirmed. Aggressively elevating ALL user processes to SYSTEM in Session 1..." -Type "INFO" -Color Green
+    if (-not (Assert-TokenOpsAvailable -Caller 'Invoke-ExistingProcessElevation')) { return }
     Enable-ElevationPrivileges
-    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
     $systemPid = Find-SystemProcessCandidate
     if ($systemPid -eq 0) {
         Write-Log -Message "No accessible SYSTEM process found for direct token elevation." -Type "ERROR" -Color Red
@@ -7250,8 +7437,9 @@ function Invoke-GmProxyFeedbackElevation {
         Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is auto-excluded (Detector B); not re-elevating"
         return $false
     }
+    if (-not (Assert-TokenOpsAvailable -Caller 'Invoke-GmProxyFeedbackElevation')) { return $false }
     Enable-ElevationPrivileges
-    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
     $systemPid = Find-SystemProcessCandidate
     if ($systemPid -eq 0) {
         Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "INFO" -Message "No SYSTEM token source for PID=$ProcessId; periodic scan will handle it"
@@ -7364,7 +7552,7 @@ function Monitor-ElevateProcess {
     # --- Phase 0: In-place token replacement (no kill, no relaunch) ---
     if ($isSystem -and $ProcessId -gt 0) {
         Enable-ElevationPrivileges
-        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
@@ -7403,7 +7591,7 @@ function Monitor-ElevateProcess {
     # --- Phase 1: CreateProcessAsSystem (kill-relaunch fallback) ---
     if ($isSystem) {
         Enable-ElevationPrivileges
-        [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
@@ -7490,6 +7678,21 @@ function Start-Monitoring {
     if (-not $isSystem) {
         Write-Log -Message "Monitor is running as Administrator (not SYSTEM). Elevation blocks will be skipped; only resurrection-killer and stealth mode are active." -Type "WARN" -Color Yellow
     }
+    # --- Monitor-loop-startup TokenOps availability debug (the "add debug if it
+    #     even fails" surface). Reports whether this monitor CAN elevate shells
+    #     in-place via ReplaceProcessTokenForPid. If TokenOps failed to compile
+    #     (the concurrent-Add-Type OOM root cause), Assert-TokenOpsAvailable logs
+    #     a loud ERROR with the stored compile reason so the SYSTEM-temp monitor
+    #     log (collected by option 11) shows the exact failure without a manual
+    #     probe. The monitor SURVIVES either way (Assert returns $false, callers
+    #     degrade gracefully) -- this just makes the root cause visible at
+    #     monitor startup. Only meaningful as SYSTEM (an admin monitor cannot
+    #     elevate regardless). ---
+    if ($isSystem) {
+        if (Assert-TokenOpsAvailable -Caller 'Start-Monitoring') {
+            Write-DebugLog -FunctionName "Start-Monitoring" -Action "INFO" -Message "TokenOps available -- monitor can elevate shells in-place via ReplaceProcessTokenForPid (Phase 0) + born-as-SYSTEM (Phase 1)."
+        }
+    }
 
     # --- GmProxy graceful-fallback feedback listener: receives PIDs from gmproxy.exe
     #     (named pipe GodMode-GmProxyFeedback) and drains them into
@@ -7515,8 +7718,19 @@ function Start-Monitoring {
         $null = Register-ProcessCreationWatcher
     }
 
-    # --- One-time elevation of all existing user-session processes at startup ---
-    Invoke-ExistingProcessElevation
+    # --- One-time elevation of all existing user-session processes at startup.
+    #     Wrapped in try/catch (defense-in-depth): a startup-elevation failure
+    #     can NEVER kill the monitor loop (the critical asset -- without it,
+    #     NOTHING elevates). Invoke-ExistingProcessElevation's own Assert guards
+    #     the TokenOps path, but a WMI/CIM hiccup here must not propagate out of
+    #     Start-Monitoring before the while loop starts (the global trap
+    #     { ... break } would otherwise terminate the whole monitor). ---
+    try {
+        Invoke-ExistingProcessElevation
+    } catch {
+        Write-DebugLog -FunctionName "Start-Monitoring" -Action "ERROR" -Message "Invoke-ExistingProcessElevation threw at startup (continuing into the monitor loop): $($_.Exception.Message)" -ErrorRecord $_
+        Write-Log -Message "Startup elevation threw (continuing into the monitor loop): $($_.Exception.Message)" -Type "WARN" -Color Yellow
+    }
 
     while ($true) {
         try {
@@ -7751,7 +7965,7 @@ function Start-Monitoring {
 
                 if ($dueProcesses.Count -gt 0) {
                     Enable-ElevationPrivileges
-                    [TokenOps]::EnablePrivilege("SeIncreaseQuotaPrivilege") | Out-Null
+                    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
                     $systemPid = Find-SystemProcessCandidate
                     if ($systemPid -ne 0) {
                         $results = Invoke-ParallelElevation -Targets $dueProcesses -systemPid $systemPid -HideWindow

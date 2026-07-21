@@ -1106,4 +1106,55 @@ Add-Assertion "AdminToolsPreSeed: summary log mentions the mmc.exe pre-seed (CLE
 Add-Assertion "AdminToolsPreSeed: seed comment reflects mmc.exe SYSTEM refusal (silently refuses SYSTEM)" ($gm.Contains('mmc.exe silently refuses SYSTEM')) "Install-IfeoElevation seed comment does not say mmc.exe silently refuses SYSTEM -- the pre-seed rationale is not documented"
 Add-Assertion "AdminToolsPreSeed: seed comment no longer says 'known-good as SYSTEM -- the PsExec' (stale claim removed)" (-not ($gm -match 'known-good as SYSTEM -- the PsExec')) "Install-IfeoElevation seed comment still says 'known-good as SYSTEM -- the PsExec -s mmc pattern' -- the pre-seed contradicts this claim"
 
+# --- 38. SYSTEM shell elevation fix: hardened TokenOps compile + unguarded-
+#     [TokenOps]:: guard + option-11 TokenOps availability probe (2026-07-21) ---
+# The user reported "the terminal does not open instant to cmd or powershell or
+# other shell into system privileges" (whoami -> admin after [7]+reboot). The
+# option-11 dump proved the root-cause chain: at boot, multiple stealth -ToggleOn
+# tasks fire concurrently -> each compiles the TokenOps C# P/Invoke class via
+# Add-Type at the same instant -> N concurrent in-memory C# compilations exhaust
+# memory -> OutOfMemoryException -> the old WARN-only catch swallowed it + left
+# TokenOps UNLOADED -> the monitor's Invoke-ExistingProcessElevation hit an
+# unguarded [TokenOps]::EnablePrivilege -> "Unable to find type [TokenOps]"
+# uncaught trap (the global trap { ... break } terminates the scope) -> monitor
+# died -> [NO LIVE MONITOR LOOP] -> shells never elevated. This section asserts
+# the 5-part fix: (1) hardened compile (serialize + retry + skip-if-loaded),
+# (2) Assert-TokenOpsAvailable + Invoke-TokenOpsPrivilege helpers, (3) every
+# unguarded [TokenOps]::EnablePrivilege site replaced + the monitor startup
+# Invoke-ExistingProcessElevation call try/catch wrapped + Get-ProcessElevationContext
+# fail-open, (4) Start-Monitoring startup TokenOps Assert, (5) option-11 section K.
+# Additive; sections 1-37 intact.
+
+# Part 1 -- hardened TokenOps compile.
+Add-Assertion "ShellElev: Test-TokenOpsAvailable helper defined" ($gm.Contains('function Test-TokenOpsAvailable')) "Test-TokenOpsAvailable missing -- the compile/callers cannot skip-if-loaded"
+Add-Assertion "ShellElev: hardened compile serializes via Global\GodModeTokenOpsCompile mutex" ($gm.Contains('Global\GodModeTokenOpsCompile')) "the compile mutex is missing -- concurrent -ToggleOn tasks can still race the Add-Type + OOM"
+Add-Assertion "ShellElev: hardened compile retries on OutOfMemoryException (maxAttempts=3)" ($gm.Contains('$maxAttempts = 3') -and ($gm -match 'Insufficient memory|OutOfMemory|OutOfMemoryException')) "no OutOfMemoryException retry -- a sibling task's compile can still starve this one"
+Add-Assertion "ShellElev: hardened compile GC.Collect + WaitForPendingFinalizers between retries" ($gm.Contains('[System.GC]::Collect()') -and $gm.Contains('[System.GC]::WaitForPendingFinalizers()')) "no GC between retries -- a sibling's in-memory assembly is not freed before the retry"
+Add-Assertion "ShellElev: hardened compile stores TokenOpsCompileReason (debug surface)" ($gm.Contains('$script:TokenOpsCompileReason')) "TokenOpsCompileReason missing -- the option-11 dump cannot show why TokenOps failed to compile"
+Add-Assertion "ShellElev: hardened compile skip-if-loaded outer guard present" ($gm -match 'if \(-not \(Test-TokenOpsAvailable\)\) \{') "no skip-if-loaded outer guard -- a sibling that already loaded TokenOps would recompile (the OOM cause)"
+Add-Assertion "ShellElev: old WARN-only compile catch GONE (TokenOps P/Invoke already loaded...)" (-not ($gm.Contains('TokenOps P/Invoke already loaded or compilation failed'))) "the bare Add-Type + WARN-only catch remains -- a compile failure is still swallowed + TokenOps left unloaded"
+
+# Part 2 -- helpers.
+Add-Assertion "ShellElev: Assert-TokenOpsAvailable helper defined" ($gm.Contains('function Assert-TokenOpsAvailable')) "Assert-TokenOpsAvailable missing -- elevation entry points cannot degrade gracefully on TokenOps-missing"
+Add-Assertion "ShellElev: Invoke-TokenOpsPrivilege helper defined" ($gm.Contains('function Invoke-TokenOpsPrivilege')) "Invoke-TokenOpsPrivilege missing -- the unguarded [TokenOps]::EnablePrivilege sites cannot be replaced"
+
+# Part 3 -- guarded call sites.
+Add-Assertion "ShellElev: Invoke-ExistingProcessElevation Asserts TokenOps (graceful skip, no uncaught trap)" ($gm.Contains('Assert-TokenOpsAvailable -Caller ''Invoke-ExistingProcessElevation''')) "Invoke-ExistingProcessElevation does not Assert TokenOps -- the SYSTEM branch can still throw 'Unable to find type [TokenOps]' (the monitor killer)"
+Add-Assertion "ShellElev: Invoke-GmProxyFeedbackElevation Asserts TokenOps" ($gm.Contains('Assert-TokenOpsAvailable -Caller ''Invoke-GmProxyFeedbackElevation''')) "Invoke-GmProxyFeedbackElevation does not Assert TokenOps -- can still throw unguarded"
+Add-Assertion "ShellElev: Start-ProcessWithStolenToken Asserts TokenOps" ($gm.Contains('Assert-TokenOpsAvailable -Caller ''Start-ProcessWithStolenToken''')) "Start-ProcessWithStolenToken does not Assert TokenOps"
+Add-Assertion "ShellElev: NO unguarded [TokenOps]::EnablePrivilege('SeIncreaseQuotaPrivilege') | Out-Null sites remain (count 0)" (([regex]::Matches($gm, '\[TokenOps\]::EnablePrivilege\("SeIncreaseQuotaPrivilege"\) \| Out-Null')).Count -eq 0) "unguarded SeIncreaseQuotaPrivilege sites remain -- any one throws 'Unable to find type [TokenOps]' when TokenOps is missing"
+Add-Assertion "ShellElev: Start-Monitoring wraps the startup Invoke-ExistingProcessElevation call in try/catch" ($gm.Contains('Invoke-ExistingProcessElevation threw at startup')) "Start-Monitoring does not try/catch the startup Invoke-ExistingProcessElevation call -- a throw here kills the monitor before the while loop"
+Add-Assertion "ShellElev: Get-ProcessElevationContext fail-open on TokenOps-missing (RootCause string, no throw)" ($gm.Contains('TokenOps C# P/Invoke not loaded -- elevation diagnostics unavailable')) "Get-ProcessElevationContext does not fail-open -- an uncaught throw propagates via Export-ElevationDiagnostics <- Find-SystemProcessCandidate"
+
+# Part 4 + 5 -- monitor startup debug + option-11 section K.
+Add-Assertion "ShellElev: Start-Monitoring startup Asserts TokenOps (-Caller 'Start-Monitoring')" ($gm.Contains('Assert-TokenOpsAvailable -Caller ''Start-Monitoring''')) "Start-Monitoring does not log TokenOps availability at startup -- the monitor-side failure stays invisible"
+$epd38Match = [regex]::Match($gm, '(?s)function\s+Get-GodModeElevationPathDiagnostics\s*\{(.*?)\nfunction\s+Export-GodModeLogs\s*\{')
+$epd38Body = if ($epd38Match.Success) { $epd38Match.Groups[1].Value } else { "" }
+Add-Assertion "ShellElev: Get-GodModeElevationPathDiagnostics body extractable (section 38)" ($epd38Match.Success) "could not isolate Get-GodModeElevationPathDiagnostics body for section 38"
+if ($epd38Match.Success) {
+    Add-Assertion "ShellElev: option-11 section K TOKENOPS P/INVOKE AVAILABILITY header present" ($epd38Body.Contains('TOKENOPS P/INVOKE AVAILABILITY')) "option-11 has no TokenOps availability section -- the dump cannot self-diagnose the shell-elevation root cause"
+    Add-Assertion "ShellElev: option-11 section K reports Test-TokenOpsAvailable" ($epd38Body.Contains('Test-TokenOpsAvailable')) "option-11 section K does not call Test-TokenOpsAvailable -- cannot report whether TokenOps is loaded"
+    Add-Assertion "ShellElev: option-11 section K reports the stored CompileReason" ($epd38Body.Contains('CompileReason') -and $epd38Body.Contains('$script:TokenOpsCompileReason')) "option-11 section K does not surface the compile failure reason"
+}
+
 Write-Summary
