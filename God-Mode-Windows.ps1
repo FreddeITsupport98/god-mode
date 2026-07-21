@@ -9151,6 +9151,24 @@ do {
     Write-Host "   ENTERPRISE DNS LOCKOUT SUITE (INSTALLER EDITION)  " -ForegroundColor Cyan
     Write-Host "=====================================================" -ForegroundColor Cyan
 
+    # God Mode discretion banner (shown every menu refresh): this suite grants
+    # SYSTEM-level control over the machine (token theft, IAT hooking, SYSTEM
+    # shell, a monitor that elevates every new process + kills security
+    # services). Remind the operator to use discretion every time the menu
+    # loads. Additive only -- does not alter any existing menu text or the
+    # option-[10] monitor warning ("Launching God Mode Monitor will start a
+    # persistent loop ... IRREVERSIBLE ..."), which stays intact per the
+    # additive rule. Red when God Mode is currently ACTIVE (more urgent),
+    # Yellow otherwise. One cheap reg read per menu refresh (menu redraws only
+    # on keypress return, not a hot loop); $GodModeFlagRegPath/$GodModeFlagRegName
+    # are already in scope here (used by the status header just below).
+    $GmBannerActive = (Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName -eq 1
+    if ($GmBannerActive) {
+        Write-Host ">>> YOU ARE IN GOD MODE -- PLEASE USE DISCRETION, ADVISED <<<" -ForegroundColor Red
+    } else {
+        Write-Host ">>> GOD MODE TOOLKIT -- PLEASE USE DISCRETION, ADVISED <<<" -ForegroundColor Yellow
+    }
+
     # Quick system status header
     $QuickGodMode = if ((Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName -eq 1) { "ACTIVE" } else { "INACTIVE" }
     $QuickGodModeColor = if ((Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName -eq 1) { "Red" } else { "Green" }
