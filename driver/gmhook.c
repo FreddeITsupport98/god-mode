@@ -325,15 +325,26 @@ static BOOL IsCriticalProcess(const wchar_t* baseName) {
    Kernel32.CreateProcess -- a native AV that PowerShell try/catch cannot
    recover from (it kills pwsh.exe, exactly the crash being fixed).
    Terminals (wt / conhost / OpenConsole / WindowsTerminal) host those
-   shells, so they are excluded too. These hosts are still elevated to
-   SYSTEM by the task / service path in God-Mode-Windows.ps1
-   (Invoke-HybridElevation / CreateProcessAsSystem); they are simply not
-   IAT-hooked in-process. */
+   shells, so they are excluded too. explorer.exe is ALSO excluded: it
+   launches Task Manager and most modern shell apps with a
+   STARTUPINFOEX (EXTENDED_STARTUPINFO_PRESENT) structure, and the
+   TryCreateProcessWithSystemToken STARTUPINFOEX -> plain STARTUPINFOW
+   DOWNGRADE (cb clamp + EXTENDED bit clear) drops the caller's attribute
+   list (inherited-handle list / mitigation policies) -- explorer then
+   crashes on the next CreateProcessW it issues expecting those extended
+   attributes, and the shell restarts it, producing the repeated
+   explorer.exe crash/restart loop (blank User column alongside the live
+   monitor loop missing). explorer is still elevated to SYSTEM by the
+   task / service path in God-Mode-Windows.ps1 (Invoke-HybridElevation /
+   CreateProcessAsSystem) and managed by the SystemDesktop session path;
+   it is simply not IAT-hooked in-process. These hosts are still elevated
+   to SYSTEM by the task / service path; they are simply not IAT-hooked
+   in-process. */
 static BOOL IsShellLauncherProcess(const wchar_t* baseName) {
     if (!baseName) return FALSE;
     const wchar_t* shells[] = {
         L"pwsh.exe", L"powershell.exe", L"powershell_ise.exe", L"cmd.exe", L"wt.exe",
-        L"conhost.exe", L"OpenConsole.exe", L"WindowsTerminal.exe", NULL
+        L"conhost.exe", L"OpenConsole.exe", L"WindowsTerminal.exe", L"explorer.exe", NULL
     };
     for (int i = 0; shells[i]; i++) {
         if (_wcsicmp(baseName, shells[i]) == 0) return TRUE;
@@ -654,8 +665,14 @@ static BOOL WINAPI HookCreateProcessW(
        native commands via CreateProcessW as its core job, and rerouting
        those calls through the stolen-token CreateProcessWithTokenW path
        destabilizes the host). Terminals host those shells, so they are
-       excluded too. These hosts are still elevated to SYSTEM by the task /
-       service path in God-Mode-Windows.ps1; they are simply not IAT-hooked. */
+       excluded too. explorer.exe is excluded here too: it launches shell
+       apps with STARTUPINFOEX and the TryCreateProcessWithSystemToken
+       STARTUPINFOEX -> plain STARTUPINFOW DOWNGRADE drops the caller's
+       extended attribute list, crashing explorer on its next CreateProcessW
+       -> the repeated explorer.exe crash/restart loop (blank User column
+       alongside the live monitor loop missing). These hosts are still
+       elevated to SYSTEM by the task / service path in God-Mode-Windows.ps1;
+       they are simply not IAT-hooked. */
     if (IsCriticalProcess(baseName) || IsShellLauncherProcess(baseName)) {
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,

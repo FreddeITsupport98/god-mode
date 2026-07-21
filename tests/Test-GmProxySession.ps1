@@ -754,6 +754,7 @@ Add-Assertion "Opt2 C: Test-GmPlumbingShell checks GodMode CLI flags (-ToggleOn/
 Add-Assertion "Opt2 C: Test-GmPlumbingShell is fail-open (ProcessId -le 0 -> return `$false)" ($gm.Contains('if ($ProcessId -le 0) { return $false }')) "Test-GmPlumbingShell is not fail-open on ProcessId -le 0 -- a bad PID could throw"
 Add-Assertion "Opt2 C: Test-GmPlumbingShell is fail-open (catch -> return `$false)" ($gm.Contains('} catch { return $false }')) "Test-GmPlumbingShell is not fail-open on a query exception -- a WMI/CIM failure could break the consult"
 Add-Assertion "Opt2 D: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" ($gmhook.Contains('L"powershell_ise.exe"')) "gmhook IsShellLauncherProcess does not exclude powershell_ise.exe -- ISE would be IAT-hooked (0xC0000005 crash risk)"
+Add-Assertion "Explorer crash fix: gmhook IsShellLauncherProcess excludes explorer.exe (STARTUPINFOEX downgrade crash/restart loop)" ($gmhook.Contains('L"explorer.exe"')) "gmhook IsShellLauncherProcess does not exclude explorer.exe -- IAT-hooking explorer's STARTUPINFOEX launches drops the extended attribute list (cb clamp + EXTENDED bit clear) -> explorer crashes on its next CreateProcessW expecting those attributes -> repeated explorer.exe crash/restart loop (blank User column alongside the live monitor loop missing)"
 Add-Assertion "Opt2 D: `$GmCriticalIfeoExclude contains powershell_ise (never IFEO-redirected)" ($gm.Contains('"pwsh","powershell_ise","wt"')) "`$GmCriticalIfeoExclude missing powershell_ise -- ISE could be IFEO-redirected to gmproxy"
 Add-Assertion "Opt2 D: `$SkipNames (Invoke-GmProxyFeedbackElevation) contains powershell_ise" ($gm.Contains('"cmd","powershell_ise","conhost"')) "`$SkipNames missing powershell_ise -- a feedback PID for ISE could be token-swapped (defense-in-depth gap)"
 Add-Assertion "Opt2 D: Invoke-ExistingProcessElevation `$CriticalProcs contains powershell_ise.exe" ($gm.Contains('"powershell_ise.exe", "conhost.exe", "explorer.exe")')) "Invoke-ExistingProcessElevation `$CriticalProcs missing powershell_ise.exe -- the startup scan could kill+relaunch ISE"
@@ -1049,12 +1050,19 @@ if ($egmMatch.Success) {
 # --- 37. Admin-tool SYSTEM elevation + option-11 donor/Detector-B diagnostics (2026-07-21) ---
 # Three additive, non-destructive features (no gmproxy.c change -- PowerShell-only, no
 # driver rebuild; no kill/TerminateProcess path anywhere):
-#   (1) Expand the admin tools God Mode launches as SYSTEM: mmc.exe (hosts ALL .msc snap-
-#       ins -- services/eventvwr/compmgmt/gpedit/secpol/lusrmgr/certmgr/diskmgmt/taskschd/
-#       ...), perfmon.exe, resmon.exe added to the Install-IfeoElevation seed + the
-#       Uninstall-ProcessHook legacy list + the Export-GodModeLogs IFEO-status check.
-#       Known-good as SYSTEM (the PsExec -s mmc pattern); Detector B self-heals any snap-
-#       in that does not tolerate SYSTEM (gmproxy.c threshold=2 -> auto-exclude).
+#   (1) Admin tools mmc.exe (hosts ALL .msc snap-ins -- services/eventvwr/compmgmt/
+#       gpedit/secpol/lusrmgr/certmgr/diskmgmt/taskschd/...), perfmon.exe, resmon.exe.
+#       STRATEGY FLIP (2026-07-21): these are NOT IFEO-hooked. mmc.exe silently refuses
+#       SYSTEM (exits 0, no window) AND gmproxy's IFEO-bypass RENAME breaks MMC snap-in
+#       loading EVEN as the current user (COM/snap-in/resource lookup uses the exe name ->
+#       a renamed gmproxy_<pid>_mmc.exe can't load snap-ins -> exit 0, no window, USER-
+#       AUTOEXCLUDE mode a VM log dump proved). So mmc/perfmon/resmon are DROPPED from
+#       the IFEO seed entirely, added to the $GmCriticalIfeoExclude denylist (auto-
+#       populate never hooks them), pre-seeded in the Detector B store with reason 'G'
+#       (so the monitor + gmhook skip SYSTEM-birth), and any prior gmproxy Debugger hook
+#       is removed on re-enable. They launch NATIVELY as the admin user from launch #1.
+#       They STAY in the Uninstall-ProcessHook legacy list (belt-and-suspenders cleanup)
+#       + the Export-GodModeLogs IFEO-status check (the dump reports their hook status).
 #   (2) Option-11 SYSTEM token DONOR INVENTORY: Get-GodModeElevationPathDiagnostics probes
 #       each Session>0 SYSTEM process with the read-only [TokenOps]::TestOpenProcess (the
 #       SAME probe Find-SystemProcessCandidate uses -- opens PROCESS_QUERY_LIMITED_INFORMATION,
@@ -1067,13 +1075,15 @@ if ($egmMatch.Success) {
 #       PENDING, hints at menu [18] to retry. Fail-open on a missing store.
 # Self-contained body extraction (mirrors section 35 but with a section-37-local var so
 # this block stays robust if section 35 ever moves). Additive; sections 1-36 intact.
-$epd37Match = [regex]::Match($gm, '(?s)function\s+Get-GodModeElevationPathDiagnostics\s*\{(.*?)\nfunction\s+Export-GodModeLogs\s*\{')
+$epd37Match = [regex]::Match($gm, '(?s)function\s+Get-GodModeElevationPathDiagnostics\s*\{([\s\S]*?)\nfunction\s+Export-GodModeLogs\s*\{')
 $epd37Body = if ($epd37Match.Success) { $epd37Match.Groups[1].Value } else { "" }
 Add-Assertion "AdminTools+Opt11: Get-GodModeElevationPathDiagnostics body extractable (section 37)" ($epd37Match.Success) "could not isolate Get-GodModeElevationPathDiagnostics body for section 37"
-# Feature 1 -- admin tools elevated as SYSTEM.
-Add-Assertion "AdminTools: mmc/perfmon/resmon added to Install-IfeoElevation seed (launched as SYSTEM)" ($gm -match 'function\s+Install-IfeoElevation\s*\{[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Install-IfeoElevation seed does not include mmc/perfmon/resmon -- admin tools are not SYSTEM-elevated"
-Add-Assertion "AdminTools: mmc/perfmon/resmon in Uninstall-ProcessHook legacy list (uninstaller sync)" ($gm -match 'function\s+Uninstall-ProcessHook\s*\{[\s\S]*?"mmc\.exe", "perfmon\.exe", "resmon\.exe"') "Uninstall-ProcessHook legacy list missing mmc/perfmon/resmon -- uninstaller not current with the expanded seed"
-Add-Assertion "AdminTools: mmc/perfmon/resmon in Export-GodModeLogs IFEO-status check (`$TargetApps)" ($gm -match 'function\s+Export-GodModeLogs\s*\{[\s\S]*?\$TargetApps[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Export-GodModeLogs `$TargetApps does not include mmc/perfmon/resmon -- the dump cannot show whether the admin tools are IFEO-hooked"
+# Feature 1 -- admin tools DROPPED from IFEO (strategy flip 2026-07-21).
+Add-Assertion "AdminTools: mmc/perfmon/resmon DROPPED from Install-IfeoElevation seed (no IFEO hook -- gmproxy rename breaks MMC)" ($gm -notmatch 'function\s+Install-IfeoElevation\s*\{[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Install-IfeoElevation seed still has the old mmc/perfmon/resmon entry -- they would be IFEO-hooked (gmproxy rename breaks MMC snap-in loading; exit 0, no window, even as user)"
+Add-Assertion "AdminTools: mmc/perfmon/resmon in the auto-populate denylist (\$GmCriticalIfeoExclude)" ($gm.Contains('"mmc","perfmon","resmon"')) "mmc/perfmon/resmon missing from the denylist -- auto-populate could IFEO-hook them (gmproxy rename breaks MMC)"
+Add-Assertion "AdminTools: Install-IfeoElevation removes prior admin-tool IFEO hooks (\$adminHookRemoved)" ($gm.Contains('$adminHookRemoved') -and $gm.Contains('$adminToolNames')) "Install-IfeoElevation missing the admin-tool prior-IFEO-hook cleanup -- a re-enable on a VM that hooked mmc would leave it hooked (broken renamed copy)"
+Add-Assertion "AdminTools: mmc/perfmon/resmon in Uninstall-ProcessHook legacy list (uninstaller sync)" ($gm -match 'function\s+Uninstall-ProcessHook\s*\{[\s\S]*?"mmc\.exe", "perfmon\.exe", "resmon\.exe"') "Uninstall-ProcessHook legacy list missing mmc/perfmon/resmon -- uninstaller not current with the admin-tool set"
+Add-Assertion "AdminTools: mmc/perfmon/resmon in Export-GodModeLogs IFEO-status check (\`$TargetApps)" ($gm -match 'function\s+Export-GodModeLogs\s*\{[\s\S]*?\$TargetApps[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Export-GodModeLogs \`$TargetApps does not include mmc/perfmon/resmon -- the dump cannot show whether the admin tools are IFEO-hooked"
 # Feature 2 -- SYSTEM token donor inventory (read-only, no kill).
 if ($epd37Match.Success) {
     Add-Assertion "Opt11Donor: diagnostics probes each SYSTEM donor via [TokenOps]::TestOpenProcess (read-only, no kill)" ($epd37Body.Contains('[TokenOps]::TestOpenProcess($p.ProcessId)')) "diagnostics does not call [TokenOps]::TestOpenProcess per donor -- cannot classify openable vs PPL (donor usability stays hidden)"
@@ -1096,9 +1106,13 @@ if ($epd37Match.Success) {
 # from the FIRST launch, skipping the 2 one-time SYSTEM flash-and-disappear
 # attempts that Detector B would otherwise need to learn from at runtime. The
 # IFEO hook is RETAINED, so menu [18] RESET AUTO-EXCLUDE STORE clears the
-# pre-seed and retries SYSTEM. perfmon.exe + resmon.exe are NOT pre-seeded
-# (thin launchers that delegate to mmc.exe; once mmc.exe is pre-excluded, the
-# .msc GUI runs as the user from launch #1 with no visible flash).
+# pre-seed and retries SYSTEM. perfmon.exe + resmon.exe are ALSO pre-seeded
+# with reason 'G' (they delegate to mmc.exe; an in-place SYSTEM token swap by
+# the monitor would break them the same way). Pre-seeding means the monitor +
+# gmhook skip SYSTEM-birth for all three from launch #1. (Strategy flip: the
+# IFEO hook is NO LONGER retained for these -- they are DROPPED from IFEO +
+# cleaned up on re-enable, see Feature 1 above; the pre-seed stays so the
+# monitor + gmhook still skip them.)
 Add-Assertion "AdminToolsPreSeed: Install-IfeoElevation pre-seeds mmc.exe in the auto-exclude store (reason 'G')" ($gm.Contains('Add-GmAutoExcludeEntries -BaseNames $preseededCleanGui -Reason ''G''')) "Install-IfeoElevation does not pre-seed mmc.exe with reason 'G' -- the 2 SYSTEM flash-and-disappear attempts are not eliminated"
 Add-Assertion "AdminToolsPreSeed: pre-seed variable defines mmc.exe (`$preseededCleanGui = @('mmc.exe'))" ($gm.Contains('$preseededCleanGui = @(''mmc.exe'')')) "Install-IfeoElevation pre-seed variable missing or does not list mmc.exe"
 Add-Assertion "AdminToolsPreSeed: debug EXIT reports the pre-seed count (preseededCleanGui)" ($gm.Contains('preseededCleanGui=$($preseededCleanGui.Count)')) "Install-IfeoElevation debug EXIT does not report the pre-seed count -- regression visibility lost"

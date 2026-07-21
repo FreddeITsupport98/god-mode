@@ -251,6 +251,7 @@ if [ -f "$GMHOOK_SRC" ]; then
     # with the same 0xC0000005 as powershell/pwsh/cmd. IsShellLauncherProcess now
     # excludes it (never IAT-hooked); the monitor auto-elevates ISE in place.
     grep -qF 'L"powershell_ise.exe"' "$GMHOOK_SRC" && record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 1 || record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 0 "not found -- ISE would be IAT-hooked (0xC0000005 crash risk)"
+    grep -qF 'L"explorer.exe"' "$GMHOOK_SRC" && record "src: gmhook IsShellLauncherProcess excludes explorer.exe (STARTUPINFOEX downgrade crash/restart loop)" 1 || record "src: gmhook IsShellLauncherProcess excludes explorer.exe (STARTUPINFOEX downgrade crash/restart loop)" 0 "not found -- explorer would be IAT-hooked -> STARTUPINFOEX->STARTUPINFOW downgrade drops the extended attribute list -> explorer crash/restart loop (blank User column)"
     grep -qF 'Microsoft\\WindowsApps' "$GMHOOK_SRC" && record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 1 || record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 0 "not found -- the alias-stub check does not look at the WindowsApps reparse point"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"

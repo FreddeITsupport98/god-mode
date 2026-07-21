@@ -68,9 +68,12 @@ static int shouldTakeTokenPath(const STARTUPINFOW* si, const void* pi,
 /* Mirror of gmhook.c's IsCriticalProcess() || IsShellLauncherProcess() decision.
    Returns 1 if the host SHOULD be IAT-hooked (neither critical nor a shell/
    launcher host), 0 if it must be skipped. Shell/launcher hosts (pwsh,
-   powershell, cmd, terminals) are excluded because they launch native commands
-   via CreateProcessW as their core job and in-process IAT hooking destabilizes
-   them with 0xC0000005 inside Kernel32.CreateProcess. */
+   powershell, powershell_ise, cmd, terminals, explorer) are excluded because
+   they launch native commands / shell apps via CreateProcessW as their core
+   job and in-process IAT hooking destabilizes them with 0xC0000005 inside
+   Kernel32.CreateProcess (explorer additionally crashes from the
+   STARTUPINFOEX -> plain STARTUPINFOW DOWNGRADE dropping its extended
+   attribute list -> the repeated explorer.exe crash/restart loop). */
 static int shouldHookHost(const char* baseName) {
     if (!baseName) return 0; /* NULL -> unhookable (mirrors IsCriticalProcess TRUE on NULL) */
     static const char* critical[] = {
@@ -79,8 +82,8 @@ static int shouldHookHost(const char* baseName) {
         "Secure System","Idle", NULL
     };
     static const char* shells[] = {
-        "pwsh.exe","powershell.exe","cmd.exe","wt.exe","conhost.exe","OpenConsole.exe",
-        "WindowsTerminal.exe", NULL
+        "pwsh.exe","powershell.exe","powershell_ise.exe","cmd.exe","wt.exe","conhost.exe",
+        "OpenConsole.exe","WindowsTerminal.exe","explorer.exe", NULL
     };
     for (int i = 0; critical[i]; i++) if (_stricmp(baseName, critical[i]) == 0) return 0;
     for (int i = 0; shells[i]; i++) if (_stricmp(baseName, shells[i]) == 0) return 0;
@@ -163,10 +166,12 @@ int main(void) {
           shouldHookHost("conhost.exe") == 0);
     check("WindowsTerminal.exe NOT hooked (terminal host)",
           shouldHookHost("WindowsTerminal.exe") == 0);
+    check("powershell_ise.exe NOT hooked (shell host, ISE hardening)",
+          shouldHookHost("powershell_ise.exe") == 0);
     check("csrss.exe NOT hooked (critical OS)",
           shouldHookHost("csrss.exe") == 0);
-    check("explorer.exe IS hooked (user app, not shell/critical)",
-          shouldHookHost("explorer.exe") == 1);
+    check("explorer.exe NOT hooked (shell host, STARTUPINFOEX downgrade crash/restart loop)",
+          shouldHookHost("explorer.exe") == 0);
     check("chrome.exe IS hooked (user app, not shell/critical)",
           shouldHookHost("chrome.exe") == 1);
     check("NULL base name NOT hooked (safe default)",

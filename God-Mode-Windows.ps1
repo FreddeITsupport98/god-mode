@@ -5049,21 +5049,48 @@ function Register-StealthTask {
             Write-Log -Message "Stealth monitoring task already running ($($running.TaskName)). Skipping re-registration to prevent flapping." -Type "INFO" -Color Gray
             return
         }
-        # Exists but not Running (Queued/Ready/Disabled): nudge it (do NOT
-        # unregister). Pick the first; Task Scheduler + the restart policy handle
-        # the rest. This is the flap-proof path.
+        # Exists but not Running -- inspect LastTaskResult to decide nudge vs
+        # self-heal. The flap-proof path (do NOT unregister a healthy/starting
+        # task) is preserved for a task that ran clean (LastTaskResult=0) or has
+        # not run yet (267011 = "task has not yet run" sentinel).
         $nudge = $existing | Select-Object -First 1
-        try { Start-ScheduledTask -TaskName $nudge.TaskName -ErrorAction SilentlyContinue } catch {}
-        Write-Log -Message "Stealth monitoring task exists ($($nudge.TaskName), state=$($nudge.State)); (re)started, no re-registration (flap-proof)." -Type "INFO" -Color Gray
-        return
+        $lastResult = 0
+        try { $nudgeInfo = $nudge | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue; if ($nudgeInfo) { $lastResult = [int]$nudgeInfo.LastTaskResult } } catch {}
+        if ($lastResult -eq 0 -or $lastResult -eq 267011) {
+            try { Start-ScheduledTask -TaskName $nudge.TaskName -ErrorAction SilentlyContinue } catch {}
+            Write-Log -Message "Stealth monitoring task exists ($($nudge.TaskName), state=$($nudge.State), lastResult=$lastResult); (re)started, no re-registration (flap-proof)." -Type "INFO" -Color Gray
+            return
+        }
+        # SELF-HEAL: a nonzero LastTaskResult (e.g. 0x8007010B / 267 =
+        # ERROR_DIRECTORY) means the -Launch action ran and DIED -- the
+        # Start-Monitoring loop is not alive, so interactive shells never
+        # auto-elevate (whoami -> admin). The prior logic just restarted it,
+        # relaunching the SAME broken action forever. Drop the broken task and
+        # fall through to the create path below, which now sets -WorkingDirectory
+        # (the fix for ERROR_DIRECTORY: a SYSTEM task with no WorkingDirectory
+        # can resolve to an inaccessible cwd -> 267 on launch -> monitor dies
+        # -> shells stay admin). This is NOT the flap case (a flapping task is
+        # mid-startup, LastTaskResult=0/267011, handled above); this only fires
+        # for a task that genuinely crashed on its last run.
+        Write-Log -Message "Stealth monitoring task BROKEN ($($nudge.TaskName), lastResult=$lastResult). Self-healing: unregister + recreate with WorkingDirectory=$GodModeInstallDir." -Type "WARN" -Color Yellow
+        try { Unregister-ScheduledTask -TaskName $nudge.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        # Fall through to the create path (reuses the WorkingDirectory-fixed action).
     }
 
-    # No stealth task exists at all -- create one (fresh install / first enable /
-    # after Disable-GodMode tore everything down).
+    # No stealth task exists (fresh install / first enable / after Disable-GodMode
+    # tore everything down / after the self-heal above dropped a broken one) --
+    # create one.
     $taskName = $GodModeTaskPrefix + (Get-Random -Minimum 10000 -Maximum 99999)
 
+    # -WorkingDirectory is the fix for LastTaskResult 0x8007010B (267,
+    # ERROR_DIRECTORY): a SYSTEM scheduled task with no WorkingDirectory can
+    # resolve to an inaccessible/invalid cwd, making the -Launch action die
+    # immediately -> no monitor loop -> interactive shells stay admin. Pin it to
+    # the install dir (which exists and is readable by SYSTEM). Additive: the
+    # -Argument string is unchanged.
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `$"$GodModeInstallScript`$" -Launch"
+        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `$"$GodModeInstallScript`$" -Launch" `
+        -WorkingDirectory $GodModeInstallDir
 
     $trigger = New-ScheduledTaskTrigger -AtStartup
     $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" `
@@ -5093,24 +5120,38 @@ function Register-SystemWatchdog {
     $WatchdogScriptPath = Join-Path $GodModeInstallDir "watchdog.ps1"
     $WatchdogContent = @'
 # God Mode SYSTEM Watchdog
-$task = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' }
-if (-not $task) {
-    $stealth = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($stealth) {
-        Start-ScheduledTask -TaskName $stealth.TaskName -ErrorAction SilentlyContinue
+# Self-healing: a stealth task that is broken (nonzero LastTaskResult, not the
+# 267011 "never ran" sentinel) is dropped + recreated with -WorkingDirectory
+# (the fix for ERROR_DIRECTORY 0x8007010B that kills the -Launch monitor and
+# leaves interactive shells stuck as admin). A Running task is left alone; a
+# clean/never-run task is just nudged (flap-proof).
+$running = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Where-Object { $_.State -eq 'Running' }
+if ($running) { return }
+$stealth = Get-ScheduledTask -TaskName '__PREFIX__*' -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($stealth) {
+    $lastResult = 0
+    try { $wdInfo = $stealth | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue; if ($wdInfo) { $lastResult = [int]$wdInfo.LastTaskResult } } catch {}
+    if ($lastResult -ne 0 -and $lastResult -ne 267011) {
+        try { Unregister-ScheduledTask -TaskName $stealth.TaskName -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+        $stealth = $null
     } else {
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"__SCRIPT__`" -Launch"
-        $trigger = New-ScheduledTaskTrigger -AtStartup
-        $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
-        $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
-        $taskName = "__PREFIX__" + (Get-Random -Minimum 10000 -Maximum 99999)
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName $stealth.TaskName -ErrorAction SilentlyContinue
+        return
     }
+}
+if (-not $stealth) {
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"__SCRIPT__`" -Launch" -WorkingDirectory "__WORKDIR__"
+    $trigger = New-ScheduledTaskTrigger -AtStartup
+    $principal = New-ScheduledTaskPrincipal -UserId "S-1-5-18" -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable
+    $taskName = "__PREFIX__" + (Get-Random -Minimum 10000 -Maximum 99999)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 }
 '@
     $WatchdogContent = $WatchdogContent.Replace('__PREFIX__', $GodModeTaskPrefix)
     $WatchdogContent = $WatchdogContent.Replace('__SCRIPT__', $GodModeInstallScript)
+    $WatchdogContent = $WatchdogContent.Replace('__WORKDIR__', $GodModeInstallDir)
 
     # Write to temp first, then copy via SYSTEM into hardened install dir
     $TempWatchdog = Join-Path $env:TEMP "gm_watchdog_$(Get-Random).ps1"
@@ -5968,6 +6009,12 @@ function Get-IfeoElevationCandidates {
         "netsh","ipconfig","net","taskkill","whoami",
         # Managed by other paths
         "explorer","taskmgr",
+        # Admin tools: mmc/perfmon/resmon dropped from IFEO (gmproxy's IFEO-bypass
+        # rename breaks MMC snap-in loading; mmc.exe silently refuses SYSTEM). See
+        # Install-IfeoElevation admin-tools comment. Native admin launch is the only
+        # way they work. Pre-seeded with reason 'G' so the monitor skips in-place
+        # SYSTEM elevation (which would break mmc the same way).
+        "mmc","perfmon","resmon",
         # God Mode binaries
         "gmproxy","gmhook"
     )
@@ -6098,19 +6145,25 @@ function Install-IfeoElevation {
             "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
             "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
             "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
-            # Administrator / management tools. mmc.exe hosts ALL .msc snap-ins
-            # -- services.msc, eventvwr.msc, compmgmt.msc, gpedit.msc, secpol.msc, lusrmgr.msc,
-            # certmgr.msc, diskmgmt.msc, taskschd.msc, fsmgmt.msc, wf.msc and more -- so one IFEO
-            # key covers every snap-in. perfmon.exe + resmon.exe are the perf and resource monitors
-            # -- thin launchers that delegate to mmc.exe. mmc.exe silently refuses SYSTEM: exits 0,
-            # no window -- the MMC host relies on per-user profile/COM resources. So it is
-            # PRE-SEEDED in the Detector B auto-exclude store with reason 'G' below: gmproxy
-            # launches it as the current user from the FIRST launch, skipping the 2 one-time SYSTEM
-            # flash-and-disappear attempts. The IFEO hook is retained so menu [18] RESET AUTO-EXCLUDE
-            # STORE retries SYSTEM. perfmon.exe + resmon.exe are NOT pre-seeded -- they are thin
-            # launchers with no GUI of their own; once mmc.exe is pre-excluded, the .msc GUI runs as
-            # the user from launch #1. All three are NOT in any denylist, NOT AppX, NOT browser.
-            "mmc.exe","perfmon.exe","resmon.exe",
+            # Administrator / management tools -- mmc.exe hosts ALL .msc snap-ins
+            # (services, eventvwr, compmgmt, gpedit, secpol, lusrmgr, certmgr, diskmgmt,
+            # taskschd, fsmgmt, wf, ...); perfmon.exe + resmon.exe are thin launchers that
+            # delegate to mmc.exe. mmc.exe silently refuses SYSTEM: exits 0, no window -- the
+            # MMC host relies on per-user profile/COM resources that don't work as SYSTEM in
+            # an interactive session. gmproxy's IFEO-bypass RENAME (gmproxy_<pid>_mmc.exe
+            # hardlink) breaks MMC the SAME way as an AppX/Store stub: MMC can't load snap-ins
+            # from a differently-named exe (COM/snap-in/resource lookup uses the exe name), so
+            # it exits 0 with no window EVEN as the current user (USER-AUTOEXCLUDE mode) -- a
+            # VM log dump proved this: hardlink=gmproxy_5500_mmc.exe ... EXITED exitcode=0
+            # class=CLEAN tree=0 (mode=USER-AUTOEXCLUDE). So mmc/perfmon/resmon are DROPPED
+            # from IFEO entirely (like browsers + AppX stubs) so they launch NATIVELY as the
+            # admin user -- no gmproxy, no rename, no breakage. They are in the
+            # $GmCriticalIfeoExclude denylist (auto-populate never hooks them), cleaned up on
+            # re-enable (prior IFEO hook removed below), and pre-seeded in the Detector B store
+            # with reason 'G' so the monitor + gmhook skip SYSTEM-birth (an in-place SYSTEM
+            # token swap would break mmc the same way). services.msc / eventvwr / perfmon /
+            # resmon all open normally as admin -- SYSTEM is wrong for MMC, native admin launch
+            # is the only way they work.
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
 
@@ -6180,18 +6233,24 @@ function Install-IfeoElevation {
         # (services, eventvwr, compmgmt, gpedit, secpol, lusrmgr, ...). It silently refuses
         # SYSTEM -- launches as SYSTEM, exits 0, renders no window (the MMC host relies on
         # per-user profile/COM resources that don't work as SYSTEM in an interactive session).
-        # Pre-seeding at install time means gmproxy launches mmc.exe as the current user from
-        # the FIRST launch, skipping the 2 one-time SYSTEM flash-and-disappear attempts that
-        # Detector B would otherwise need to learn from at runtime. The IFEO hook is RETAINED,
-        # so menu [18] RESET AUTO-EXCLUDE STORE clears the pre-seed and retries SYSTEM (the
-        # next ToggleOn re-seeds it, same as browser/AppX pre-seeds). perfmon.exe + resmon.exe
-        # are thin launchers that delegate to mmc.exe (perfmon.msc / resmon.msc) -- once
-        # mmc.exe is pre-excluded, the actual GUI runs as the user from launch #1 with no
-        # visible flash. Fail-open (Add-GmAutoExcludeEntries swallows errors; never blocks
+        # AND gmproxy's IFEO-bypass RENAME breaks MMC even as the current user (see the
+        # admin-tools comment in $IfeoElevationApps above), so mmc/perfmon/resmon are DROPPED
+        # from IFEO entirely (not retained) + cleaned up below + pre-seeded here with reason
+        # 'G' so the monitor + gmhook also skip SYSTEM-birth (an in-place SYSTEM token swap
+        # would break mmc the same way). mmc launches NATIVELY as the admin user from launch
+        # #1. Menu [18] RESET AUTO-EXCLUDE STORE clears the pre-seed (the next ToggleOn
+        # re-seeds it). Fail-open (Add-GmAutoExcludeEntries swallows errors; never blocks
         # the install). Merge-safe: if the store already has a runtime mmc.exe entry, the
         # higher count is kept and excluded is never downgraded.
         $preseededCleanGui = @('mmc.exe')
         Add-GmAutoExcludeEntries -BaseNames $preseededCleanGui -Reason 'G'
+        # perfmon.exe + resmon.exe are also pre-seeded with reason 'G' (they delegate to
+        # mmc.exe / host their own GUI; an in-place SYSTEM token swap by the monitor would
+        # break them the same way mmc breaks as SYSTEM). Pre-seeding means the monitor's
+        # periodic scan + 5s polling + gmhook all skip them from launch #1. Additive to the
+        # mmc.exe pre-seed above (kept intact for the $preseededCleanGui variable contract).
+        $preseededCleanGuiAdmin = @('perfmon.exe','resmon.exe')
+        Add-GmAutoExcludeEntries -BaseNames $preseededCleanGuiAdmin -Reason 'G'
 
         $IfeoBase = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
@@ -6221,6 +6280,43 @@ function Install-IfeoElevation {
             } catch {
                 $appxHookRemoveFailed++
                 Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "Failed to remove prior AppX IFEO hook for $app`: $_"
+            }
+        }
+
+        # Admin-tools legacy IFEO cleanup: mmc.exe / perfmon.exe / resmon.exe were
+        # IFEO-hooked under the OLD strategy (the seed listed them as "known-good as
+        # SYSTEM" + pre-seeded reason 'G' but RETAINED the IFEO hook so menu [18]
+        # could retry SYSTEM). The new strategy DROPS them from IFEO entirely
+        # (gmproxy's IFEO-bypass RENAME breaks MMC snap-in loading -- COM/snap-in/
+        # resource lookup uses the exe name, so a renamed gmproxy_<pid>_mmc.exe
+        # can't load snap-ins and exits 0 with no window EVEN as the current user,
+        # the USER-AUTOEXCLUDE mode a VM log dump proved). So a re-enable on a VM
+        # that previously hooked them MUST remove the prior gmproxy Debugger key or
+        # mmc/perfmon/resmon stay IFEO-hooked and keep launching via gmproxy's
+        # broken renamed copy (exit 0, no window) -- the exact "admin tools won't
+        # launch" symptom. Mirrors the AppX cleanup loop above +
+        # Uninstall-IfeoElevation's per-key cleanup (Restore-RegistryKey lifts the
+        # hardened deny ACL, then remove Debugger + key). Only ever touches keys
+        # whose Debugger points at gmproxy (never an unrelated IFEO key). The names
+        # are the pre-seed set ($preseededCleanGui + $preseededCleanGuiAdmin,
+        # defined above) -- a FIXED known set (not the dynamic AppX set). Best-
+        # effort; counts surface in the summary log + debug EXIT.
+        $adminToolNames = @($preseededCleanGui) + @($preseededCleanGuiAdmin)
+        $adminHookRemoved = 0; $adminHookRemoveFailed = 0
+        foreach ($app in $adminToolNames) {
+            $appKey = Join-Path $IfeoBase $app
+            if (-not (Test-Path $appKey)) { continue }
+            $dbg = $null
+            try { $dbg = (Get-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue).Debugger } catch {}
+            if (-not $dbg -or $dbg -notlike "*gmproxy*") { continue }
+            try {
+                $null = Restore-RegistryKey -Path "$IfeoBaseSubKey\$app"
+                Remove-ItemProperty -Path $appKey -Name "Debugger" -ErrorAction SilentlyContinue
+                Remove-Item -Path $appKey -Force -ErrorAction SilentlyContinue
+                if (-not (Test-Path $appKey)) { $adminHookRemoved++ } else { $adminHookRemoveFailed++ }
+            } catch {
+                $adminHookRemoveFailed++
+                Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "WARN" -Message "Failed to remove prior admin-tool IFEO hook for $app`: $_"
             }
         }
 
@@ -6260,8 +6356,8 @@ function Install-IfeoElevation {
         $totalUnique = $allApps.Count
         $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
         if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser + $seedDroppedAppx AppX/Store-stub from the seed (launch as user from launch #1; browsers persisted reason 'P', AppX set persisted reason 'A'). AppX/Store-redirector stubs (notepad/mspaint/calc/photos/etc.) are NOT IFEO-hooked -- they cannot run as SYSTEM (AppX activation needs user identity) and gmproxy's rename/copy breaks their Store redirect, so they launch natively as the user via the App Execution Alias. Prior AppX IFEO hooks removed: $appxHookRemoved (failed: $appxHookRemoveFailed). Detector B pre-seeded $($preseededCleanGui.Count) CLEAN-GUI admin tool (mmc.exe reason 'G' -- silently refuses SYSTEM; launched as user from launch #1, IFEO hook retained). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count) droppedAppx=$seedDroppedAppx persistedAppx=$($CompatExclusions.AppX.Count) appxHookRemoved=$appxHookRemoved appxHookRemoveFailed=$appxHookRemoveFailed preseededCleanGui=$($preseededCleanGui.Count)"
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser + $seedDroppedAppx AppX/Store-stub from the seed (launch as user from launch #1; browsers persisted reason 'P', AppX set persisted reason 'A'). AppX/Store-redirector stubs (notepad/mspaint/calc/photos/etc.) are NOT IFEO-hooked -- they cannot run as SYSTEM (AppX activation needs user identity) and gmproxy's rename/copy breaks their Store redirect, so they launch natively as the user via the App Execution Alias. Prior AppX IFEO hooks removed: $appxHookRemoved (failed: $appxHookRemoveFailed). Admin tools (mmc/perfmon/resmon) DROPPED from IFEO (gmproxy rename breaks MMC snap-in loading) + pre-seeded reason 'G' so the monitor + gmhook skip SYSTEM-birth; they launch NATIVELY as the admin user. Prior admin-tool IFEO hooks removed: $adminHookRemoved (failed: $adminHookRemoveFailed). Detector B pre-seeded $($preseededCleanGui.Count) + $($preseededCleanGuiAdmin.Count) CLEAN-GUI admin tools (mmc.exe reason 'G' silently refuses SYSTEM; perfmon.exe + resmon.exe reason 'G' delegate to mmc; launched as user from launch #1, NO IFEO hook). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count) droppedAppx=$seedDroppedAppx persistedAppx=$($CompatExclusions.AppX.Count) appxHookRemoved=$appxHookRemoved appxHookRemoveFailed=$appxHookRemoveFailed adminHookRemoved=$adminHookRemoved adminHookRemoveFailed=$adminHookRemoveFailed preseededCleanGui=$($preseededCleanGui.Count) preseededCleanGuiAdmin=$($preseededCleanGuiAdmin.Count)"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow

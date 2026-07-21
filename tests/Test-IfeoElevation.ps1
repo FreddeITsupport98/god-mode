@@ -92,7 +92,15 @@ $installBody = if ($installMatch.Success) { $installMatch.Groups[1].Value } else
 Add-Assertion "Install-IfeoElevation body extractable (adjacent to Uninstall)" ($installMatch.Success) "could not isolate Install-IfeoElevation body"
 
 # Extract the $IfeoElevationApps array text from the Install body (the app list).
-$arrMatch = [regex]::Match($installBody, '(?s)\$IfeoElevationApps\s*=\s*@\((.*?)\)')
+# The terminator is the array-close `)` that sits ALONE on its own line
+# (\r?\n\s*\)) -- NOT the first `)` in the body. The seed's admin-tools comment
+# block contains parenthesized prose e.g. `(services, eventvwr, compmgmt, ...)`
+# and `(USER-AUTOEXCLUDE mode)`, so a lazy `\((.*?)\)` would stop at the first
+# comment `)` and miss the entries after it (steam/epic/origin/uplay/battle.net/
+# minecraft). Requiring the close `)` to be the only non-whitespace on its line
+# skips every `)` that is part of a comment line (those start with `#`, not
+# whitespace). Robust to future comment prose additions too.
+$arrMatch = [regex]::Match($installBody, '(?s)\$IfeoElevationApps\s*=\s*@\((.*?\r?\n\s*\))')
 $arrText = if ($arrMatch.Success) { $arrMatch.Groups[1].Value } else { "" }
 Add-Assertion "Install-IfeoElevation: IfeoElevationApps array present" ($arrMatch.Success) "app-list array not found in Install-IfeoElevation"
 
@@ -354,6 +362,29 @@ Add-Assertion "Detector B pre-seed: pre-seed variable defines mmc.exe ($preseede
 Add-Assertion "Detector B pre-seed: debug EXIT reports preseededCleanGui count" ($installBody.Contains('preseededCleanGui=$($preseededCleanGui.Count)')) "Install-IfeoElevation debug EXIT does not report the pre-seed count -- regression visibility lost"
 Add-Assertion "Detector B pre-seed: IFEO summary log mentions the mmc.exe pre-seed (CLEAN-GUI)" ($installBody.Contains('Detector B pre-seeded') -and $installBody.Contains('mmc.exe reason ''G''')) "Install-IfeoElevation summary log does not mention the mmc.exe pre-seed -- the user cannot tell why mmc.exe launches as user from launch #1"
 Add-Assertion "Detector B pre-seed: seed comment says mmc.exe silently refuses SYSTEM (not 'known-good as SYSTEM')" ($installBody.Contains('mmc.exe silently refuses SYSTEM')) "Install-IfeoElevation seed comment does not say mmc.exe silently refuses SYSTEM -- the pre-seed rationale is not documented"
+
+# --- 12b-admintools. Admin tools (mmc/perfmon/resmon) DROPPED from IFEO +
+# legacy hook cleanup + perfmon/resmon reason-'G' pre-seed (2026-07-21) ---
+# mmc.exe hosts every .msc snap-in (services/eventvwr/compmgmt/gpedit/secpol/
+# lusrmgr/...); perfmon.exe + resmon.exe delegate to mmc. mmc silently refuses
+# SYSTEM (exits 0, no window) AND gmproxy's IFEO-bypass RENAME breaks MMC
+# snap-in loading EVEN as the current user (COM/snap-in/resource lookup uses
+# the exe name -> a renamed gmproxy_<pid>_mmc.exe can't load snap-ins -> exit
+# 0, no window, USER-AUTOEXCLUDE mode a VM log dump proved). So mmc/perfmon/
+# resmon are DROPPED from the IFEO seed entirely (like browsers + AppX stubs),
+# added to the auto-populate denylist, pre-seeded in the Detector B store with
+# reason 'G' so the monitor + gmhook skip SYSTEM-birth, and any PRIOR gmproxy
+# Debugger hook for them is REMOVED on a re-enable (the old strategy retained
+# the IFEO hook). They launch NATIVELY as the admin user from launch #1.
+Add-Assertion "Admin tools: auto-populate denylist drops mmc/perfmon/resmon (`$GmCriticalIfeoExclude)" ($gm.Contains('"mmc","perfmon","resmon"')) "auto-populate denylist missing mmc/perfmon/resmon -- they could be IFEO-hooked by auto-populate (gmproxy rename breaks MMC)"
+Add-Assertion "Admin tools: old seed entry line removed (no longer IFEO-hooked)" ($installBody -notmatch '"mmc\.exe","perfmon\.exe","resmon\.exe"') "the old mmc/perfmon/resmon IFEO seed entry is still present -- they would be IFEO-hooked (gmproxy rename breaks MMC)"
+Add-Assertion "Admin tools: pre-seed variable defines perfmon.exe + resmon.exe (`$preseededCleanGuiAdmin)" ($installBody.Contains('$preseededCleanGuiAdmin = @(''perfmon.exe'',''resmon.exe'')')) "Install-IfeoElevation missing the perfmon/resmon reason-'G' pre-seed variable"
+Add-Assertion "Admin tools: Install-IfeoElevation pre-seeds perfmon/resmon with reason 'G'" ($installBody.Contains('Add-GmAutoExcludeEntries -BaseNames $preseededCleanGuiAdmin -Reason ''G''')) "Install-IfeoElevation does not pre-seed perfmon/resmon with reason 'G' -- the monitor + gmhook would SYSTEM-birth them (breaks mmc/perfmon/resmon)"
+Add-Assertion "Admin tools: legacy IFEO cleanup loop present (`$adminHookRemoved + `$adminToolNames)" ($installBody.Contains('$adminHookRemoved') -and $installBody.Contains('$adminToolNames')) "Install-IfeoElevation missing the admin-tools prior-IFEO-hook cleanup -- a re-enable on a VM that hooked mmc would leave it hooked (broken renamed copy)"
+Add-Assertion "Admin tools: legacy IFEO cleanup is gmproxy-guarded (guard appears >= 2: AppX + admin)" (([regex]::Matches($installBody, '\$dbg -or \$dbg -notlike "\*gmproxy\*"')).Count -ge 2) "only one gmproxy-guarded cleanup loop (need >= 2: AppX + admin-tools) -- the admin cleanup could remove an unrelated IFEO key"
+Add-Assertion "Admin tools: cleanup builds names from pre-seed vars (`$preseededCleanGui + `$preseededCleanGuiAdmin)" ($installBody.Contains('@($preseededCleanGui) + @($preseededCleanGuiAdmin)')) "admin-tools cleanup does not reuse the pre-seed name vars -- the fixed name set could drift from the pre-seed"
+Add-Assertion "Admin tools: debug EXIT reports adminHookRemoved + preseededCleanGuiAdmin" ($installBody.Contains('adminHookRemoved=$adminHookRemoved') -and $installBody.Contains('preseededCleanGuiAdmin=$($preseededCleanGuiAdmin.Count)')) "debug EXIT does not report the admin-tools cleanup + pre-seed counts -- regression visibility lost"
+Add-Assertion "Admin tools: summary log mentions the admin-tool IFEO drop + cleanup" ($installBody.Contains('Admin tools (mmc/perfmon/resmon) DROPPED from IFEO') -and $installBody.Contains('Prior admin-tool IFEO hooks removed')) "summary log does not mention the admin-tool IFEO drop + cleanup -- the user cannot tell why mmc/perfmon/resmon launch natively"
 
 # --- 12c. notepad detection-miss fix + 3 hardening suggestions (2026-07-19) ---
 # Get-GmSystemCompatExclusions gains (4) a direct C:\Program Files\WindowsApps
