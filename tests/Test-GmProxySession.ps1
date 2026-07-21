@@ -1046,4 +1046,48 @@ if ($egmMatch.Success) {
     Add-Assertion "BugFix: Enable-GodMode has no raw GetFolderPath(Desktop) call left" (-not ($egmBody -match 'GetFolderPath\("Desktop"\)')) "Enable-GodMode still calls GetFolderPath(Desktop) -- the SYSTEM-context uncaught-trap site remains"
 }
 
+# --- 37. Admin-tool SYSTEM elevation + option-11 donor/Detector-B diagnostics (2026-07-21) ---
+# Three additive, non-destructive features (no gmproxy.c change -- PowerShell-only, no
+# driver rebuild; no kill/TerminateProcess path anywhere):
+#   (1) Expand the admin tools God Mode launches as SYSTEM: mmc.exe (hosts ALL .msc snap-
+#       ins -- services/eventvwr/compmgmt/gpedit/secpol/lusrmgr/certmgr/diskmgmt/taskschd/
+#       ...), perfmon.exe, resmon.exe added to the Install-IfeoElevation seed + the
+#       Uninstall-ProcessHook legacy list + the Export-GodModeLogs IFEO-status check.
+#       Known-good as SYSTEM (the PsExec -s mmc pattern); Detector B self-heals any snap-
+#       in that does not tolerate SYSTEM (gmproxy.c threshold=2 -> auto-exclude).
+#   (2) Option-11 SYSTEM token DONOR INVENTORY: Get-GodModeElevationPathDiagnostics probes
+#       each Session>0 SYSTEM process with the read-only [TokenOps]::TestOpenProcess (the
+#       SAME probe Find-SystemProcessCandidate uses -- opens PROCESS_QUERY_LIMITED_INFORMATION,
+#       duplicates the token, closes every handle; NO kill, NO retained handle) and tags it
+#       [OPENABLE] vs [PPL/DENIED] vs [?], with gmproxy's priority donors
+#       (winlogon/dwm/fontdrvhost) marked <<priority. Tally + a root-cause line when ALL
+#       donors are denied (elevation degrades to a current-user launch).
+#   (3) Option-11 Detector B AUTO-EXCLUDE STORE view: reads $GodModeAutoExcludeFile, prints
+#       each entry + the reason legend (C/G/P/A/?) + the threshold, tallies EXCLUDED vs
+#       PENDING, hints at menu [18] to retry. Fail-open on a missing store.
+# Self-contained body extraction (mirrors section 35 but with a section-37-local var so
+# this block stays robust if section 35 ever moves). Additive; sections 1-36 intact.
+$epd37Match = [regex]::Match($gm, '(?s)function\s+Get-GodModeElevationPathDiagnostics\s*\{(.*?)\nfunction\s+Export-GodModeLogs\s*\{')
+$epd37Body = if ($epd37Match.Success) { $epd37Match.Groups[1].Value } else { "" }
+Add-Assertion "AdminTools+Opt11: Get-GodModeElevationPathDiagnostics body extractable (section 37)" ($epd37Match.Success) "could not isolate Get-GodModeElevationPathDiagnostics body for section 37"
+# Feature 1 -- admin tools elevated as SYSTEM.
+Add-Assertion "AdminTools: mmc/perfmon/resmon added to Install-IfeoElevation seed (launched as SYSTEM)" ($gm -match 'function\s+Install-IfeoElevation\s*\{[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Install-IfeoElevation seed does not include mmc/perfmon/resmon -- admin tools are not SYSTEM-elevated"
+Add-Assertion "AdminTools: mmc/perfmon/resmon in Uninstall-ProcessHook legacy list (uninstaller sync)" ($gm -match 'function\s+Uninstall-ProcessHook\s*\{[\s\S]*?"mmc\.exe", "perfmon\.exe", "resmon\.exe"') "Uninstall-ProcessHook legacy list missing mmc/perfmon/resmon -- uninstaller not current with the expanded seed"
+Add-Assertion "AdminTools: mmc/perfmon/resmon in Export-GodModeLogs IFEO-status check (`$TargetApps)" ($gm -match 'function\s+Export-GodModeLogs\s*\{[\s\S]*?\$TargetApps[\s\S]*?"mmc\.exe","perfmon\.exe","resmon\.exe"') "Export-GodModeLogs `$TargetApps does not include mmc/perfmon/resmon -- the dump cannot show whether the admin tools are IFEO-hooked"
+# Feature 2 -- SYSTEM token donor inventory (read-only, no kill).
+if ($epd37Match.Success) {
+    Add-Assertion "Opt11Donor: diagnostics probes each SYSTEM donor via [TokenOps]::TestOpenProcess (read-only, no kill)" ($epd37Body.Contains('[TokenOps]::TestOpenProcess($p.ProcessId)')) "diagnostics does not call [TokenOps]::TestOpenProcess per donor -- cannot classify openable vs PPL (donor usability stays hidden)"
+    Add-Assertion "Opt11Donor: classifies donors [OPENABLE] vs [PPL/DENIED]" ($epd37Body.Contains('[OPENABLE]') -and $epd37Body.Contains('[PPL/DENIED]')) "diagnostics does not tag donors OPENABLE/PPL/DENIED -- gmproxy cannot tell which SYSTEM processes are usable token sources"
+    Add-Assertion "Opt11Donor: marks gmproxy priority donors (winlogon/dwm/fontdrvhost) <<priority" ($epd37Body.Contains('<<priority') -and $epd37Body.Contains('winlogon.exe') -and $epd37Body.Contains('dwm.exe') -and $epd37Body.Contains('fontdrvhost.exe')) "diagnostics does not mark the priority donors -- gmproxy's preferred token sources are not highlighted in the dump"
+    Add-Assertion "Opt11Donor: tallies the donor inventory (DONOR INVENTORY summary line)" ($epd37Body.Contains('DONOR INVENTORY:')) "diagnostics does not tally the donor inventory -- openable/denied counts are missing"
+    Add-Assertion "Opt11Donor: reports the degrade-to-current-user root cause when all donors denied" ($epd37Body.Contains('degrades to a current-user launch')) "diagnostics does not explain the degrade-to-current-user outcome when all donors are PPL-protected -- the 'whoami -> admin' root cause stays unstated"
+    # Feature 3 -- Detector B auto-exclude store view.
+    Add-Assertion "Opt11DetB: diagnostics reads the Detector B store (`$GodModeAutoExcludeFile)" ($epd37Body.Contains('$GodModeAutoExcludeFile')) "diagnostics does not read the Detector B auto-exclude store -- gmproxy's runtime SYSTEM-crash learnings are invisible in the dump"
+    Add-Assertion "Opt11DetB: Detector B section header present (DETECTOR B AUTO-EXCLUDE STORE)" ($epd37Body.Contains('----- DETECTOR B AUTO-EXCLUDE STORE -----')) "Detector B section header missing -- the store view is not a labeled section"
+    Add-Assertion "Opt11DetB: prints the reason legend (C=CRASH / G=CLEAN-GUI / P=PRE-DROP / A=AppX)" ($epd37Body.Contains('C=CRASH') -and $epd37Body.Contains('G=CLEAN-GUI') -and $epd37Body.Contains('P=PRE-DROP') -and $epd37Body.Contains('A=AppX')) "diagnostics does not print the Detector B reason legend -- store entries are uninterpretable"
+    Add-Assertion "Opt11DetB: prints the auto-exclude threshold (GM_AUTOEXCLUDE_THRESHOLD)" ($epd37Body.Contains('GM_AUTOEXCLUDE_THRESHOLD')) "diagnostics does not print the Detector B threshold -- the crash-count-to-exclude rule is unstated"
+    Add-Assertion "Opt11DetB: hints at menu [18] RESET AUTO-EXCLUDE STORE to retry elevation" ($epd37Body.Contains('RESET AUTO-EXCLUDE STORE')) "diagnostics does not hint at menu [18] to retry SYSTEM elevation for excluded apps"
+    Add-Assertion "Opt11DetB: fail-open on a missing store (store not present message)" ($epd37Body.Contains('store not present')) "diagnostics is not fail-open on a missing Detector B store -- a missing store could throw"
+}
+
 Write-Summary

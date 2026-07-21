@@ -3686,24 +3686,58 @@ function Get-GodModeElevationPathDiagnostics {
         $sec += "  If your cmd/powershell shows NOT-SYSTEM here, the monitor did not elevate it."
     } catch { $sec += "[INTERACTIVE SHELLS probe failed: $_]" }
 
-    # --- F. SYSTEM token source (what the monitor steals from) ---
+    # --- F. SYSTEM token source (what the monitor steals from) + donor inventory ---
     try {
         $sec += "----- SYSTEM TOKEN SOURCE -----"
         $cand = 0
         try { $cand = Find-SystemProcessCandidate } catch {}
         $sec += "  Find-SystemProcessCandidate -> PID=$cand  $(if ($cand -gt 0) { '(a SYSTEM token source IS available)' } else { '(NO SYSTEM token source -- shells CANNOT be elevated!)' })"
-        $sysProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ProcessId -gt 4 } | Sort-Object SessionId)
+        # gmproxy's priority SYSTEM-token donors (gmproxy.c FindSystemProcessForToken
+        # priorityNames): winlogon / dwm / fontdrvhost. Sort these FIRST so the 25-row
+        # cap below always surfaces them (they are the donors gmproxy actually prefers).
+        $priorityDonors = @('winlogon.exe','dwm.exe','fontdrvhost.exe')
+        $sysProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.SessionId -gt 0 -and $_.ProcessId -gt 4 } |
+            Sort-Object @{ Expression = { if ($priorityDonors -contains $_.Name) { 0 } else { 1 } } }, SessionId)
         $shown = 0
+        $donorOpenable = 0; $donorDenied = 0; $donorPriorityOpenable = 0; $donorPriorityDenied = 0
         foreach ($p in $sysProcs) {
             if ($shown -ge 25) { break }
             $owner = "n/a"
             try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue; if ($o -and $o.User) { $owner = "$($o.User)" } } catch {}
             if ("$owner" -eq "SYSTEM") {
-                $sec += "  PID=$($p.ProcessId) Name=$($p.Name) Session=$($p.SessionId) Owner=SYSTEM"
+                # Read-only donor-usability probe (mirrors gmproxy.c IsOpenableSystemProcess via
+                # the SAME [TokenOps]::TestOpenProcess Find-SystemProcessCandidate uses): opens
+                # PROCESS_QUERY_LIMITED_INFORMATION, opens+duplicates the token, then closes every
+                # handle. NO kill, NO retained handle -- purely a query. Tags each SYSTEM process
+                # [OPENABLE] (gmproxy can steal a session-correct SYSTEM token from it) vs
+                # [PPL/DENIED] (OpenProcess / token-duplicate failed -> PPL-protected or ACL-
+                # denied) vs [?] (probe threw). Priority donors get <<priority. Tally totals.
+                $openable = $null
+                try { $openable = [TokenOps]::TestOpenProcess($p.ProcessId) } catch { $openable = $null }
+                $tag = if ($null -eq $openable) { '[?]' } elseif ($openable) { '[OPENABLE]' } else { '[PPL/DENIED]' }
+                $isPriority = ($priorityDonors -contains $p.Name)
+                if ($isPriority) { $tag += ' <<priority' }
+                if ($openable) {
+                    $donorOpenable++
+                    if ($isPriority) { $donorPriorityOpenable++ }
+                } else {
+                    $donorDenied++
+                    if ($isPriority) { $donorPriorityDenied++ }
+                }
+                $sec += "  PID=$($p.ProcessId) Name=$($p.Name) Session=$($p.SessionId) Owner=SYSTEM $tag"
                 $shown++
             }
         }
         if ($shown -eq 0) { $sec += "  [No Session>0 SYSTEM processes found -- winlogon/dwm not SYSTEM? PPL?]" }
+        $sec += "  DONOR INVENTORY: openable=$donorOpenable denied=$donorDenied priority_openable=$donorPriorityOpenable priority_denied=$donorPriorityDenied (of $shown SYSTEM row(s) shown)"
+        if ($donorPriorityOpenable -gt 0) {
+            $sec += "  -> gmproxy CAN steal a session-correct SYSTEM token from a priority donor (winlogon/dwm/fontdrvhost) -- SYSTEM elevation should succeed."
+        } elseif ($donorOpenable -gt 0) {
+            $sec += "  -> No priority donor is openable, but another Session>0 SYSTEM process is -- gmproxy falls back to it (FindSystemProcessForToken anyHit)."
+        } else {
+            $sec += "  -> ALL Session>0 SYSTEM donors are PPL-protected/denied. gmproxy cannot steal a session-correct SYSTEM token -> elevation degrades to a current-user launch (the root cause of 'whoami -> admin'). Check SeDebugPrivilege / PPL protection."
+        }
     } catch { $sec += "[SYSTEM TOKEN SOURCE probe failed: $_]" }
 
     # --- G. seclogon (Phase 1 CreateProcessWithTokenW fallback dependency) ---
@@ -3759,6 +3793,42 @@ function Get-GodModeElevationPathDiagnostics {
             $sec += "  [No admin or SYSTEM-temp logs found at all -- God Mode may never have run.]"
         }
     } catch { $sec += "[MONITOR MARKER SCAN failed: $_]" }
+
+    # --- J. Detector B auto-exclude store (which apps gmproxy learned crash as SYSTEM) ---
+    try {
+        $sec += "----- DETECTOR B AUTO-EXCLUDE STORE -----"
+        $sec += "  Store: $GodModeAutoExcludeFile"
+        $sec += "  Threshold: 2 SYSTEM crashes (gmproxy.c GM_AUTOEXCLUDE_THRESHOLD) -- an app that"
+        $sec += "  crashes/refuses as SYSTEM twice is auto-excluded to a normal-user launch (IFEO hook retained)."
+        $sec += "  Reason legend: C=CRASH (non-zero exit)  G=CLEAN-GUI (exit 0 + GUI PE, WinUI/AppX refusal)"
+        $sec += "                P=PRE-DROP (install-time browser drop)  A=AppX/Store stub  ?=old/unknown"
+        if (-not (Test-Path $GodModeAutoExcludeFile)) {
+            $sec += "  [store not present -- no app has crashed as SYSTEM since the last reset (menu [18])]"
+        } else {
+            $lines = Get-Content -Path $GodModeAutoExcludeFile -ErrorAction SilentlyContinue
+            $excluded = 0; $pending = 0; $entries = 0
+            if ($lines) {
+                foreach ($line in $lines) {
+                    if (-not $line) { continue }
+                    $parts = $line -split '\|'
+                    if ($parts.Count -ge 4) {
+                        $entries++
+                        $rex = if ($parts[3] -eq '1') { 'EXCLUDED' } else { 'PENDING(count<threshold)' }
+                        if ($parts[3] -eq '1') { $excluded++ } else { $pending++ }
+                        $rsn = if ($parts.Count -ge 5 -and $parts[4]) { $parts[4] } else { '?' }
+                        $sec += "  base=$($parts[0]) count=$($parts[1]) status=$rex reason=$rsn"
+                    }
+                }
+            }
+            $sec += "  SUMMARY: $entries entry/entries, $excluded EXCLUDED, $pending PENDING (count<threshold)."
+            if ($excluded -gt 0) {
+                $sec += "  -> Use menu [18] RESET AUTO-EXCLUDE STORE to retry SYSTEM elevation for the excluded apps."
+            } else {
+                $sec += "  -> No app is currently excluded; every hooked app still attempts SYSTEM elevation."
+            }
+        }
+        $sec += "  HINT: an app ABSENT from this store never crashed as SYSTEM (it stayed elevated)."
+    } catch { $sec += "[DETECTOR B AUTO-EXCLUDE STORE probe failed: $_]" }
 
     return ($sec -join "`r`n")
 }
@@ -3829,7 +3899,7 @@ function Export-GodModeLogs {
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         # Includes a few Install-IfeoElevation targets (chrome/notepad/regedit/mstsc) plus the
         # deliberately-excluded shells (cmd/powershell) which should read NOT HOOKED by design.
-        $TargetApps = @("chrome.exe","firefox.exe","msedge.exe","notepad.exe","cmd.exe","powershell.exe","regedit.exe","mstsc.exe")
+        $TargetApps = @("chrome.exe","firefox.exe","msedge.exe","notepad.exe","cmd.exe","powershell.exe","regedit.exe","mstsc.exe","mmc.exe","perfmon.exe","resmon.exe")
         foreach ($app in $TargetApps) {
             $appPath = Join-Path $IfeoPath $app
             $Debugger = $null
@@ -5343,7 +5413,7 @@ function Uninstall-ProcessHook {
         $IfeoPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $LegacyIfeoApps = @("chrome.exe", "firefox.exe", "msedge.exe", "notepad.exe", "cmd.exe", "powershell.exe",
             "opera.exe", "brave.exe", "vivaldi.exe", "iexplore.exe", "notepad++.exe", "wordpad.exe",
-            "pwsh.exe", "wt.exe", "wsl.exe", "wslhost.exe", "explorer.exe", "taskmgr.exe", "regedit.exe",
+            "pwsh.exe", "wt.exe", "wsl.exe", "wslhost.exe", "explorer.exe", "taskmgr.exe", "regedit.exe", "mmc.exe", "perfmon.exe", "resmon.exe",
             "msconfig.exe", "mspaint.exe", "calc.exe", "snippingtool.exe", "winword.exe", "excel.exe",
             "powerpnt.exe", "outlook.exe", "msaccess.exe", "onenote.exe", "teams.exe", "code.exe",
             "sublime_text.exe", "devenv.exe", "rider64.exe", "pycharm64.exe", "idea64.exe", "eclipse.exe",
@@ -5842,6 +5912,16 @@ function Install-IfeoElevation {
             "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
             "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
             "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
+            # Administrator / management tools launched as SYSTEM. mmc.exe hosts ALL .msc snap-ins
+            # -- services.msc, eventvwr.msc, compmgmt.msc, gpedit.msc, secpol.msc, lusrmgr.msc,
+            # certmgr.msc, diskmgmt.msc, taskschd.msc, fsmgmt.msc, wf.msc and more -- so one IFEO
+            # key covers every snap-in. perfmon.exe + resmon.exe are the perf and resource monitors.
+            # These are known-good as SYSTEM -- the PsExec -s mmc pattern -- and are NOT in any
+            # denylist used by Get-IfeoElevationCandidates or Add-IfeoElevationForApp, and are NOT
+            # AppX or browser so Detector A's compat filter passes them. Any snap-in that does NOT
+            # tolerate SYSTEM is self-healed by Detector B: gmproxy.c threshold is 2, after which
+            # the app auto-excludes to a normal-user launch.
+            "mmc.exe","perfmon.exe","resmon.exe",
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
 
