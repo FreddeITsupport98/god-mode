@@ -761,30 +761,39 @@ Add-Assertion "Opt2 D: Start-Monitoring `$CriticalProcs contains powershell_ise.
 Add-Assertion "Opt2 D: polling new-process scan passes -ProcessId `$proc.ProcessId (Phase 0 for shells)" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow')) "polling new-process scan does not pass -ProcessId -- shells would fall to kill+relaunch (loses session/cwd)"
 Add-Assertion "Opt2 D: WMI watcher drain still passes -ProcessId `$evt.ProcessId" ($gm.Contains('Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain no longer passes -ProcessId -- regression in the in-place elevation path"
 
-# --- 30. PS7 WMI process-creation watcher compat (+= -> Register-ObjectEvent) +
-# persistent-monitor registration (2026-07-20) ---
-# Two bugs broke interactive-shell (cmd/powershell/pwsh/ISE) auto-elevation on
-# PS 7.x: (1) Register-ProcessCreationWatcher used `$watcher.EventArrived += {}`
-# which PS7 rejects ("The property 'EventArrived' cannot be found on this object")
-# -- the watcher silently failed to register (log: "WMI process creation watcher
-# failed to register"); (2) it was called ONLY in Enable-GodMode (a one-shot
-# activator that exits), NOT in Start-Monitoring (the persistent scheduled-task
-# monitor), so even if it registered it died with the activator and the monitor's
-# event-driven shell elevator was dead. Fix: Register-ObjectEvent + -MessageData
-# (PS7-correct; the -Action runs in the event runscape where $script: does not
-# resolve) AND Register-ProcessCreationWatcher is now called from Start-Monitoring
-# so the watcher lives as long as the SYSTEM monitor. Shells are console/UI apps
-# the global WH_GETMESSAGE hook does not auto-inject and were removed from IFEO,
-# so this WMI watcher is their SOLE event-driven elevator (Phase 0 in-place
-# ReplaceProcessTokenForPid token swap). The 5s polling new-process scan remains
-# the fallback when the watcher is inactive.
-Add-Assertion "PS7 WMI: Register-ProcessCreationWatcher uses Register-ObjectEvent (not +=)" ($gm -match 'Register-ObjectEvent -InputObject \$script:ProcessCreationWatcher -EventName ''EventArrived''') "Register-ProcessCreationWatcher still uses the PS7-broken .EventArrived += adapter -- watcher silently fails to register on PS 7.x"
-Add-Assertion "PS7 WMI: NO .EventArrived += left (PS7-incompatible)" ($gm -notmatch '\.EventArrived\s*\+=') "Register-ProcessCreationWatcher still has .EventArrived += -- PS7 throws 'property EventArrived cannot be found' and the watcher never registers"
-Add-Assertion "PS7 WMI: queue passed via -MessageData (runscope-safe, not `$script:)" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?MessageData \$queue') "Register-ProcessCreationWatcher does not pass the queue via -MessageData -- the -Action block (event runscape) could not reach the queue reliably"
-Add-Assertion "PS7 WMI: action reads `$EventArgs.NewEvent.TargetInstance + `$Event.MessageData" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?\$EventArgs\.NewEvent\.TargetInstance' -and $gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,5000}?\$Event\.MessageData') "Register-ProcessCreationWatcher action does not use the automatic event vars -- the handler could not read the new process or reach the queue"
+# --- 30. PS7 WMI process-creation watcher compat (+= -> Register-ObjectEvent ->
+# ThreadJob+WaitForNextEvent) + persistent-monitor registration (2026-07-20) ---
+# Interactive shells (cmd/powershell/pwsh/ISE) are NOT IFEO-hooked (by design) and
+# the global WH_GETMESSAGE hook does not auto-inject them, so a WMI process-creation
+# watcher is their SOLE event-driven elevator (Phase 0 in-place ReplaceProcessTokenForPid).
+# Three iterations of PS7 compat:
+#   (1) PS 5.1 used `$watcher.EventArrived += {}`. PS 7.x removed that adapter (it
+#       throws "The property 'EventArrived' cannot be found") -> the watcher silently
+#       failed to register (log: "WMI process creation watcher failed to register").
+#   (2) An earlier fix switched to `Register-ObjectEvent -Action`. That REGISTERS on
+#       PS7 without error, BUT the -Action block only runs when the runscape PUMPS the
+#       PowerShell event queue -- which a non-interactive scheduled-task runscape
+#       (-WindowStyle Hidden, no console "pulse") does NOT do reliably. So the watcher
+#       reported Active=$true, the 5s polling fallback was gated OFF (it only ran when
+#       Active=$false), and shells got NEITHER path -> stayed admin (whoami -> admin).
+#       This is the symptom that persisted across two prior fix rounds.
+#   (3) FINAL fix: drive delivery from a background ThreadJob calling
+#       ManagementEventWatcher.WaitForNextEvent() in a loop. WaitForNextEvent() blocks
+#       the ThreadJob's own thread until a WMI event fires -- independent of the
+#       runscape event-queue pump. The ThreadJob populates the shared synchronized
+#       queue + a heartbeat counter; the 5s polling fallback now runs UNCONDITIONALLY
+#       (throttled) as a guaranteed safety net so a dead watcher never strands shells.
+# The watcher MUST live in THIS persistent monitor (Start-Monitoring, the scheduled
+# task), not only in Enable-GodMode (a one-shot activator that exits) -- otherwise it
+# dies with the activator. The 5s polling fallback is the universal safety net.
+Add-Assertion "PS7 WMI: Register-ProcessCreationWatcher uses Start-ThreadJob + WaitForNextEvent (pump-independent delivery)" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,6000}?Start-ThreadJob[\s\S]{0,3000}?WaitForNextEvent') "Register-ProcessCreationWatcher does not use a ThreadJob + WaitForNextEvent delivery loop -- PS7 Register-ObjectEvent -Action does not pump in a non-interactive scheduled-task runscape, so shells would never be event-elevated"
+Add-Assertion "PS7 WMI: NO .EventArrived += left (PS7-incompatible adapter)" ($gm -notmatch '\.EventArrived\s*\+=') "Register-ProcessCreationWatcher still has .EventArrived += -- PS7 throws 'property EventArrived cannot be found' and the watcher never registers"
+Add-Assertion "PS7 WMI: queue + watcher passed to the ThreadJob via -ArgumentList (runscope-safe)" ($gm -match 'function\s+Register-ProcessCreationWatcher[\s\S]{0,8000}?\-ArgumentList \$watcher, \$queue, \$state') "Register-ProcessCreationWatcher does not pass the watcher+queue+state to the ThreadJob via -ArgumentList -- the ThreadJob could not reach them reliably"
+Add-Assertion "PS7 WMI: ThreadJob reads `$evt.TargetInstance from WaitForNextEvent" ($gm -match 'WaitForNextEvent\(\)[\s\S]{0,500}?\$evt\.TargetInstance') "Register-ProcessCreationWatcher ThreadJob does not read `$evt.TargetInstance from WaitForNextEvent -- the new process instance could not be extracted"
 Add-Assertion "PS7 WMI: defensive Add-Type System.Management (assembly load)" ($gm -match 'Add-Type -AssemblyName System\.Management') "Register-ProcessCreationWatcher missing the defensive Add-Type System.Management -- ManagementEventWatcher could be unresolved on a clean PS7 runspace"
+Add-Assertion "PS7 WMI: ThreadJob increments a shared heartbeat counter (`$state.Beats / `$st.Beats)" ($gm.Contains('$st.Beats = [int]$st.Beats + 1')) "Register-ProcessCreationWatcher ThreadJob does not increment a heartbeat counter -- the liveness check cannot prove the watcher is delivering"
 Add-Assertion "PS7 WMI: Start-Monitoring registers the watcher (persistent SYSTEM monitor)" ($gm -match 'function\s+Start-Monitoring[\s\S]{0,8000}?\$null = Register-ProcessCreationWatcher') "Start-Monitoring does NOT call Register-ProcessCreationWatcher -- the watcher was only registered in Enable-GodMode (one-shot, exits) so the persistent monitor's event-driven shell elevator is dead"
-Add-Assertion "PS7 WMI: Unregister-ProcessCreationWatcher tears down the event subscription + job" ($gm -match 'function\s+Unregister-ProcessCreationWatcher[\s\S]{0,2000}?Unregister-Event -SourceIdentifier ''GMProcessCreationWatcher''') "Unregister-ProcessCreationWatcher does not Unregister-Event the subscription -- re-registration / Disable-GodMode would leak the event job"
+Add-Assertion "PS7 WMI: Unregister-ProcessCreationWatcher stops the ThreadJob + watcher (no leak)" ($gm -match 'function\s+Unregister-ProcessCreationWatcher[\s\S]{0,2000}?ProcessCreationWatcherJob[\s\S]{0,500}?Stop-Job' -and $gm -match 'function\s+Unregister-ProcessCreationWatcher[\s\S]{0,2000}?ProcessCreationWatcher\.Stop\(\)') "Unregister-ProcessCreationWatcher does not stop the ThreadJob + watcher -- re-registration / Disable-GodMode would leak the job and WMI subscription"
 
 # --- 31. WMI watcher drain ArrayList-dequeue fix + CriticalProcs/shell guards
 # (2026-07-20) ---
@@ -812,5 +821,32 @@ Add-Assertion "Drain guard: event drain skips CriticalProcs except shells (`$she
 Add-Assertion "Drain guard: event drain skips auto-excluded apps (Test-GmAutoExcluded `$procBase)" ($gm.Contains('if (Test-GmAutoExcluded $procBase)')) "WMI watcher drain does not consult Test-GmAutoExcluded -- an auto-excluded AppX stub could be kill+relaunched (breaks the stub)"
 Add-Assertion "Drain guard: 5s polling skips CriticalProcs except shells (`$shellNames -notcontains `$pollBase)" ($gm.Contains('($CriticalProcs -contains $pollBase) -and ($shellNames -notcontains $pollBase)')) "5s polling fallback has no CriticalProcs-except-shells guard -- explorer/dwm would be in-place-swapped when the watcher is down"
 Add-Assertion "Drain guard: 5s polling skips auto-excluded apps (Test-GmAutoExcluded `$pollBase)" ($gm.Contains('if (Test-GmAutoExcluded $pollBase)')) "5s polling fallback does not consult Test-GmAutoExcluded -- an auto-excluded AppX stub could be kill+relaunched"
+
+# --- 32. WMI watcher liveness heartbeat + unconditional 5s polling safety net
+# (2026-07-20) ---
+# Two belt-and-suspenders guarantees so interactive shells can NEVER be stranded by
+# a dead/stuck WMI watcher (the failure mode that persisted across the prior PS7 +
+# drain-fix rounds: watcher registered Active=$true but never delivered -> 5s polling
+# was gated OFF -> shells stayed admin):
+#   A. The 5s new-process polling fallback now runs UNCONDITIONALLY (throttled to ~3s),
+#      regardless of $ProcessCreationWatcherActive. It was previously gated on
+#      `-not $ProcessCreationWatcherActive`, so a registered-but-not-delivering watcher
+#      disabled the only reliable (direct WMI query) elevation path for shells.
+#      $lastElevatedPid dedup prevents double-elevation when both the watcher and
+#      polling catch the same PID. Shells are caught within ~3s no matter what.
+#   B. A 30s liveness heartbeat checks the watcher ThreadJob State; if it died (not
+#      Running), the watcher is auto-re-registered to restore the ~1s fast path, and
+#      the death is logged. Beats delta is logged for observability. The polling
+#      safety net (A) means a dead watcher never strands shells even before the
+#      heartbeat re-registers it.
+Add-Assertion "Heartbeat A: 5s polling runs UNCONDITIONALLY (no -not ProcessCreationWatcherActive gate)" ($gm.Contains('if ($isSystem -and ((Get-Date) - $lastNewProcPoll -gt [TimeSpan]::FromSeconds(3)))')) "5s polling is still gated on -not $ProcessCreationWatcherActive -- a registered-but-not-delivering watcher would disable the only reliable shell-elevation path"
+Add-Assertion "Heartbeat A: 5s polling throttle var `$lastNewProcPoll initialized" ($gm.Contains('$lastNewProcPoll = [datetime]::MinValue')) "Start-Monitoring missing $lastNewProcPoll -- the 3s polling throttle cannot work"
+Add-Assertion "Heartbeat A: 5s polling sets `$lastNewProcPoll inside the gate" ($gm.Contains('$lastNewProcPoll = Get-Date')) "5s polling does not set $lastNewProcPoll inside the gate -- it would fire every iteration (WMI query storm)"
+Add-Assertion "Heartbeat B: 30s liveness heartbeat check present (`$lastWatcherHealthCheck -gt 30s)" ($gm.Contains('((Get-Date) - $lastWatcherHealthCheck -gt [TimeSpan]::FromSeconds(30))')) "Start-Monitoring missing the 30s watcher liveness heartbeat -- a dead watcher would not be detected/re-registered"
+Add-Assertion "Heartbeat B: heartbeat checks ThreadJob State -eq 'Running'" ($gm -match '\$script:ProcessCreationWatcherJob\.State -eq ''Running''') "heartbeat does not check the watcher ThreadJob State -- cannot detect a dead watcher"
+Add-Assertion "Heartbeat B: heartbeat auto-re-registers a dead watcher (Register-ProcessCreationWatcher)" ($gm -match 'if \(\$script:ProcessCreationWatcherActive -and -not \$jobAlive\)[\s\S]{0,800}?Register-ProcessCreationWatcher') "heartbeat does not re-register a dead watcher -- the fast ~1s elevation path would stay down"
+Add-Assertion "Heartbeat B: heartbeat reads `$script:ProcessCreationWatcherState.Beats (delivery proof)" ($gm.Contains('$script:ProcessCreationWatcherState.Beats')) "heartbeat does not read the watcher Beats counter -- no delivery-proof liveness signal"
+Add-Assertion "Heartbeat B: `$lastWatcherHealthCheck + `$lastWatcherBeats initialized" ($gm.Contains('$lastWatcherHealthCheck = [datetime]::MinValue') -and $gm.Contains('$lastWatcherBeats = 0')) "Start-Monitoring missing $lastWatcherHealthCheck / $lastWatcherBeats -- the heartbeat timers cannot work"
+Add-Assertion "Heartbeat: `$script:ProcessCreationWatcherJob + `$script:ProcessCreationWatcherState defined" ($gm.Contains('$script:ProcessCreationWatcherJob = $null') -and $gm.Contains('$script:ProcessCreationWatcherState = [hashtable]::Synchronized')) "watcher ThreadJob job + heartbeat state vars missing -- the liveness heartbeat cannot inspect/re-register the watcher"
 
 Write-Summary

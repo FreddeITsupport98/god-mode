@@ -6083,6 +6083,17 @@ function Get-NonSystemProcessesParallel {
 
 $script:ProcessCreationQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 $script:ProcessCreationWatcher = $null
+# Watcher delivery runs on a background ThreadJob (Start-ThreadJob) calling
+# ManagementEventWatcher.WaitForNextEvent() in a loop -- see Register-ProcessCreationWatcher
+# for why Register-ObjectEvent -Action is NOT used (its -Action never pumps in a
+# non-interactive scheduled-task runscape, so events were queued but never copied into
+# $ProcessCreationQueue -> shells stayed admin). The job ref is stored here so the
+# Start-Monitoring liveness heartbeat can check its State and auto-re-register on death.
+$script:ProcessCreationWatcherJob = $null
+# Shared heartbeat state (synchronized hashtable -> thread-safe across the ThreadJob and
+# the main loop): Stopped = shutdown signal to the ThreadJob; Beats = total WMI events
+# the ThreadJob copied into the queue (liveness + delivery proof for the heartbeat).
+$script:ProcessCreationWatcherState = [hashtable]::Synchronized(@{ Stopped = $false; Beats = 0 })
 
 # GmProxy graceful-fallback PID handoff: gmproxy.exe signals the monitor with the
 # PID it launched as the current user (named pipe GodMode-GmProxyFeedback) so the
@@ -6093,62 +6104,106 @@ $script:GmProxyFeedbackQueue = [System.Collections.ArrayList]::Synchronized([Sys
 $script:GmProxyFeedbackPipeJob = $null
 
 function Register-ProcessCreationWatcher {
-    # NOTE: PowerShell 7 removed the PSEventReceived adapter that let Windows
-    # PowerShell 5.1 attach .NET event handlers with `$obj.EventName += { ... }`.
-    # On PS 7.x that syntax throws "The property '<EventName>' cannot be found on
-    # this object. Verify that the property exists and can be set." -- which is
-    # exactly why this watcher silently failed to register (log: "WMI process
-    # creation watcher failed to register"), and interactive shells
-    # cmd/powershell/pwsh/powershell_ise were never event-elevated. Use
-    # Register-ObjectEvent instead, and pass the shared synchronized queue via
-    # -MessageData: the -Action block runs in the event-subscription runspace
-    # where $script: scope does NOT reliably resolve, so the queue MUST be handed
-    # in explicitly. This watcher is the SOLE event-driven elevator for
-    # interactive shells (console/UI apps the global WH_GETMESSAGE hook does not
-    # auto-inject, and that were removed from IFEO so they are not born via
-    # gmproxy); the Start-Monitoring loop drains the queue into
-    # Monitor-ElevateProcess Phase 0 (in-place ReplaceProcessTokenForPid token
-    # swap, no kill, no relaunch, no duplicate).
+    # NOTE: this watcher is the SOLE event-driven elevator for interactive shells
+    # (cmd/powershell/pwsh/powershell_ise -- console/UI apps the global WH_GETMESSAGE
+    # hook does not auto-inject, and that were removed from IFEO so they are not born
+    # via gmproxy). The Start-Monitoring loop drains the shared queue into
+    # Monitor-ElevateProcess Phase 0 (in-place ReplaceProcessTokenForPid token swap,
+    # no kill, no relaunch, no duplicate).
+    #
+    # DELIVERY MODEL (PS7): the ORIGINAL Windows PowerShell 5.1 design attached a
+    # .NET handler to the watcher's EventArrived delegate (the PS 5.1 "+=" syntax).
+    # PS 7.x removed that adapter (throws "The property 'EventArrived' cannot be found"), so an earlier
+    # fix switched to `Register-ObjectEvent -Action`. That REGISTERS without error,
+    # BUT the -Action block only runs when the runspace PUMPS the PowerShell event
+    # queue -- which a non-interactive scheduled-task runscape (-WindowStyle Hidden,
+    # no console "pulse") does NOT do reliably: the engine queues the event but the
+    # -Action that copies it into $ProcessCreationQueue never executes. Net effect:
+    # the watcher reported Active=$true, the 5s polling fallback was GATED OFF (it
+    # only ran when Active=$false), and interactive shells got NEITHER path -- they
+    # stayed admin (whoami -> admin). This is the exact symptom that persisted across
+    # two prior PS7/drain fix rounds.
+    #
+    # FIX: drive delivery from a background ThreadJob that calls
+    # ManagementEventWatcher.WaitForNextEvent() in a loop. WaitForNextEvent() BLOCKS
+    # the ThreadJob's own thread until a WMI event fires and returns it directly --
+    # completely independent of the runscape's event-queue pumping. The ThreadJob
+    # populates the shared synchronized $ProcessCreationQueue + a heartbeat counter
+    # ($ProcessCreationWatcherState.Beats) so the Start-Monitoring loop can verify
+    # liveness. The 5s polling fallback now runs UNCONDITIONALLY (throttled) as a
+    # guaranteed safety net, so a dead/stuck watcher can never strand shells again.
     try {
-        try { Unregister-Event -SourceIdentifier 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue } catch {}
-        try { Get-Job -Name 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+        try { Unregister-ProcessCreationWatcher | Out-Null } catch {}
         try { Add-Type -AssemblyName System.Management -ErrorAction SilentlyContinue } catch {}
+
+        # ThreadJob availability: if the module is absent, the watcher cannot run.
+        # Degrade gracefully -- the 5s polling fallback (always on) elevates shells.
+        $canThreadJob = $false
+        try { $null = Get-Command Start-ThreadJob -ErrorAction Stop; $canThreadJob = $true } catch {
+            try { Import-Module ThreadJob -ErrorAction Stop; $canThreadJob = $true } catch {}
+        }
+        if (-not $canThreadJob) {
+            Write-Log -Message "Start-ThreadJob unavailable; WMI process-creation watcher disabled -- 5s polling fallback will elevate interactive shells." -Type "WARN" -Color Yellow
+            $script:ProcessCreationWatcherActive = $false
+            return $false
+        }
+
         $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
         $script:ProcessCreationWatcher = New-Object System.Management.ManagementEventWatcher($query)
         $queue = $script:ProcessCreationQueue
-        $action = {
-            $q = $Event.MessageData
-            if (-not $q) { return }
-            $proc = $EventArgs.NewEvent.TargetInstance
-            if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe" -and $proc.SessionId -gt 0) {
-                $arguments = ""
-                if ($proc.CommandLine) {
-                    $cmdLine = [string]$proc.CommandLine
-                    if ($cmdLine.StartsWith('"')) {
-                        $endQuote = $cmdLine.IndexOf('"', 1)
-                        if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
-                            $arguments = $cmdLine.Substring($endQuote + 1).Trim()
-                        }
-                    } else {
-                        $firstSpace = $cmdLine.IndexOf(' ')
-                        if ($firstSpace -gt 0) {
-                            $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
-                        }
-                    }
-                }
+        $state = $script:ProcessCreationWatcherState
+        $state.Stopped = $false
+        $state.Beats = 0
+        $watcher = $script:ProcessCreationWatcher
+
+        $job = Start-ThreadJob -ScriptBlock {
+            param($watcher, $q, $st)
+            while (-not $st.Stopped) {
                 try {
-                    [void]$q.Add([PSCustomObject]@{
-                        ProcessId      = $proc.ProcessId
-                        ExecutablePath = $proc.ExecutablePath
-                        Arguments      = $arguments
-                        SessionId      = $proc.SessionId
-                        CreationDate   = $proc.CreationDate
-                    })
-                } catch {}
+                    # WaitForNextEvent() blocks THIS thread until a WMI event fires
+                    # (independent of the runscape event-queue pump). watcher.Stop()
+                    # cancels it -> throws -> the catch breaks the loop.
+                    $evt = $watcher.WaitForNextEvent()
+                    if ($st.Stopped) { try { $evt.Dispose() } catch {}; break }
+                    $proc = $evt.TargetInstance
+                    if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe" -and $proc.SessionId -gt 0) {
+                        $arguments = ""
+                        if ($proc.CommandLine) {
+                            $cmdLine = [string]$proc.CommandLine
+                            if ($cmdLine.StartsWith('"')) {
+                                $endQuote = $cmdLine.IndexOf('"', 1)
+                                if ($endQuote -gt 0 -and $endQuote -lt $cmdLine.Length - 1) {
+                                    $arguments = $cmdLine.Substring($endQuote + 1).Trim()
+                                }
+                            } else {
+                                $firstSpace = $cmdLine.IndexOf(' ')
+                                if ($firstSpace -gt 0) {
+                                    $arguments = $cmdLine.Substring($firstSpace + 1).Trim()
+                                }
+                            }
+                        }
+                        try {
+                            [void]$q.Add([PSCustomObject]@{
+                                ProcessId      = $proc.ProcessId
+                                ExecutablePath = $proc.ExecutablePath
+                                Arguments      = $arguments
+                                SessionId      = $proc.SessionId
+                                CreationDate   = $proc.CreationDate
+                            })
+                            $st.Beats = [int]$st.Beats + 1
+                        } catch {}
+                    }
+                    try { $evt.Dispose() } catch {}
+                } catch {
+                    if ($st.Stopped) { break }
+                    # WaitForNextEvent threw (transient WMI error or watcher stopped
+                    # externally). Brief pause then retry; the Start-Monitoring
+                    # liveness heartbeat will re-register if this ThreadJob dies.
+                    Start-Sleep -Milliseconds 500
+                }
             }
-        }
-        $null = Register-ObjectEvent -InputObject $script:ProcessCreationWatcher -EventName 'EventArrived' -SourceIdentifier 'GMProcessCreationWatcher' -MessageData $queue -Action $action
-        $script:ProcessCreationWatcher.Start()
+        } -ArgumentList $watcher, $queue, $state
+        Set-Variable -Name ProcessCreationWatcherJob -Value $job -Scope Script
         $script:ProcessCreationWatcherActive = $true
         return $true
     } catch {
@@ -6159,13 +6214,20 @@ function Register-ProcessCreationWatcher {
 }
 
 function Unregister-ProcessCreationWatcher {
+    # Signal the ThreadJob to stop, then cancel its blocking WaitForNextEvent() via
+    # watcher.Stop() (makes WaitForNextEvent throw -> the loop's catch breaks out),
+    # then tear down the job + watcher + queue. Disable-GodMode + re-registration
+    # both call this so no WMI subscription or ThreadJob ever leaks.
+    if ($script:ProcessCreationWatcherState) { $script:ProcessCreationWatcherState.Stopped = $true }
     if ($script:ProcessCreationWatcher) {
         try { $script:ProcessCreationWatcher.Stop() } catch {}
         try { $script:ProcessCreationWatcher.Dispose() } catch {}
         $script:ProcessCreationWatcher = $null
     }
-    try { Unregister-Event -SourceIdentifier 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue } catch {}
-    try { Get-Job -Name 'GMProcessCreationWatcher' -ErrorAction SilentlyContinue | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+    if ($script:ProcessCreationWatcherJob) {
+        try { $script:ProcessCreationWatcherJob | Stop-Job -ErrorAction SilentlyContinue; $script:ProcessCreationWatcherJob | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
+        Set-Variable -Name ProcessCreationWatcherJob -Value $null -Scope Script
+    }
     $script:ProcessCreationWatcherActive = $false
     if ($script:ProcessCreationQueue) {
         $script:ProcessCreationQueue.Clear()
@@ -6757,6 +6819,9 @@ function Start-Monitoring {
     $lastPidCleanup = [datetime]::MinValue
     $lastReconcile = [datetime]::MinValue
     $loopCount = 0
+    $lastNewProcPoll = [datetime]::MinValue
+    $lastWatcherHealthCheck = [datetime]::MinValue
+    $lastWatcherBeats = 0
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
         Write-Log -Message "Monitor is running as Administrator (not SYSTEM). Elevation blocks will be skipped; only resurrection-killer and stealth mode are active." -Type "WARN" -Color Yellow
@@ -6777,8 +6842,12 @@ function Start-Monitoring {
         # ReplaceProcessTokenForPid token swap). MUST live in THIS persistent
         # monitor process (the scheduled task), not only in Enable-GodMode (a
         # one-shot activator that exits) -- otherwise the watcher dies with the
-        # activator and shells are never event-elevated. PS7 uses
-        # Register-ObjectEvent internally (the += adapter was removed in PS7).
+        # activator and shells are never event-elevated. PS7 delivery uses a background
+        # ThreadJob + ManagementEventWatcher.WaitForNextEvent() (Register-ObjectEvent
+        # -Action does NOT pump in a non-interactive scheduled-task runscape; see
+        # Register-ProcessCreationWatcher). The 5s polling fallback below runs
+        # UNCONDITIONALLY (throttled) as a guaranteed safety net so a dead watcher
+        # never strands interactive shells.
         $null = Register-ProcessCreationWatcher
     }
 
@@ -6919,6 +6988,31 @@ function Start-Monitoring {
                 foreach ($pid in $oldPids) { $lastElevatedPid.Remove($pid) | Out-Null }
             }
 
+            # --- WMI watcher liveness heartbeat (every 30s): verify the watcher
+            #     ThreadJob is alive + delivering, and auto-re-register if it died.
+            #     The 5s polling fallback (always on) guarantees shells are never
+            #     stranded, but a healthy watcher gives ~1s latency vs ~3s polling,
+            #     so re-registering a dead watcher restores the fast path. Beats =
+            #     events the ThreadJob copied into the queue (delivery proof). ---
+            if ((Get-Date) - $lastWatcherHealthCheck -gt [TimeSpan]::FromSeconds(30)) {
+                $lastWatcherHealthCheck = Get-Date
+                $beatsNow = 0
+                try { $beatsNow = [int]$script:ProcessCreationWatcherState.Beats } catch {}
+                $beatsDelta = $beatsNow - $lastWatcherBeats
+                $lastWatcherBeats = $beatsNow
+                $jobAlive = $false
+                if ($script:ProcessCreationWatcherJob) {
+                    try { $jobAlive = ($script:ProcessCreationWatcherJob.State -eq 'Running') } catch {}
+                }
+                if ($script:ProcessCreationWatcherActive -and -not $jobAlive) {
+                    Write-Log -Message "WMI watcher ThreadJob died (State=$($script:ProcessCreationWatcherJob.State)); re-registering for fast shell elevation (5s polling fallback remains active)." -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Start-Monitoring" -Action "WARN" -Message "Watcher ThreadJob not Running; re-registering (beatsTotal=$beatsNow)"
+                    $null = Register-ProcessCreationWatcher
+                } else {
+                    Write-DebugLog -FunctionName "Start-Monitoring" -Action "INFO" -Message "Watcher heartbeat: alive=$jobAlive beatsTotal=$beatsNow beatsDelta30s=$beatsDelta queueLen=$($script:ProcessCreationQueue.Count) watcherActive=$script:ProcessCreationWatcherActive"
+                }
+            }
+
             # --- Resurrection Killer: Re-kill security services if they respawn (every 30 seconds) ---
             if ((Get-Date) - $lastKillCheck -gt [TimeSpan]::FromSeconds(30)) {
                 $lastKillCheck = Get-Date
@@ -7014,10 +7108,19 @@ function Start-Monitoring {
                 }
             }
 
-        # --- New Process Elevation ---
-        # Only elevate processes in user sessions (SessionId > 0) to avoid duplicating system processes
+        # --- New Process Elevation (5s polling -- GUARANTEED safety net, runs unconditionally) ---
+        # Runs regardless of $ProcessCreationWatcherActive (throttled to ~3s via
+        # $lastNewProcPoll). Previously gated on `-not $ProcessCreationWatcherActive`,
+        # which meant a watcher that REGISTERED (Active=$true) but never DELIVERED
+        # (PS7 -Action pump failure / ThreadJob death) left interactive shells with NO
+        # elevation path -- they stayed admin (whoami -> admin). Now the watcher is the
+        # FAST path (~1s, event-driven) and this polling is the GUARANTEED path (~3s,
+        # direct WMI query); $lastElevatedPid dedup prevents double-elevation when both
+        # catch the same PID, and Invoke-ParallelElevation's SYSTEM-instance check
+        # prevents the 15s scan from kill+relaunching an already-SYSTEM app.
         $newProcesses = @()
-        if ($isSystem -and -not $script:ProcessCreationWatcherActive) {
+        if ($isSystem -and ((Get-Date) - $lastNewProcPoll -gt [TimeSpan]::FromSeconds(3))) {
+            $lastNewProcPoll = Get-Date
             $Now = Get-Date
             $newProcesses = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
                 try {
