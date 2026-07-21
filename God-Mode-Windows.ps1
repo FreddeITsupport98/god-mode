@@ -458,10 +458,35 @@ function Get-ProcessElevationContext {
     return $context
 }
 
+function Get-GodModeLogDir {
+    <#
+    .SYNOPSIS
+        Resolve a writable directory for diagnostic logs (driver build log,
+        compiler-error abort log, log dumps) that is safe when the caller is
+        SYSTEM. [Environment]::GetFolderPath("Desktop") returns "" for SYSTEM
+        (no user profile / no Desktop), and Join-Path with an empty -Path
+        throws "Cannot bind argument to parameter 'Path' because it is an
+        empty string" -- as an UNCAUGHT error this killed every scheduled-task
+        -ToggleOn / -Launch relaunch (Install-ProcessHook build-log +
+        Enable-GodMode abort-log both crashed here as SYSTEM). Prefer Desktop
+        (so the admin can find the logs), then $env:TEMP (per-context temp --
+        C:\Windows\Temp as SYSTEM), then C:\Windows\Temp (always writable by
+        SYSTEM + Administrators). Fail-open: every probe is guarded.
+    #>
+    try {
+        $desk = [Environment]::GetFolderPath("Desktop")
+        if ($desk -and (Test-Path $desk)) { return $desk }
+    } catch {}
+    try {
+        if ($env:TEMP -and (Test-Path $env:TEMP)) { return $env:TEMP }
+    } catch {}
+    return "C:\Windows\Temp"
+}
+
 function Export-ElevationDiagnostics {
     param(
         [string]$Trigger = "Auto",
-        [string]$DestinationFolder = [Environment]::GetFolderPath("Desktop")
+        [string]$DestinationFolder = (Get-GodModeLogDir)
     )
     $dump = @()
     $dump += "===== ELEVATION DIAGNOSTICS DUMP ====="
@@ -3739,7 +3764,7 @@ function Get-GodModeElevationPathDiagnostics {
 }
 
 function Export-GodModeLogs {
-    param([string]$DestinationFolder = [Environment]::GetFolderPath("Desktop"))
+    param([string]$DestinationFolder = (Get-GodModeLogDir))
     Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "ENTRY" -Message "DestinationFolder=$DestinationFolder"
     try {
         $TimeStamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -3794,7 +3819,7 @@ function Export-GodModeLogs {
         $HookSrc = Join-Path $DriverDir "gmhook.dll"
         $ProxyDest = Join-Path $GodModeInstallDir "gmproxy.exe"
         $HookDest = Join-Path $GodModeInstallDir "gmhook.dll"
-    $BuildLog = Join-Path ([Environment]::GetFolderPath("Desktop")) "GodMode_DriverBuild.log"
+    $BuildLog = Join-Path (Get-GodModeLogDir) "GodMode_DriverBuild.log"
 
         $LogContent += "`r`nSource gmproxy.exe: $(if (Test-Path $ProxySrc) { 'EXISTS' } else { 'MISSING' }) ($ProxySrc)"
         $LogContent += "`r`nSource gmhook.dll:  $(if (Test-Path $HookSrc)  { 'EXISTS' } else { 'MISSING' }) ($HookSrc)"
@@ -4965,7 +4990,7 @@ function Install-ProcessHook {
         $ProxyExe = Join-Path $BuildOutDir "gmproxy.exe"
         $HookDll = Join-Path $BuildOutDir "gmhook.dll"
         $BuildScript = Join-Path $DriverDir "build.ps1"
-    $BuildLog = Join-Path ([Environment]::GetFolderPath("Desktop")) "GodMode_DriverBuild.log"
+    $BuildLog = Join-Path (Get-GodModeLogDir) "GodMode_DriverBuild.log"
 
     # --- Auto-build if binaries are missing ---
         $NeedBuild = (-not (Test-Path $ProxyExe)) -or (-not (Test-Path $HookDll))
@@ -6508,8 +6533,15 @@ function Get-NonSystemProcessesParallel {
     $pids = $candidates | Select-Object -ExpandProperty ProcessId
     $chunks = @()
     $currentChunk = @()
-    foreach ($pid in $pids) {
-        $currentChunk += $pid
+    # NOTE: loop var is $procId, NOT $pid -- $pid/$PID is a read-only automatic
+    # variable (the current process PID). Using $pid as a foreach loop variable
+    # assigns to it every iteration -> "Cannot overwrite variable PID because it
+    # is read-only or a constant" -> uncaught trap that kills the SYSTEM
+    # aggressive elevation AND the monitor -Launch startup (Start-Monitoring ->
+    # Invoke-ExistingProcessElevation -> here). PS vars are case-insensitive:
+    # $pid IS $PID.
+    foreach ($procId in $pids) {
+        $currentChunk += $procId
         if ($currentChunk.Count -ge $ChunkSize) {
             $chunks += ,@($currentChunk)
             $currentChunk = @()
@@ -6550,11 +6582,13 @@ function Get-NonSystemProcessesParallel {
         Remove-Job $job -Force -ErrorAction SilentlyContinue
     }
 
-    # Map PIDs back to original CIM instances
+    # Map PIDs back to original CIM instances. $procId (NOT $pid -- see the
+    # note on the chunk loop above: $pid is the read-only automatic $PID and
+    # assigning it throws "Cannot overwrite variable PID").
     $results = @()
-    foreach ($pid in $nonSystemPids) {
-        if ($pidLookup.ContainsKey([int]$pid)) {
-            $results += $pidLookup[[int]$pid]
+    foreach ($procId in $nonSystemPids) {
+        if ($pidLookup.ContainsKey([int]$procId)) {
+            $results += $pidLookup[[int]$procId]
         }
     }
     return $results
@@ -7524,7 +7558,12 @@ function Start-Monitoring {
                 $lastPidCleanup = Get-Date
                 $now = Get-Date
                 $oldPids = $lastElevatedPid.GetEnumerator() | Where-Object { $_.Value -lt $now.AddMinutes(-5) } | Select-Object -ExpandProperty Key
-                foreach ($pid in $oldPids) { $lastElevatedPid.Remove($pid) | Out-Null }
+                # $procId, NOT $pid -- $pid is the read-only automatic $PID
+                # (case-insensitive: $pid IS $PID); assigning it throws "Cannot
+                # overwrite variable PID" and faults the monitor loop (caught by
+                # the loop catch -> 5s recovery -> skips the resurrection-killer
+                # + periodic elevation that tick).
+                foreach ($procId in $oldPids) { $lastElevatedPid.Remove($procId) | Out-Null }
             }
 
             # --- WMI watcher liveness heartbeat (every 30s): verify the watcher
@@ -7744,12 +7783,19 @@ function Enable-GodMode {
     #     the rest of the script must NOT proceed. ---
     $HookOk = Install-ProcessHook
     if (-not $HookOk) {
-        $DesktopPath = [Environment]::GetFolderPath("Desktop")
-        $AbortLog = Join-Path $DesktopPath "GodMode_CompilerError.log"
-        @"
+        # Abort-log MUST be best-effort: as SYSTEM (scheduled-task -ToggleOn
+        # relaunch) the user Desktop folder resolves to "" (SYSTEM has no
+        # profile), and Join-Path with an empty -Path throws "Cannot bind
+        # argument to parameter 'Path'..." as an UNCAUGHT TRAP -- which kills
+        # the -ToggleOn relaunch before persistence/monitoring are re-asserted.
+        # Resolve a writable dir via Get-GodModeLogDir + guard the write so a
+        # logging failure can never abort the activation path with an uncaught trap.
+        try {
+            $AbortLog = Join-Path (Get-GodModeLogDir) "GodMode_CompilerError.log"
+            @"
 [ERROR] God Mode activation aborted - C component build/install failed.
 
-Install-ProcessHook returned failure. Check GodMode_DriverBuild.log on Desktop for build details.
+Install-ProcessHook returned failure. Check GodMode_DriverBuild.log for build details.
 
 To fix:
 1. Check that MSYS2 is installed correctly and gcc is available
@@ -7757,8 +7803,11 @@ To fix:
 3. Then press [7] again
 
 No system modifications were applied (Defender, registry, etc. remain untouched).
-"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force
-        Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
+"@ | Out-File -FilePath $AbortLog -Encoding UTF8 -Force -ErrorAction SilentlyContinue
+            Write-Log -Message "C hook installation failed. God Mode activation aborted. Details: $AbortLog" -Type "ERROR" -Color Red
+        } catch {
+            Write-DebugLog -FunctionName "Enable-GodMode" -Action "WARN" -Message "Abort-log write failed: $_"
+        }
         Write-DebugLog -FunctionName "Enable-GodMode" -Action "ERROR" -Message "Install-ProcessHook failed - aborting God Mode activation"
         return
     }

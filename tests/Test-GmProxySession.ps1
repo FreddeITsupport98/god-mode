@@ -982,4 +982,68 @@ if ($epdMatch.Success) {
 }
 Add-Assertion "Opt11: SYSTEM-TEMP collection is best-effort (Test-Path guarded foreach loop)" ($gm -match 'foreach \(\$stPath in \$GodModeSystemTempLogCandidates\)[\s\S]{0,400}?Test-Path \$stPath') "SYSTEM-TEMP log collection is not Test-Path guarded -- an inaccessible path could throw"
 
+# --- 36. SYSTEM-context crash fixes: read-only $PID collision + empty-Desktop
+# Join-Path (2026-07-21) ---
+# The section-35 option-11 diagnostics finally exposed the two root-cause
+# uncaught traps that left shells admin after [7]+reboot (whoami -> admin):
+#   A. A foreach loop variable named $pid in Get-NonSystemProcessesParallel
+#      (chunk + map loops) and Start-Monitoring PID cleanup -- $pid is the
+#      read-only automatic $PID (PS vars are case-insensitive, so $pid IS
+#      $PID), so the loop assignment throws "Cannot overwrite variable PID
+#      because it is read-only or a constant". This killed the SYSTEM aggressive
+#      elevation (Invoke-ExistingProcessElevation) AND the monitor -Launch
+#      startup (Start-Monitoring -> Invoke-ExistingProcessElevation -> here),
+#      leaving NO live monitor loop (stealth task LastTaskResult=2147942667,
+#      [NO LIVE MONITOR LOOP]) -> interactive shells were never in-place
+#      elevated. Renamed the loop variable to $procId in all three sites.
+#   B. [Environment]::GetFolderPath("Desktop") returns "" as SYSTEM (no user
+#      profile); Join-Path "" threw "Cannot bind argument to parameter 'Path'
+#      ..." UNCAUGHT in Install-ProcessHook (build-log, caught -> returns
+#      false) + Enable-GodMode (abort-log, UNCAUGHT trap), killing every
+#      scheduled-task -ToggleOn relaunch. Fixed via a Get-GodModeLogDir helper
+#      (Desktop -> $env:TEMP -> C:\Windows\Temp, all guarded) + try/catch
+#      around the abort-log. Additive; sections 1-35 intact.
+Add-Assertion "BugFix: no foreach loop over `$pid anywhere -- read-only `$PID collision eliminated" ($gm -notmatch 'foreach \(\$pid\b') "a foreach loop over `$pid remains -- `$pid is the read-only automatic `$PID; the loop assignment throws 'Cannot overwrite variable PID' (killed the SYSTEM aggressive elevation + monitor -Launch startup)"
+$gnspMatch = [regex]::Match($gm, '(?s)function\s+Get-NonSystemProcessesParallel\s*\{(.*?)\nfunction\s+Register-ProcessCreationWatcher\s*\{')
+$gnspBody = if ($gnspMatch.Success) { $gnspMatch.Groups[1].Value } else { "" }
+Add-Assertion "BugFix: Get-NonSystemProcessesParallel body extractable" ($gnspMatch.Success) "could not isolate Get-NonSystemProcessesParallel body"
+if ($gnspMatch.Success) {
+    Add-Assertion "BugFix: Get-NonSystemProcessesParallel chunk loop uses `$procId (not `$pid)" ($gnspBody.Contains('foreach ($procId in $pids)')) "Get-NonSystemProcessesParallel chunk loop still uses `$pid -- the SYSTEM aggressive elevation + monitor -Launch startup would crash"
+    Add-Assertion "BugFix: Get-NonSystemProcessesParallel map loop uses `$procId (not `$pid)" ($gnspBody.Contains('foreach ($procId in $nonSystemPids)')) "Get-NonSystemProcessesParallel map loop still uses `$pid -- PID-to-instance mapping would crash"
+    Add-Assertion "BugFix: Get-NonSystemProcessesParallel carries the read-only-`$PID warning comment" ($gnspBody -match 'read-only automatic') "Get-NonSystemProcessesParallel missing the `$pid-is-`$PID warning -- the bug could be reintroduced"
+}
+$smMatch = [regex]::Match($gm, '(?s)function\s+Start-Monitoring\s*\{(.*?)\nfunction\s+Enable-GodMode\s*\{')
+$smBody = if ($smMatch.Success) { $smMatch.Groups[1].Value } else { "" }
+Add-Assertion "BugFix: Start-Monitoring body extractable" ($smMatch.Success) "could not isolate Start-Monitoring body"
+if ($smMatch.Success) {
+    Add-Assertion "BugFix: Start-Monitoring PID cleanup uses `$procId (not `$pid)" ($smBody.Contains('foreach ($procId in $oldPids)')) "Start-Monitoring PID cleanup still uses `$pid -- faults the monitor loop every 2 min (loop catch -> 5s recovery -> skips resurrection-killer + periodic elevation that tick)"
+}
+Add-Assertion "BugFix: Get-GodModeLogDir helper defined (SYSTEM-safe log-dir resolver)" ($gm.Contains('function Get-GodModeLogDir')) "Get-GodModeLogDir missing -- the empty-Desktop-as-SYSTEM Join-Path crash has no fix"
+$glmMatch = [regex]::Match($gm, '(?s)function\s+Get-GodModeLogDir\s*\{(.*?)\nfunction\s+Export-ElevationDiagnostics\s*\{')
+$glmBody = if ($glmMatch.Success) { $glmMatch.Groups[1].Value } else { "" }
+Add-Assertion "BugFix: Get-GodModeLogDir body extractable" ($glmMatch.Success) "could not isolate Get-GodModeLogDir body"
+if ($glmMatch.Success) {
+    Add-Assertion "BugFix: Get-GodModeLogDir prefers the Desktop first (admin finds the logs)" ($glmBody.Contains('GetFolderPath("Desktop")')) "Get-GodModeLogDir does not prefer the Desktop -- admin logs would not land where the user can find them"
+    Add-Assertion "BugFix: Get-GodModeLogDir falls back to `$env:TEMP (SYSTEM temp)" ($glmBody.Contains('$env:TEMP')) "Get-GodModeLogDir has no `$env:TEMP fallback -- SYSTEM would still get an empty Desktop"
+    Add-Assertion "BugFix: Get-GodModeLogDir final fallback C:\Windows\Temp" ($glmBody.Contains('C:\Windows\Temp')) "Get-GodModeLogDir has no C:\Windows\Temp final fallback -- a no-profile no-temp context would still return empty"
+}
+Add-Assertion "BugFix: Install-ProcessHook build-log uses Get-GodModeLogDir (not raw Desktop)" ($gm -match 'function\s+Install-ProcessHook\s*\{[\s\S]{0,2000}?\$BuildLog = Join-Path \(Get-GodModeLogDir\)') "Install-ProcessHook build-log still uses GetFolderPath(Desktop) -- crashes as SYSTEM (empty Desktop) before the build/inject"
+$iphMatch = [regex]::Match($gm, '(?s)function\s+Install-ProcessHook\s*\{(.*?)\nfunction\s+Uninstall-ProcessHook\s*\{')
+$iphBody = if ($iphMatch.Success) { $iphMatch.Groups[1].Value } else { "" }
+Add-Assertion "BugFix: Install-ProcessHook body extractable" ($iphMatch.Success) "could not isolate Install-ProcessHook body"
+if ($iphMatch.Success) {
+    Add-Assertion "BugFix: Install-ProcessHook has no raw GetFolderPath(Desktop) call left" (-not ($iphBody -match 'GetFolderPath\("Desktop"\)')) "Install-ProcessHook still calls GetFolderPath(Desktop) -- the SYSTEM-context empty-Path crash site remains"
+}
+Add-Assertion "BugFix: Export-GodModeLogs build-log uses Get-GodModeLogDir" ($gm -match 'function\s+Export-GodModeLogs\s*\{[\s\S]{0,8000}?\$BuildLog = Join-Path \(Get-GodModeLogDir\)') "Export-GodModeLogs build-log still uses GetFolderPath(Desktop) -- read/write path mismatch with Install-ProcessHook"
+Add-Assertion "BugFix: Export-GodModeLogs destination default is Get-GodModeLogDir (SYSTEM-safe)" ($gm.Contains('param([string]$DestinationFolder = (Get-GodModeLogDir))')) "Export-GodModeLogs destination default still uses GetFolderPath(Desktop) -- a SYSTEM-context dump would crash at Join-Path"
+Add-Assertion "BugFix: Export-ElevationDiagnostics destination default is Get-GodModeLogDir" ($gm -match 'function\s+Export-ElevationDiagnostics\s*\{[\s\S]{0,300}?\$DestinationFolder = \(Get-GodModeLogDir\)') "Export-ElevationDiagnostics destination default still uses GetFolderPath(Desktop)"
+$egmMatch = [regex]::Match($gm, '(?s)function\s+Enable-GodMode\s*\{(.*?)\nfunction\s+Disable-GodMode\s*\{')
+$egmBody = if ($egmMatch.Success) { $egmMatch.Groups[1].Value } else { "" }
+Add-Assertion "BugFix: Enable-GodMode body extractable" ($egmMatch.Success) "could not isolate Enable-GodMode body"
+if ($egmMatch.Success) {
+    Add-Assertion "BugFix: Enable-GodMode abort-log uses Get-GodModeLogDir (not raw Desktop)" ($egmBody.Contains('Join-Path (Get-GodModeLogDir) "GodMode_CompilerError.log"')) "Enable-GodMode abort-log still uses GetFolderPath(Desktop) -- crashes UNCAUGHT as SYSTEM (the reported -ToggleOn killer)"
+    Add-Assertion "BugFix: Enable-GodMode abort-log is try/catch guarded (no uncaught trap)" ($egmBody.Contains('Abort-log write failed')) "Enable-GodMode abort-log is not try/catch guarded -- a logging failure still kills the -ToggleOn relaunch with an uncaught trap"
+    Add-Assertion "BugFix: Enable-GodMode has no raw GetFolderPath(Desktop) call left" (-not ($egmBody -match 'GetFolderPath\("Desktop"\)')) "Enable-GodMode still calls GetFolderPath(Desktop) -- the SYSTEM-context uncaught-trap site remains"
+}
+
 Write-Summary
