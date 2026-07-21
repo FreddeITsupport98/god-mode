@@ -64,7 +64,78 @@ function Add-Failure {
     }
 }
 
-Write-Host "[SCAN] Checking PowerShell syntax in: $ScanDir" -ForegroundColor Cyan
+function Get-OptimalThreadCount {
+    # Auto-detect the parallel thread count for the toolchain checks (C compile /
+    # shellcheck / py_compile / node --check). Mirrors the God-Mode-Windows.ps1
+    # Get-OptimalThreadCount idiom: $env:GODMODE_JOBS override ->
+    # [System.Environment]::ProcessorCount -> $env:NUMBER_OF_PROCESSORS -> 4.
+    # Overridable so the user can tune (e.g. a low-core VM: GODMODE_JOBS=2, or to
+    # force serial: GODMODE_JOBS=1). Returns at least 1. The toolchain sections
+    # (27a/b/c/d) fan out one Start-ThreadJob per file up to this count, turning
+    # the serial chain of gcc/shellcheck/python/node process spawns into a
+    # parallel batch -- the dominant cost of a scan (process startup x N).
+    try {
+        $j = $env:GODMODE_JOBS
+        if ($j) { $ji = [int]$j; if ($ji -gt 0) { return $ji } }
+    } catch {}
+    try {
+        $c = [System.Environment]::ProcessorCount
+        if ($c -gt 0) { return $c }
+    } catch {}
+    try {
+        $c = [int]$env:NUMBER_OF_PROCESSORS
+        if ($c -gt 0) { return $c }
+    } catch {}
+    return 4
+}
+$threadCount = Get-OptimalThreadCount
+# Start-ThreadJob availability: built into PowerShell 7; on Windows PowerShell 5.1
+# it ships as the Microsoft.PowerShell.ThreadJob module (auto-imported below). When
+# unavailable, the toolchain checks degrade to serial (correctness preserved, just
+# slower) -- mirrors the Invoke-ParallelElevation fallback in God-Mode-Windows.ps1.
+$canParallel = $false
+try { $null = Get-Command Start-ThreadJob -ErrorAction Stop; $canParallel = $true } catch {
+    try { Import-Module ThreadJob -ErrorAction Stop; $canParallel = $true } catch {}
+}
+if (-not $canParallel) {
+    Write-Host "[PARALLEL] Start-ThreadJob unavailable; toolchain checks run serially." -ForegroundColor Yellow
+}
+function Invoke-ParallelToolChecks {
+    # Runs one per-file toolcheck scriptblock in parallel via Start-ThreadJob (auto
+    # thread count, serial fallback). Each scriptblock receives a file object plus
+    # any ExtraArgs (e.g. the tool binary path) and returns
+    # [PSCustomObject]@{ FileName; FilePath; Severity; Text } where Severity is
+    # 'ERROR' / 'WARN' / 'OK'. The main thread then Wait-Job + Receive-Job and
+    # aggregates into $FileFailures via Add-Failure (so the existing honest-
+    # aggregation summary + exit code are unchanged). Serial fallback when
+    # Start-ThreadJob is unavailable OR there is only one file (no point
+    # parallelizing a single invocation). A 300s Wait-Job timeout + Stop-Job on
+    # laggards prevents a hung compiler from hanging the whole check.
+    param([array]$Files, [scriptblock]$CheckScript, [array]$ExtraArgs = @())
+    $results = @()
+    if ($canParallel -and $Files.Count -gt 1) {
+        $jobs = @()
+        foreach ($f in $Files) {
+            $jobs += Start-ThreadJob -ScriptBlock $CheckScript -ArgumentList (@($f) + @($ExtraArgs))
+        }
+        $null = Wait-Job -Job $jobs -Timeout 300
+        foreach ($j in $jobs) {
+            if ($j.State -ne 'Completed' -and $j.State -ne 'Failed') {
+                Write-Host "[PARALLEL] toolcheck job timed out (300s), stopping: $($j.Name)" -ForegroundColor Yellow
+                Stop-Job $j -ErrorAction SilentlyContinue
+            }
+        }
+        $results = @($jobs | Receive-Job -ErrorAction SilentlyContinue)
+        $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+    } else {
+        foreach ($f in $Files) {
+            $results += & $CheckScript $f @ExtraArgs
+        }
+    }
+    return $results
+}
+
+Write-Host "[SCAN] Checking PowerShell syntax in: $ScanDir (toolchain parallel: x$threadCount)" -ForegroundColor Cyan
 
 $Ps1Files = Get-ChildItem -Path $ScanDir -Filter "*.ps1" -File -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notmatch '_temp_' }
@@ -930,24 +1001,36 @@ foreach ($cand in @('x86_64-w64-mingw32-gcc', 'gcc', 'cl.exe')) {
     if ($cmd) { $CcCompiler = $cand; break }
 }
 if ($CcCompiler) {
-    Write-Host "[C-CC] Using compiler: $CcCompiler (-fsyntax-only)" -ForegroundColor DarkGray
-    foreach ($CFile in $CFiles) {
+    Write-Host "[C-CC] Using compiler: $CcCompiler (-fsyntax-only) [parallel x$threadCount]" -ForegroundColor DarkGray
+    # Parallel per-file C compile via Start-ThreadJob (auto thread count, serial
+    # fallback). Each job runs ONE gcc -fsyntax-only invocation and returns the
+    # severity + text; the main thread aggregates. gcc startup is the dominant
+    # per-file cost, so fanning out N files across $threadCount threads turns a
+    # serial chain into a parallel batch.
+    $ccResults = Invoke-ParallelToolChecks -Files $CFiles -ExtraArgs @($CcCompiler) -CheckScript {
+        param($CFile, $compiler)
         $CFileName = $CFile.Name
         $CFilePath = $CFile.FullName
         $ccArgs = @('-fsyntax-only')
         if ($CFileName -eq 'gmproxy.c') { $ccArgs += '-municode' }
         $ccArgs += $CFilePath
-        $ccOut = & $CcCompiler @ccArgs 2>&1
+        $ccOut = & $compiler @ccArgs 2>&1
         $ccText = $ccOut | Out-String
         # gcc real errors print as ': error:'; missing-header 'fatal error:' has no ': error:' match,
         # so a toolchain-missing-header file is silently skipped rather than falsely flagged.
-        if ($ccText -match ': error:') {
-            Write-Host "[C-CC-ERR] $CFilePath`: compiler reported errors:" -ForegroundColor Red
-            Write-Host $ccText -ForegroundColor DarkRed
-            Add-Failure -FileName $CFileName -Message "C compiler (-fsyntax-only) reported errors - see output" -Severity "ERROR"
-        } elseif ($ccText -match ': warning:') {
-            Write-Host "[C-CC-WARN] $CFilePath`: compiler reported warnings (non-fatal)" -ForegroundColor Yellow
-            Add-Failure -FileName $CFileName -Message "C compiler (-fsyntax-only) reported warnings" -Severity "WARN"
+        $sev = 'OK'
+        if ($ccText -match ': error:') { $sev = 'ERROR' }
+        elseif ($ccText -match ': warning:') { $sev = 'WARN' }
+        return [PSCustomObject]@{ FileName = $CFileName; FilePath = $CFilePath; Severity = $sev; Text = $ccText }
+    }
+    foreach ($r in $ccResults) {
+        if ($r.Severity -eq 'ERROR') {
+            Write-Host "[C-CC-ERR] $($r.FilePath)`: compiler reported errors:" -ForegroundColor Red
+            Write-Host $r.Text -ForegroundColor DarkRed
+            Add-Failure -FileName $r.FileName -Message "C compiler (-fsyntax-only) reported errors - see output" -Severity "ERROR"
+        } elseif ($r.Severity -eq 'WARN') {
+            Write-Host "[C-CC-WARN] $($r.FilePath)`: compiler reported warnings (non-fatal)" -ForegroundColor Yellow
+            Add-Failure -FileName $r.FileName -Message "C compiler (-fsyntax-only) reported warnings" -Severity "WARN"
         }
     }
 } else {
@@ -957,15 +1040,26 @@ if ($CcCompiler) {
 # (b) shellcheck on every .sh (-S warning => ERROR on any warning-or-worse, mirroring run-regressions.sh).
 $shellcheck = Get-Command -Name 'shellcheck' -ErrorAction SilentlyContinue
 if ($shellcheck) {
-    foreach ($File in $ShFiles) {
+    Write-Host "[SH] shellcheck -S warning [parallel x$threadCount]" -ForegroundColor DarkGray
+    # Parallel per-file shellcheck (auto thread count, serial fallback). The tool
+    # binary is passed via ExtraArgs ($shellcheck.Source) so the child runspace does
+    # not rely on PATH resolution. $LASTEXITCODE is runspace-local, so each job's
+    # exit code is captured inside its own scriptblock.
+    $scResults = Invoke-ParallelToolChecks -Files $ShFiles -ExtraArgs @($shellcheck.Source) -CheckScript {
+        param($File, $scBin)
         $ShName = $File.Name
         $ShPath = $File.FullName
-        $scOut = & shellcheck -S warning -f gcc $ShPath 2>&1
+        $scOut = & $scBin -S warning -f gcc $ShPath 2>&1
         $scText = $scOut | Out-String
-        if ($LASTEXITCODE -ne 0 -and $scText.Trim().Length -gt 0) {
-            Write-Host "[SH-ERR] $ShPath`: shellcheck reported issues:" -ForegroundColor Red
-            Write-Host $scText -ForegroundColor DarkRed
-            Add-Failure -FileName $ShName -Message "shellcheck (-S warning) reported issues - see output" -Severity "ERROR"
+        $sev = 'OK'
+        if ($LASTEXITCODE -ne 0 -and $scText.Trim().Length -gt 0) { $sev = 'ERROR' }
+        return [PSCustomObject]@{ FileName = $ShName; FilePath = $ShPath; Severity = $sev; Text = $scText }
+    }
+    foreach ($r in $scResults) {
+        if ($r.Severity -eq 'ERROR') {
+            Write-Host "[SH-ERR] $($r.FilePath)`: shellcheck reported issues:" -ForegroundColor Red
+            Write-Host $r.Text -ForegroundColor DarkRed
+            Add-Failure -FileName $r.FileName -Message "shellcheck (-S warning) reported issues - see output" -Severity "ERROR"
         }
     }
 } else {
@@ -977,15 +1071,23 @@ $python = Get-Command -Name 'python3' -ErrorAction SilentlyContinue
 if (-not $python) { $python = Get-Command -Name 'python' -ErrorAction SilentlyContinue }
 if ($python) {
     $pyBin = $python.Source
-    foreach ($File in $PyFiles) {
+    Write-Host "[PY] python -m py_compile [parallel x$threadCount]" -ForegroundColor DarkGray
+    # Parallel per-file py_compile (auto thread count, serial fallback).
+    $pyResults = Invoke-ParallelToolChecks -Files $PyFiles -ExtraArgs @($pyBin) -CheckScript {
+        param($File, $pyB)
         $PyName = $File.Name
         $PyPath = $File.FullName
-        $pyOut = & $pyBin -m py_compile $PyPath 2>&1
+        $pyOut = & $pyB -m py_compile $PyPath 2>&1
         $pyText = $pyOut | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[PY-ERR] $PyPath`: python py_compile failed:" -ForegroundColor Red
-            Write-Host $pyText -ForegroundColor DarkRed
-            Add-Failure -FileName $PyName -Message "python -m py_compile failed - see output" -Severity "ERROR"
+        $sev = 'OK'
+        if ($LASTEXITCODE -ne 0) { $sev = 'ERROR' }
+        return [PSCustomObject]@{ FileName = $PyName; FilePath = $PyPath; Severity = $sev; Text = $pyText }
+    }
+    foreach ($r in $pyResults) {
+        if ($r.Severity -eq 'ERROR') {
+            Write-Host "[PY-ERR] $($r.FilePath)`: python py_compile failed:" -ForegroundColor Red
+            Write-Host $r.Text -ForegroundColor DarkRed
+            Add-Failure -FileName $r.FileName -Message "python -m py_compile failed - see output" -Severity "ERROR"
         }
     }
 } else {
@@ -995,15 +1097,24 @@ if ($python) {
 # (d) node --check on every .js.
 $node = Get-Command -Name 'node' -ErrorAction SilentlyContinue
 if ($node) {
-    foreach ($File in $JsFiles) {
+    $nodeBin = $node.Source
+    Write-Host "[JS] node --check [parallel x$threadCount]" -ForegroundColor DarkGray
+    # Parallel per-file node --check (auto thread count, serial fallback).
+    $jsResults = Invoke-ParallelToolChecks -Files $JsFiles -ExtraArgs @($nodeBin) -CheckScript {
+        param($File, $nodeB)
         $JsName = $File.Name
         $JsPath = $File.FullName
-        $jsOut = & node --check $JsPath 2>&1
+        $jsOut = & $nodeB --check $JsPath 2>&1
         $jsText = $jsOut | Out-String
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[JS-ERR] $JsPath`: node --check failed:" -ForegroundColor Red
-            Write-Host $jsText -ForegroundColor DarkRed
-            Add-Failure -FileName $JsName -Message "node --check failed - see output" -Severity "ERROR"
+        $sev = 'OK'
+        if ($LASTEXITCODE -ne 0) { $sev = 'ERROR' }
+        return [PSCustomObject]@{ FileName = $JsName; FilePath = $JsPath; Severity = $sev; Text = $jsText }
+    }
+    foreach ($r in $jsResults) {
+        if ($r.Severity -eq 'ERROR') {
+            Write-Host "[JS-ERR] $($r.FilePath)`: node --check failed:" -ForegroundColor Red
+            Write-Host $r.Text -ForegroundColor DarkRed
+            Add-Failure -FileName $r.FileName -Message "node --check failed - see output" -Severity "ERROR"
         }
     }
 } else {

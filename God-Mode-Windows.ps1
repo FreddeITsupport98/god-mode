@@ -130,6 +130,21 @@ $DebugLogFile = Join-Path -Path $env:TEMP -ChildPath "DNS_Lockdown_Enterprise.de
 $GodModeFlagRegPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WpnPlatform\Settings"
 $GodModeFlagRegName = "GodModeActive"
 $GodModeLogFile    = "C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\.syslog"
+# SYSTEM-temp log candidates: when the monitor (Start-Monitoring) runs as SYSTEM via
+# the stealth scheduled task, Write-Log/$env:TEMP resolves to a SYSTEM temp
+# (C:\Windows\Temp or the systemprofile AppData\Local\Temp), NOT the admin user's
+# $env:TEMP that Export-GodModeLogs (option 11) reads by default. Collecting these is
+# what makes the monitor's own "Monitoring started" / "Monitor elevated: cmd PID=..."
+# / error lines visible in the option-11 dump -- the blind spot that left "shells stay
+# admin after [7]+reboot" undiagnosable. Best-effort (Test-Path guarded at every read).
+$GodModeSystemTempLogCandidates = @(
+    'C:\Windows\Temp\DNS_Lockdown_Enterprise.log',
+    'C:\Windows\Temp\DNS_Lockdown_Enterprise.debug.log',
+    'C:\Windows\System32\config\systemprofile\AppData\Local\Temp\DNS_Lockdown_Enterprise.log',
+    'C:\Windows\System32\config\systemprofile\AppData\Local\Temp\DNS_Lockdown_Enterprise.debug.log',
+    'C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\DNS_Lockdown_Enterprise.log',
+    'C:\Windows\SysWOW64\config\systemprofile\AppData\Local\Temp\DNS_Lockdown_Enterprise.debug.log'
+)
 $GodModeTaskPrefix = "MicrosoftEdgeUpdateTask_"
 
 $GodModeInstallDir     = "C:\ProgramData\GodMode"
@@ -3491,6 +3506,238 @@ function Register-DeepPersistence {
     }
 }
 
+function Get-GodModeElevationPathDiagnostics {
+    # Option-11 (Export-GodModeLogs) companion: captures the MONITOR / SHELL-ELEVATION
+    # PATH live state that the gmproxy/IFEO-centric dump historically omitted -- the
+    # blind spot that left "shells stay admin after [7]+reboot" undiagnosable from the
+    # dump alone. The monitor (Start-Monitoring) runs as SYSTEM (Session 0, via the
+    # stealth scheduled task GodMode.ps1 -Launch) and logs via Write-Log to
+    # $env:TEMP\DNS_Lockdown_Enterprise.log -- which as SYSTEM resolves to
+    # C:\Windows\Temp, NOT the admin user's $env:TEMP that Export-GodModeLogs reads by
+    # default. So the monitor's own "Monitoring started" / "Monitor elevated: cmd
+    # PID=..." / error lines were NEVER collected, and no live task/process/flag/token
+    # state was captured. This function returns a single string (the whole
+    # MONITOR / SHELL-ELEVATION PATH section) for Export-GodModeLogs to append.
+    # Best-effort throughout: every probe is try/catch guarded so a missing/ACL-denied
+    # probe prints a [probe failed] line instead of throwing (the dump never fails
+    # half-written). Reuses Test-GodModeActive / Find-SystemProcessCandidate so the
+    # diagnostics reflect the SAME logic the monitor uses.
+    $sec = @()
+    $sec += "===== MONITOR / SHELL-ELEVATION PATH ====="
+    $sec += "Generated: $(Get-Date)"
+
+    # --- A. Dump context (who option 11 runs as -- decides which logs SHOULD exist) ---
+    try {
+        $curId = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $curSid = $curId.User.Value
+        $curIsAdmin = ([Security.Principal.WindowsPrincipal]$curId).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        $curIsBuiltIn = ($curSid -like "*-500")
+        $curIsSystem = ($curSid -eq "S-1-5-18")
+        $sec += "----- DUMP CONTEXT -----"
+        $sec += "User            : $($curId.Name)"
+        $sec += "SID             : $curSid"
+        $sec += "IsAdmin         : $curIsAdmin"
+        $sec += "IsBuiltInAdmin  : $curIsBuiltIn"
+        $sec += "IsSystem        : $curIsSystem"
+        $sec += "PSVersion       : $($PSVersionTable.PSVersion)"
+        $sec += "DumpPID         : $PID"
+        $sec += "DumpTEMP        : $env:TEMP"
+        $sec += "NOTE: Export-GodModeLogs reads `$env:TEMP\DNS_Lockdown_Enterprise.log (this dump's temp)."
+        $sec += "      The MONITOR runs as SYSTEM and logs to C:\Windows\Temp\DNS_Lockdown_Enterprise.log"
+        $sec += "      (collected in the SYSTEM-TEMP LOGS section above). If those are empty/missing,"
+        $sec += "      the monitor is NOT running as SYSTEM after reboot -- the root cause of"
+        $sec += "      'whoami -> admin' for cmd/powershell launched normally."
+    } catch { $sec += "[DUMP CONTEXT probe failed: $_]" }
+
+    # --- B. God Mode active flag ---
+    try {
+        $flagActive = Test-GodModeActive
+        $flagRaw = $null
+        try { $flagRaw = (Get-ItemProperty -Path $GodModeFlagRegPath -Name $GodModeFlagRegName -ErrorAction SilentlyContinue).$GodModeFlagRegName } catch {}
+        $sec += "----- GOD MODE ACTIVE FLAG -----"
+        $sec += "Test-GodModeActive : $flagActive"
+        $sec += "Raw flag value     : $(if ($null -ne $flagRaw) { $flagRaw } else { '[missing/key not found]' })"
+        $sec += "RegPath            : $GodModeFlagRegPath"
+        $sec += "RegName            : $GodModeFlagRegName"
+    } catch { $sec += "[GOD MODE FLAG probe failed: $_]" }
+
+    # --- C. God Mode scheduled tasks (stealth / main / guardian / watchdog / backup) ---
+    # LastTaskResult is the key signal: 0 = the task action ran clean; nonzero = the
+    # monitor launch FAILED (PS5->PS7 relaunch error in Session 0, script parse error,
+    # or an early Exit). A stealth task in state Ready with a nonzero LastTaskResult
+    # means the monitor was launched and DIED -- interactive shells will never
+    # auto-elevate. State=Running means the Start-Monitoring loop is alive right now.
+    try {
+        $sec += "----- SCHEDULED TASKS (monitor launch path) -----"
+        $taskSpecs = @(
+            @{ Label = "STEALTH (monitor -Launch)"; Filter = "$GodModeTaskPrefix*" }
+            @{ Label = "MAIN (-ToggleOn)";           Exact  = $GodModeTaskName }
+            @{ Label = "GUARDIAN (-ToggleOn 5m)";    Exact  = $GodModeGuardianName }
+            @{ Label = "WATCHDOG (30s heartbeat)";   Exact  = $GodModeWatchdogName }
+            @{ Label = "BACKUP GoogleUpdateTask_";   Filter = "GoogleUpdateTask_*" }
+            @{ Label = "BACKUP ChromeUpdater_";      Filter = "ChromeUpdater_*" }
+            @{ Label = "BACKUP OneDriveSyncTask_";   Filter = "OneDriveSyncTask_*" }
+        )
+        foreach ($spec in $taskSpecs) {
+            $tasks = @()
+            if ($spec.Filter) { $tasks = @(Get-ScheduledTask -TaskName $spec.Filter -ErrorAction SilentlyContinue) }
+            elseif ($spec.Exact) { $t = Get-ScheduledTask -TaskName $spec.Exact -ErrorAction SilentlyContinue; if ($t) { $tasks = @($t) } }
+            if ($tasks.Count -eq 0) {
+                $sec += "  [$($spec.Label)] NOT FOUND"
+                continue
+            }
+            $sec += "  [$($spec.Label)] $($tasks.Count) task(s):"
+            foreach ($t in $tasks) {
+                $info = $null
+                try { $info = $t | Get-ScheduledTaskInfo -ErrorAction SilentlyContinue } catch {}
+                $principal = ""
+                try { $principal = $t.Principal.UserId } catch {}
+                $actExec = ""; $actArgs = ""
+                try { if ($t.Actions) { $actExec = $t.Actions[0].Execute; $actArgs = $t.Actions[0].Arguments } } catch {}
+                $lastRun = "n/a"; $lastResult = "n/a"; $nextRun = "n/a"
+                try { if ($info) { $lastRun = $info.LastRunTime; $lastResult = $info.LastTaskResult; $nextRun = $info.NextRunTime } } catch {}
+                $sec += "    - Name=$($t.TaskName)"
+                $sec += "      State=$($t.State)  Principal=$principal"
+                $sec += "      LastRunTime=$lastRun  LastTaskResult=$lastResult  NextRunTime=$nextRun"
+                $sec += "      Action=$actExec $actArgs"
+            }
+        }
+        $sec += "NOTE: LastTaskResult=0 => task action ran clean. Nonzero (e.g. 1, 0xC0000142,"
+        $sec += "      267009) => the monitor launch FAILED. State=Ready + nonzero result = the"
+        $sec += "      monitor was launched and exited/died -- the stealth task action must STAY"
+        $sec += "      alive in the Start-Monitoring loop for shells to auto-elevate."
+    } catch { $sec += "[SCHEDULED TASKS probe failed: $_]" }
+
+    # --- D. Live monitor process (is a Start-Monitoring loop alive RIGHT NOW?) ---
+    try {
+        $sec += "----- LIVE MONITOR PROCESS -----"
+        $allProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+        $monitorPids = @()
+        foreach ($p in $allProcs) {
+            $nm = "$($p.Name)".ToLower()
+            if ($nm -notin @("powershell.exe","pwsh.exe","cmd.exe")) { continue }
+            $cmd = "$($p.CommandLine)"
+            if (-not $cmd) { continue }
+            if ($cmd -match "GodMode\.ps1" -or $cmd -match "-Launch" -or $cmd -match "God-Mode-Windows\.ps1") {
+                $owner = "n/a"
+                try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue; if ($o -and $o.User) { $owner = "$($o.Domain)\$($o.User)" } } catch {}
+                $isMon = ($cmd -match "GodMode\.ps1" -and $cmd -match "-Launch")
+                $tag = if ($isMon) { "<== MONITOR LOOP (GodMode.ps1 -Launch)" } else { "plumbing" }
+                $cmdTrim = if ($cmd.Length -gt 200) { $cmd.Substring(0,200) + "..." } else { $cmd }
+                $sec += "  PID=$($p.ProcessId) Name=$($p.Name) Session=$($p.SessionId) Owner=$owner $tag"
+                $sec += "    CmdLine: $cmdTrim"
+                if ($isMon) { $monitorPids += $p.ProcessId }
+            }
+        }
+        if ($monitorPids.Count -eq 0) {
+            $sec += "  [NO LIVE MONITOR LOOP -- no powershell/pwsh running 'GodMode.ps1 -Launch'."
+            $sec += "   This is the #1 cause of shells staying admin: the monitor is not running, so"
+            $sec += "   the WMI watcher + 5s polling never elevate interactive shells.]"
+        } else {
+            $sec += "  [MONITOR LOOP ALIVE: PID(s) $($monitorPids -join ', ')]"
+        }
+    } catch { $sec += "[LIVE MONITOR PROCESS probe failed: $_]" }
+
+    # --- E. Running interactive shells + owner identity (GROUND TRUTH: admin vs SYSTEM) ---
+    try {
+        $sec += "----- RUNNING INTERACTIVE SHELLS (admin vs SYSTEM ground truth) -----"
+        $shellNames = @("cmd.exe","powershell.exe","pwsh.exe","powershell_ise.exe")
+        $shells = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $shellNames -contains "$($_.Name)".ToLower() })
+        if ($shells.Count -eq 0) {
+            $sec += "  [No cmd/powershell/pwsh/ISE running -- launch one then re-dump to see its owner]"
+        }
+        $sysCount = 0; $adminCount = 0
+        foreach ($p in $shells) {
+            $owner = "n/a"; $isSys = $false
+            try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue; if ($o -and $o.User) { $owner = "$($o.Domain)\$($o.User)"; $isSys = ("$($o.User)" -eq "SYSTEM") } } catch {}
+            if ($isSys) { $sysCount++ } else { $adminCount++ }
+            $cmdTrim = ""
+            try { $c = "$($p.CommandLine)"; $cmdTrim = if ($c.Length -gt 160) { $c.Substring(0,160) + "..." } else { $c } } catch {}
+            $verdict = if ($isSys) { "SYSTEM" } else { "NOT-SYSTEM (admin/user)" }
+            $sec += "  PID=$($p.ProcessId) Name=$($p.Name) Session=$($p.SessionId) Owner=$owner -> $verdict"
+            $sec += "    CmdLine: $cmdTrim"
+        }
+        $sec += "  SUMMARY: $sysCount SYSTEM shell(s), $adminCount non-SYSTEM shell(s)."
+        $sec += "  If your cmd/powershell shows NOT-SYSTEM here, the monitor did not elevate it."
+    } catch { $sec += "[INTERACTIVE SHELLS probe failed: $_]" }
+
+    # --- F. SYSTEM token source (what the monitor steals from) ---
+    try {
+        $sec += "----- SYSTEM TOKEN SOURCE -----"
+        $cand = 0
+        try { $cand = Find-SystemProcessCandidate } catch {}
+        $sec += "  Find-SystemProcessCandidate -> PID=$cand  $(if ($cand -gt 0) { '(a SYSTEM token source IS available)' } else { '(NO SYSTEM token source -- shells CANNOT be elevated!)' })"
+        $sysProcs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { $_.SessionId -gt 0 -and $_.ProcessId -gt 4 } | Sort-Object SessionId)
+        $shown = 0
+        foreach ($p in $sysProcs) {
+            if ($shown -ge 25) { break }
+            $owner = "n/a"
+            try { $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue; if ($o -and $o.User) { $owner = "$($o.User)" } } catch {}
+            if ("$owner" -eq "SYSTEM") {
+                $sec += "  PID=$($p.ProcessId) Name=$($p.Name) Session=$($p.SessionId) Owner=SYSTEM"
+                $shown++
+            }
+        }
+        if ($shown -eq 0) { $sec += "  [No Session>0 SYSTEM processes found -- winlogon/dwm not SYSTEM? PPL?]" }
+    } catch { $sec += "[SYSTEM TOKEN SOURCE probe failed: $_]" }
+
+    # --- G. seclogon (Phase 1 CreateProcessWithTokenW fallback dependency) ---
+    try {
+        $sec += "----- SECLOGON SERVICE (Phase 1 fallback dependency) -----"
+        $svc = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+        if ($svc) {
+            $sec += "  seclogon: Status=$($svc.Status) StartType=$($svc.StartType)"
+            $sec += "  (CreateProcessWithTokenW needs seclogon RUNNING -- Phase 1 born-as-SYSTEM fallback)"
+        } else {
+            $sec += "  [seclogon service not found]"
+        }
+    } catch { $sec += "[SECLOGON probe failed: $_]" }
+
+    # --- H. CriticalProcs + shellNames reference (answers the 'critical process' question) ---
+    try {
+        $sec += "----- CRITICAL-PROCS / SHELL EXEMPTION REFERENCE -----"
+        $sec += "  Shells (cmd/powershell/pwsh/ISE) ARE in Start-Monitoring `$CriticalProcs (so the"
+        $sec += "  15s periodic scan SKIPS them -- no kill+relaunch), BUT the WMI watcher + 5s"
+        $sec += "  polling drains use `$shellNames to EXEMPT shells from the CriticalProcs guard"
+        $sec += "  and elevate them in-place (Phase 0). So 'critical' does NOT block shells; the"
+        $sec += "  blocker is the monitor not running / not catching them (see LIVE MONITOR +"
+        $sec += "  SYSTEM-TEMP LOGS). Removing shells from CriticalProcs would HARM: the 15s scan"
+        $sec += "  would kill+relaunch them, losing your session/cwd/history."
+    } catch { $sec += "[CRITICAL-PROCS reference failed: $_]" }
+
+    # --- I. Monitor-activity marker scan (admin + SYSTEM-temp logs) ---
+    try {
+        $sec += "----- MONITOR ACTIVITY MARKER SCAN (admin + SYSTEM temp logs) -----"
+        $markerPattern = 'Start-Monitoring|Monitor-ElevateProcess|Monitoring started|Monitor elevated|Phase 0|Phase 1|Phase 2|WMI process creation watcher|GmProxy feedback|loop exception|God Mode is not enabled|Monitor is running as Administrator'
+        $logPaths = @()
+        if (Test-Path $LogFile) { $logPaths += $LogFile }
+        if (Test-Path $DebugLogFile) { $logPaths += $DebugLogFile }
+        foreach ($c in $GodModeSystemTempLogCandidates) { if (Test-Path $c) { $logPaths += $c } }
+        $sec += "Log paths scanned: $(if ($logPaths.Count -gt 0) { $logPaths -join '; ' } else { '[none found]' })"
+        $totalMarkers = 0
+        if ($logPaths.Count -gt 0) {
+            try {
+                $hits = @(Select-String -Path $logPaths -Pattern $markerPattern -ErrorAction SilentlyContinue)
+                $totalMarkers = $hits.Count
+                $sec += "Total monitor-marker lines: $totalMarkers (showing last 40)"
+                foreach ($h in ($hits | Select-Object -Last 40)) {
+                    $sec += "  [$($h.Filename)] $($h.Line.Trim())"
+                }
+                if ($totalMarkers -eq 0) {
+                    $sec += "  [NO monitor activity in ANY log -- the monitor has never run (or never logged)."
+                    $sec += "   Check SCHEDULED TASKS LastTaskResult + LIVE MONITOR PROCESS above.]"
+                }
+            } catch {
+                $sec += "  [marker scan error: $_]"
+            }
+        } else {
+            $sec += "  [No admin or SYSTEM-temp logs found at all -- God Mode may never have run.]"
+        }
+    } catch { $sec += "[MONITOR MARKER SCAN failed: $_]" }
+
+    return ($sec -join "`r`n")
+}
+
 function Export-GodModeLogs {
     param([string]$DestinationFolder = [Environment]::GetFolderPath("Desktop"))
     Write-DebugLog -FunctionName "Export-GodModeLogs" -Action "ENTRY" -Message "DestinationFolder=$DestinationFolder"
@@ -3506,6 +3753,38 @@ function Export-GodModeLogs {
         $LogContent += "`r`n===== DEBUG LOG ====="
         if (Test-Path $DebugLogFile) { $LogContent += Get-Content -Raw -Path $DebugLogFile -ErrorAction SilentlyContinue } else { $LogContent += "[No debug log found]" }
         if (Test-Path $GodModeLogFile) { $LogContent += "`r`n===== GOD MODE LOG ====="; $LogContent += Get-Content -Raw -Path $GodModeLogFile -ErrorAction SilentlyContinue }
+
+        # --- SYSTEM-TEMP LOGS: the monitor (Start-Monitoring) runs as SYSTEM via the
+        #     stealth scheduled task and logs via Write-Log to $env:TEMP, which as SYSTEM
+        #     resolves to C:\Windows\Temp (or the systemprofile AppData\Local\Temp) -- NOT
+        #     the admin user's $env:TEMP that the MAIN/DEBUG LOG sections above read. So
+        #     the monitor's own "Monitoring started" / "Monitor elevated: cmd PID=..." /
+        #     error lines were NEVER collected -- the blind spot that left "shells stay
+        #     admin after [7]+reboot" undiagnosable from this dump alone. Collect every
+        #     SYSTEM-temp candidate (best-effort, Test-Path guarded); missing paths are
+        #     noted. If ALL are empty/missing, the monitor is NOT running as SYSTEM. ---
+        $LogContent += "`r`n===== SYSTEM-TEMP LOGS (monitor as SYSTEM) ====="
+        $sysTempFound = 0
+        foreach ($stPath in $GodModeSystemTempLogCandidates) {
+            if (Test-Path $stPath) {
+                $sysTempFound++
+                $LogContent += "`r`n--- (Source: $stPath) ---`r`n"
+                $LogContent += Get-Content -Raw -Path $stPath -ErrorAction SilentlyContinue
+            }
+        }
+        if ($sysTempFound -eq 0) {
+            $LogContent += "`r`n[No SYSTEM-temp monitor logs found at any candidate path.]"
+            $LogContent += "`r`n  Checked: $($GodModeSystemTempLogCandidates -join ', ')"
+            $LogContent += "`r`n  -> The monitor (Start-Monitoring) has NOT run as SYSTEM since boot, or never wrote."
+            $LogContent += "`r`n     This is the #1 cause of cmd/powershell staying admin after [7]+reboot."
+        }
+
+        # --- MONITOR / SHELL-ELEVATION PATH: live state (flag, tasks, monitor process,
+        #     shell owners, token source, seclogon, marker scan) so the dump pinpoints
+        #     exactly where the elevation chain breaks. Reuses Test-GodModeActive /
+        #     Find-SystemProcessCandidate (same logic the monitor uses). Best-effort. ---
+        $LogContent += "`r`n"
+        $LogContent += Get-GodModeElevationPathDiagnostics
 
         # Driver / Hook status
         $LogContent += "`r`n===== DRIVER / HOOK STATUS ====="

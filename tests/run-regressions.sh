@@ -47,6 +47,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Auto-chmod executable all scripts in tests/ for convenience.
 find "$SCRIPT_DIR" -maxdepth 1 -type f \( -name '*.sh' -o -name '*.ps1' \) -exec chmod +x {} + 2>/dev/null || true
 
+# Auto-detect the parallel job count for the independent shellcheck + pwsh-suite
+# steps (overridable via GODMODE_JOBS). The wine tests (steps 4/4b/4c + 5/5b-5e)
+# stay SERIAL by design -- see the step-4 comment for why (shared WINEPREFIX +
+# shared gmproxy.log/gmhook.log + the auto-exclude store would race/corrupt under
+# concurrency). nproc -> 4 fallback; GODMODE_JOBS=1 forces fully serial.
+if [ -n "${GODMODE_JOBS:-}" ] && [ "${GODMODE_JOBS:-}" -gt 0 ] 2>/dev/null; then
+    JOBS="$GODMODE_JOBS"
+elif command -v nproc >/dev/null 2>&1; then
+    JOBS="$(nproc)"
+else
+    JOBS=4
+fi
+case "$JOBS" in ''|*[!0-9]*) JOBS=4 ;; esac
+[ "$JOBS" -lt 1 ] && JOBS=1
+printf '[REGRESSION] parallel jobs: %s (override: GODMODE_JOBS=<n>; wine tests stay serial)\n' "$JOBS"
+
 pass_count=0
 fail_count=0
 fail_names=()
@@ -63,15 +79,28 @@ record() {  # record <name> <0|1> [detail]
     fi
 }
 
-# 1. shellcheck on shell scripts.
+# 1. shellcheck on shell scripts (parallel: one background job per file).
 if command -v shellcheck >/dev/null 2>&1; then
+    sh_pids=(); sh_logs=(); sh_names=(); sh_paths=()
     while IFS= read -r f; do
-        if shellcheck -S warning "$f" >/dev/null 2>&1; then
-            record "shellcheck $(basename "$f")" 1
-        else
-            record "shellcheck $(basename "$f")" 0 "run: shellcheck $f"
-        fi
+        log="$(mktemp)"; nm="$(basename "$f")"
+        # Background subshell writes the log + exit code to <log>.rc; the main
+        # shell waits per-PID and records AFTER (so the record counters/arrays
+        # are never touched concurrently -- safe under set -u, no locking).
+        ( shellcheck -S warning "$f" >"$log" 2>&1; echo $? > "$log.rc" ) &
+        sh_pids+=("$!"); sh_logs+=("$log"); sh_names+=("$nm"); sh_paths+=("$f")
     done < <(find "$SCRIPT_DIR" -maxdepth 1 -type f -name '*.sh')
+    for idx in "${!sh_pids[@]}"; do
+        wait "${sh_pids[$idx]}" 2>/dev/null
+        rc="$(cat "${sh_logs[$idx]}.rc" 2>/dev/null)"
+        [ -z "$rc" ] && rc=1
+        if [ "$rc" -eq 0 ]; then
+            record "shellcheck ${sh_names[$idx]}" 1
+        else
+            record "shellcheck ${sh_names[$idx]}" 0 "run: shellcheck ${sh_paths[$idx]}"
+        fi
+        rm -f "${sh_logs[$idx]}" "${sh_logs[$idx]}.rc"
+    done
 else
     record "shellcheck available" 0 "shellcheck not installed"
 fi
@@ -103,10 +132,11 @@ else
     rm -f "$ctest_exe"
 fi
 
-# 3. PowerShell regression suites via pwsh.
+# 3. PowerShell regression suites via pwsh (parallel: one background job per suite).
 if ! command -v pwsh >/dev/null 2>&1; then
     record "pwsh available" 0 "pwsh not installed"
 else
+    ps_pids=(); ps_logs=(); ps_names=()
     for suite in Test-GodModeCrashFix.ps1 Test-IfeoElevation.ps1 Test-Suite.ps1 Test-GmProxySession.ps1; do
         f="$SCRIPT_DIR/$suite"
         if [ ! -f "$f" ]; then
@@ -114,17 +144,35 @@ else
             continue
         fi
         log="$(mktemp)"
-        if pwsh -NoProfile -File "$f" >"$log" 2>&1; then
-            record "pwsh $suite" 1
-            rm -f "$log"
+        # Background subshell: each suite is an independent pwsh process reading
+        # source files (read-only), so concurrent runs are safe. The main shell
+        # waits per-PID + records after, keeping the counters/arrays single-threaded.
+        ( pwsh -NoProfile -File "$f" >"$log" 2>&1; echo $? > "$log.rc" ) &
+        ps_pids+=("$!"); ps_logs+=("$log"); ps_names+=("$suite")
+    done
+    for idx in "${!ps_pids[@]}"; do
+        wait "${ps_pids[$idx]}" 2>/dev/null
+        rc="$(cat "${ps_logs[$idx]}.rc" 2>/dev/null)"
+        [ -z "$rc" ] && rc=1
+        if [ "$rc" -eq 0 ]; then
+            record "pwsh ${ps_names[$idx]}" 1
+            rm -f "${ps_logs[$idx]}" "${ps_logs[$idx]}.rc"
         else
-            rc=$?
-            record "pwsh $suite" 0 "exit=$rc (log: $log)"
+            record "pwsh ${ps_names[$idx]}" 0 "exit=$rc (log: ${ps_logs[$idx]})"
+            rm -f "${ps_logs[$idx]}.rc"
         fi
     done
 fi
 
 # 4. wine smoke test: gmhook.dll shell-host exclusion (binary-level).
+# NOTE: the wine tests (4/4b/4c + 5/5b-5e) run SERIALLY by design -- they all share
+# WINEPREFIX="${WINEPREFIX:-$HOME/.wine}" and the same wine %TEMP% gmproxy.log /
+# gmhook.log + the C:\ProgramData\GodModeAutoExclude store, so concurrent runs
+# would race on those files and corrupt each other's assertions. Parallelizing
+# them would need a per-job isolated WINEPREFIX (mktemp -d) + a wineboot per
+# prefix, which is a larger future enhancement (concurrent wineboot across
+# separate prefixes is itself flaky). The shellcheck + pwsh-suite steps above
+# ARE parallel (independent processes, no shared writable state).
 smoke="$SCRIPT_DIR/test-shell-host-exclusion.sh"
 if [ ! -f "$smoke" ]; then
     record "test-shell-host-exclusion.sh present" 0 "missing"

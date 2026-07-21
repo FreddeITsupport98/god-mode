@@ -947,4 +947,39 @@ Add-Assertion "ShellAuto: WMI watcher drain retries shells on failure (lastEleva
 Add-Assertion "ShellAuto: 5s polling drain captures the elevation result (meResult)" ($gm.Contains('$meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $proc.ProcessId -HideWindow')) "5s polling drain does not capture the elevation result -- cannot retry on failure"
 Add-Assertion "ShellAuto: 5s polling drain retries shells on failure (lastElevatedPid.Remove proc.ProcessId + shellNames pollBase)" ($gm.Contains('$lastElevatedPid.Remove($proc.ProcessId)') -and $gm.Contains('$shellNames -contains $pollBase')) "5s polling drain does not retry shells on failure -- a transient failure strands the shell as admin forever"
 
+# --- 35. Option-11 (Export-GodModeLogs) monitor/elevation-path diagnostics (2026-07-21) ---
+# The user reported "it still fails -- no SYSTEM privileges at powershell/cmd" after
+# [7]+reboot and asked for more debug in option 11 "so we dont go blind". The dump was
+# gmproxy/IFEO-centric but the SHELL elevation path is MONITOR-centric
+# (Start-Monitoring -> in-place token swap), and option 11 only read the ADMIN user's
+# $env:TEMP logs -- the monitor runs as SYSTEM and logs to C:\Windows\Temp, which was
+# NEVER collected. Plus no live task/process/flag/token-source state was captured, so
+# the dump could not show whether the monitor was even running. This section asserts
+# the new SYSTEM-TEMP LOGS collection + the Get-GodModeElevationPathDiagnostics helper
+# (flag, scheduled tasks + LastTaskResult, live monitor process, shell owner ground
+# truth, SYSTEM token source, seclogon, critical-procs reference, monitor marker scan)
+# are present and wired into Export-GodModeLogs. Additive; sections 1-34 intact.
+Add-Assertion "Opt11: `$GodModeSystemTempLogCandidates var defined (SYSTEM-temp monitor log paths)" ($gm.Contains('$GodModeSystemTempLogCandidates') -and $gm.Contains('C:\Windows\Temp\DNS_Lockdown_Enterprise.log')) "Export-GodModeLogs has no SYSTEM-temp log candidate list -- the monitor's SYSTEM-context logs are never collected (the blind spot)"
+Add-Assertion "Opt11: Get-GodModeElevationPathDiagnostics helper defined" ($gm.Contains('function Get-GodModeElevationPathDiagnostics')) "Get-GodModeElevationPathDiagnostics missing -- option 11 has no monitor/elevation-path section"
+Add-Assertion "Opt11: Export-GodModeLogs calls Get-GodModeElevationPathDiagnostics" ($gm -match 'function Export-GodModeLogs\s*\{[\s\S]*?Get-GodModeElevationPathDiagnostics') "Export-GodModeLogs does not call Get-GodModeElevationPathDiagnostics -- the monitor section is not wired into option 11"
+Add-Assertion "Opt11: MONITOR / SHELL-ELEVATION PATH section header present" ($gm.Contains('===== MONITOR / SHELL-ELEVATION PATH =====')) "monitor/elevation-path section header missing"
+Add-Assertion "Opt11: SYSTEM-TEMP LOGS section header present" ($gm.Contains('===== SYSTEM-TEMP LOGS (monitor as SYSTEM) =====')) "SYSTEM-TEMP LOGS section header missing -- the monitor's SYSTEM-context logs are not collected"
+$epdMatch = [regex]::Match($gm, '(?s)function\s+Get-GodModeElevationPathDiagnostics\s*\{(.*?)\nfunction\s+Export-GodModeLogs\s*\{')
+$epdBody = if ($epdMatch.Success) { $epdMatch.Groups[1].Value } else { "" }
+Add-Assertion "Opt11: Get-GodModeElevationPathDiagnostics body extractable" ($epdMatch.Success) "could not isolate Get-GodModeElevationPathDiagnostics body"
+if ($epdMatch.Success) {
+    Add-Assertion "Opt11: diagnostics reads the God Mode flag (Test-GodModeActive)" ($epdBody.Contains('Test-GodModeActive')) "diagnostics does not read the God Mode flag -- cannot report active state"
+    Add-Assertion "Opt11: diagnostics resolves the SYSTEM token source (Find-SystemProcessCandidate)" ($epdBody.Contains('Find-SystemProcessCandidate')) "diagnostics does not call Find-SystemProcessCandidate -- cannot report token-source availability"
+    Add-Assertion "Opt11: diagnostics enumerates scheduled tasks + LastTaskResult (Get-ScheduledTaskInfo)" ($epdBody.Contains('Get-ScheduledTaskInfo') -and $epdBody.Contains('LastTaskResult')) "diagnostics does not dump task LastTaskResult -- a failed monitor launch would be invisible"
+    Add-Assertion "Opt11: diagnostics detects a live monitor loop (Win32_Process + GodMode.ps1 -Launch)" ($epdBody.Contains('Get-CimInstance Win32_Process') -and $epdBody.Contains('GodMode.ps1') -and $epdBody.Contains('-Launch')) "diagnostics does not detect a live monitor process -- cannot tell if the monitor is running"
+    Add-Assertion "Opt11: diagnostics reports shell owner identity (Invoke-CimMethod GetOwner)" ($epdBody.Contains('Invoke-CimMethod') -and $epdBody.Contains('GetOwner')) "diagnostics does not report shell owner identity -- cannot prove admin vs SYSTEM (ground truth)"
+    Add-Assertion "Opt11: diagnostics checks seclogon (Phase 1 fallback dependency)" ($epdBody.Contains('Get-Service -Name seclogon')) "diagnostics does not check seclogon -- Phase 1 CreateProcessWithTokenW dependency is invisible"
+    Add-Assertion "Opt11: diagnostics scans logs for monitor markers (Select-String + Monitor-ElevateProcess)" ($epdBody.Contains('Select-String') -and $epdBody.Contains('Monitor-ElevateProcess')) "diagnostics does not scan logs for monitor markers -- monitor activity stays buried in a big log"
+    Add-Assertion "Opt11: diagnostics scans SYSTEM-temp candidate logs (`$GodModeSystemTempLogCandidates)" ($epdBody.Contains('$GodModeSystemTempLogCandidates')) "diagnostics does not scan the SYSTEM-temp candidates -- monitor-as-SYSTEM activity is missed"
+    Add-Assertion "Opt11: diagnostics is best-effort (try/catch around the section probes)" ($epdBody -match 'catch\s*\{\s*\$sec \+=') "diagnostics is not best-effort -- a single probe failure could abort the whole section"
+    Add-Assertion "Opt11: diagnostics answers the 'critical process' question (CriticalProcs + shellNames reference)" ($epdBody.Contains('CriticalProcs') -and $epdBody.Contains('shellNames')) "diagnostics does not explain the CriticalProcs/shellNames exemption -- the 'why is my shell critical' question stays unanswered"
+    Add-Assertion "Opt11: diagnostics reports dump context (IsSystem + DumpTEMP)" ($epdBody.Contains('IsSystem') -and $epdBody.Contains('DumpTEMP')) "diagnostics does not report the dump context -- cannot tell which user-temp the dump read"
+}
+Add-Assertion "Opt11: SYSTEM-TEMP collection is best-effort (Test-Path guarded foreach loop)" ($gm -match 'foreach \(\$stPath in \$GodModeSystemTempLogCandidates\)[\s\S]{0,400}?Test-Path \$stPath') "SYSTEM-TEMP log collection is not Test-Path guarded -- an inaccessible path could throw"
+
 Write-Summary

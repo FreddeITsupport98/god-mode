@@ -99,6 +99,49 @@ else
 fi
 rm -rf "$d3"; rm -f "$RUN_LOG"
 
+# Scenario 4: the parallelization symbols are present (auto thread count +
+# Start-ThreadJob in syntax_check.ps1; nproc + GODMODE_JOBS + background jobs in
+# run-regressions.sh). Additive source-invariant guards so a future edit cannot
+# silently revert the speedup. The honesty scenarios above remain authoritative
+# for exit-code behavior; this just guards the parallel plumbing is wired in.
+SC="$SCRIPT_DIR/../syntax_check.ps1"
+RR="$SCRIPT_DIR/run-regressions.sh"
+if grep -qF 'function Get-OptimalThreadCount' "$SC" 2>/dev/null; then
+    record "syntax_check.ps1: Get-OptimalThreadCount defined (auto thread count)" 1
+else
+    record "syntax_check.ps1: Get-OptimalThreadCount defined (auto thread count)" 0 "missing"
+fi
+if grep -qF 'Start-ThreadJob' "$SC" 2>/dev/null; then
+    record "syntax_check.ps1: Start-ThreadJob used (parallel toolchain)" 1
+else
+    record "syntax_check.ps1: Start-ThreadJob used (parallel toolchain)" 0 "missing"
+fi
+if grep -qF 'GODMODE_JOBS' "$SC" 2>/dev/null; then
+    record 'syntax_check.ps1: honors $GODMODE_JOBS override' 1
+else
+    record 'syntax_check.ps1: honors $GODMODE_JOBS override' 0 "missing"
+fi
+if grep -qF 'Invoke-ParallelToolChecks' "$SC" 2>/dev/null; then
+    record "syntax_check.ps1: Invoke-ParallelToolChecks helper defined" 1
+else
+    record "syntax_check.ps1: Invoke-ParallelToolChecks helper defined" 0 "missing"
+fi
+if grep -qE 'nproc|GODMODE_JOBS' "$RR" 2>/dev/null; then
+    record "run-regressions.sh: auto job count (nproc + GODMODE_JOBS)" 1
+else
+    record "run-regressions.sh: auto job count (nproc + GODMODE_JOBS)" 0 "missing"
+fi
+if grep -qF 'sh_pids+=("$!")' "$RR" 2>/dev/null && grep -qF 'ps_pids+=("$!")' "$RR" 2>/dev/null; then
+    record "run-regressions.sh: background jobs spawned (shellcheck + pwsh suites)" 1
+else
+    record "run-regressions.sh: background jobs spawned (shellcheck + pwsh suites)" 0 "missing sh_pids/ps_pids append"
+fi
+if grep -qF 'wait "${sh_pids[$idx]}"' "$RR" 2>/dev/null && grep -qF 'wait "${ps_pids[$idx]}"' "$RR" 2>/dev/null; then
+    record "run-regressions.sh: per-pid wait + record after (parallel safe)" 1
+else
+    record "run-regressions.sh: per-pid wait + record after (parallel safe)" 0 "missing per-pid wait"
+fi
+
 # Final summary with FAIL SUMMARY (N).
 printf '\n=====================================================\n'
 printf '  SYNTAX-CHECK HONESTY TEST SUMMARY\n'
