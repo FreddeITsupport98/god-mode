@@ -340,6 +340,21 @@ Add-Assertion "Detector A AppX drop: prior-hook cleanup is gmproxy-guarded (Debu
 Add-Assertion "Detector A AppX drop: debug EXIT reports droppedAppx + persistedAppx + appxHookRemoved" ($installBody.Contains('droppedAppx=$seedDroppedAppx') -and $installBody.Contains('persistedAppx=') -and $installBody.Contains('appxHookRemoved=')) "debug EXIT does not report the AppX drop counts -- regression visibility lost"
 Add-Assertion "Detector A AppX drop: Add-IfeoElevationForApp skips App Execution Alias stubs (ReparsePoint)" ($addBody.Contains('WindowsApps') -and $addBody.Contains('ReparsePoint') -and $addBody.Contains('SKIP-APPAlias')) "Add-IfeoElevationForApp does not skip App Execution Alias stubs -- a newly-installed Store app could be IFEO-hooked (broken renamed copy)"
 
+# --- 12b-preseed. Detector B CLEAN-GUI admin-tool pre-seed (2026-07-21) ---
+# mmc.exe (hosts every .msc snap-in) silently refuses SYSTEM: launches as SYSTEM,
+# exits 0, renders no window (the MMC host relies on per-user profile/COM
+# resources). Pre-seeding it in the auto-exclude store at install time with
+# reason 'G' means gmproxy launches it as the current user from the FIRST
+# launch, skipping the 2 one-time SYSTEM flash-and-disappear attempts that
+# Detector B would otherwise need to learn from at runtime. The IFEO hook is
+# RETAINED so menu [18] RESET AUTO-EXCLUDE STORE retries SYSTEM. perfmon.exe +
+# resmon.exe are NOT pre-seeded (thin launchers that delegate to mmc.exe).
+Add-Assertion "Detector B pre-seed: Install-IfeoElevation pre-seeds mmc.exe with reason 'G' (CLEAN-GUI)" ($installBody.Contains('Add-GmAutoExcludeEntries -BaseNames $preseededCleanGui -Reason ''G''')) "Install-IfeoElevation does not pre-seed mmc.exe with reason 'G' -- the 2 SYSTEM flash-and-disappear attempts are not eliminated"
+Add-Assertion "Detector B pre-seed: pre-seed variable defines mmc.exe ($preseededCleanGui)" ($installBody.Contains('$preseededCleanGui = @(''mmc.exe'')')) "Install-IfeoElevation pre-seed variable missing or does not list mmc.exe"
+Add-Assertion "Detector B pre-seed: debug EXIT reports preseededCleanGui count" ($installBody.Contains('preseededCleanGui=$($preseededCleanGui.Count)')) "Install-IfeoElevation debug EXIT does not report the pre-seed count -- regression visibility lost"
+Add-Assertion "Detector B pre-seed: IFEO summary log mentions the mmc.exe pre-seed (CLEAN-GUI)" ($installBody.Contains('Detector B pre-seeded') -and $installBody.Contains('mmc.exe reason ''G''')) "Install-IfeoElevation summary log does not mention the mmc.exe pre-seed -- the user cannot tell why mmc.exe launches as user from launch #1"
+Add-Assertion "Detector B pre-seed: seed comment says mmc.exe silently refuses SYSTEM (not 'known-good as SYSTEM')" ($installBody.Contains('mmc.exe silently refuses SYSTEM')) "Install-IfeoElevation seed comment does not say mmc.exe silently refuses SYSTEM -- the pre-seed rationale is not documented"
+
 # --- 12c. notepad detection-miss fix + 3 hardening suggestions (2026-07-19) ---
 # Get-GmSystemCompatExclusions gains (4) a direct C:\Program Files\WindowsApps
 # manifest scan + (5) a curated Win11 Store-redirector stub fallback

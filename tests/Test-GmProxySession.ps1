@@ -1089,5 +1089,21 @@ if ($epd37Match.Success) {
     Add-Assertion "Opt11DetB: hints at menu [18] RESET AUTO-EXCLUDE STORE to retry elevation" ($epd37Body.Contains('RESET AUTO-EXCLUDE STORE')) "diagnostics does not hint at menu [18] to retry SYSTEM elevation for excluded apps"
     Add-Assertion "Opt11DetB: fail-open on a missing store (store not present message)" ($epd37Body.Contains('store not present')) "diagnostics is not fail-open on a missing Detector B store -- a missing store could throw"
 }
+# Feature 4 -- mmc.exe Detector B pre-seed (CLEAN-GUI admin tool, 2026-07-21).
+# mmc.exe silently refuses SYSTEM (exits 0, no window -- the MMC host relies on
+# per-user profile/COM resources). Pre-seeding it in the auto-exclude store at
+# install time with reason 'G' means gmproxy launches it as the current user
+# from the FIRST launch, skipping the 2 one-time SYSTEM flash-and-disappear
+# attempts that Detector B would otherwise need to learn from at runtime. The
+# IFEO hook is RETAINED, so menu [18] RESET AUTO-EXCLUDE STORE clears the
+# pre-seed and retries SYSTEM. perfmon.exe + resmon.exe are NOT pre-seeded
+# (thin launchers that delegate to mmc.exe; once mmc.exe is pre-excluded, the
+# .msc GUI runs as the user from launch #1 with no visible flash).
+Add-Assertion "AdminToolsPreSeed: Install-IfeoElevation pre-seeds mmc.exe in the auto-exclude store (reason 'G')" ($gm.Contains('Add-GmAutoExcludeEntries -BaseNames $preseededCleanGui -Reason ''G''')) "Install-IfeoElevation does not pre-seed mmc.exe with reason 'G' -- the 2 SYSTEM flash-and-disappear attempts are not eliminated"
+Add-Assertion "AdminToolsPreSeed: pre-seed variable defines mmc.exe (`$preseededCleanGui = @('mmc.exe'))" ($gm.Contains('$preseededCleanGui = @(''mmc.exe'')')) "Install-IfeoElevation pre-seed variable missing or does not list mmc.exe"
+Add-Assertion "AdminToolsPreSeed: debug EXIT reports the pre-seed count (preseededCleanGui)" ($gm.Contains('preseededCleanGui=$($preseededCleanGui.Count)')) "Install-IfeoElevation debug EXIT does not report the pre-seed count -- regression visibility lost"
+Add-Assertion "AdminToolsPreSeed: summary log mentions the mmc.exe pre-seed (CLEAN-GUI reason 'G')" ($gm -match 'pre-seeded .*CLEAN-GUI admin tool.*mmc\.exe reason ''G''') "Install-IfeoElevation summary log does not mention the mmc.exe pre-seed -- the user cannot tell why mmc.exe launches as user from launch #1"
+Add-Assertion "AdminToolsPreSeed: seed comment reflects mmc.exe SYSTEM refusal (silently refuses SYSTEM)" ($gm.Contains('mmc.exe silently refuses SYSTEM')) "Install-IfeoElevation seed comment does not say mmc.exe silently refuses SYSTEM -- the pre-seed rationale is not documented"
+Add-Assertion "AdminToolsPreSeed: seed comment no longer says 'known-good as SYSTEM -- the PsExec' (stale claim removed)" (-not ($gm -match 'known-good as SYSTEM -- the PsExec')) "Install-IfeoElevation seed comment still says 'known-good as SYSTEM -- the PsExec -s mmc pattern' -- the pre-seed contradicts this claim"
 
 Write-Summary

@@ -5912,15 +5912,18 @@ function Install-IfeoElevation {
             "7z.exe","7zFM.exe","winrar.exe","peazip.exe",
             "filezilla.exe","putty.exe","mstsc.exe","telnet.exe","ftp.exe","nslookup.exe","tracert.exe",
             "regedit.exe","msconfig.exe","mspaint.exe","calc.exe","snippingtool.exe","snipaste.exe",
-            # Administrator / management tools launched as SYSTEM. mmc.exe hosts ALL .msc snap-ins
+            # Administrator / management tools. mmc.exe hosts ALL .msc snap-ins
             # -- services.msc, eventvwr.msc, compmgmt.msc, gpedit.msc, secpol.msc, lusrmgr.msc,
             # certmgr.msc, diskmgmt.msc, taskschd.msc, fsmgmt.msc, wf.msc and more -- so one IFEO
-            # key covers every snap-in. perfmon.exe + resmon.exe are the perf and resource monitors.
-            # These are known-good as SYSTEM -- the PsExec -s mmc pattern -- and are NOT in any
-            # denylist used by Get-IfeoElevationCandidates or Add-IfeoElevationForApp, and are NOT
-            # AppX or browser so Detector A's compat filter passes them. Any snap-in that does NOT
-            # tolerate SYSTEM is self-healed by Detector B: gmproxy.c threshold is 2, after which
-            # the app auto-excludes to a normal-user launch.
+            # key covers every snap-in. perfmon.exe + resmon.exe are the perf and resource monitors
+            # -- thin launchers that delegate to mmc.exe. mmc.exe silently refuses SYSTEM: exits 0,
+            # no window -- the MMC host relies on per-user profile/COM resources. So it is
+            # PRE-SEEDED in the Detector B auto-exclude store with reason 'G' below: gmproxy
+            # launches it as the current user from the FIRST launch, skipping the 2 one-time SYSTEM
+            # flash-and-disappear attempts. The IFEO hook is retained so menu [18] RESET AUTO-EXCLUDE
+            # STORE retries SYSTEM. perfmon.exe + resmon.exe are NOT pre-seeded -- they are thin
+            # launchers with no GUI of their own; once mmc.exe is pre-excluded, the .msc GUI runs as
+            # the user from launch #1. All three are NOT in any denylist, NOT AppX, NOT browser.
             "mmc.exe","perfmon.exe","resmon.exe",
             "steam.exe","epicgameslauncher.exe","origin.exe","uplay.exe","battle.net.exe","minecraft.exe"
         )
@@ -5987,7 +5990,24 @@ function Install-IfeoElevation {
             Add-GmAutoExcludeEntries -BaseNames @($CompatExclusions.AppX.Keys) -Reason 'A'
         }
 
-        $IfeoBase = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        # Detector B pre-seed (CLEAN-GUI admin tool): mmc.exe hosts every .msc snap-in
+        # (services, eventvwr, compmgmt, gpedit, secpol, lusrmgr, ...). It silently refuses
+        # SYSTEM -- launches as SYSTEM, exits 0, renders no window (the MMC host relies on
+        # per-user profile/COM resources that don't work as SYSTEM in an interactive session).
+        # Pre-seeding at install time means gmproxy launches mmc.exe as the current user from
+        # the FIRST launch, skipping the 2 one-time SYSTEM flash-and-disappear attempts that
+        # Detector B would otherwise need to learn from at runtime. The IFEO hook is RETAINED,
+        # so menu [18] RESET AUTO-EXCLUDE STORE clears the pre-seed and retries SYSTEM (the
+        # next ToggleOn re-seeds it, same as browser/AppX pre-seeds). perfmon.exe + resmon.exe
+        # are thin launchers that delegate to mmc.exe (perfmon.msc / resmon.msc) -- once
+        # mmc.exe is pre-excluded, the actual GUI runs as the user from launch #1 with no
+        # visible flash. Fail-open (Add-GmAutoExcludeEntries swallows errors; never blocks
+        # the install). Merge-safe: if the store already has a runtime mmc.exe entry, the
+        # higher count is kept and excluded is never downgraded.
+        $preseededCleanGui = @('mmc.exe')
+        Add-GmAutoExcludeEntries -BaseNames $preseededCleanGui -Reason 'G'
+
+        $IfeoBase = "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options"
         $IfeoBaseSubKey = "SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
         $hooked = 0; $skipped = 0; $failed = 0
 
@@ -6054,8 +6074,8 @@ function Install-IfeoElevation {
         $totalUnique = $allApps.Count
         $dedupOverlap = ($seedCount + $autoCount) - $totalUnique
         if ($dedupOverlap -lt 0) { $dedupOverlap = 0 }
-        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser + $seedDroppedAppx AppX/Store-stub from the seed (launch as user from launch #1; browsers persisted reason 'P', AppX set persisted reason 'A'). AppX/Store-redirector stubs (notepad/mspaint/calc/photos/etc.) are NOT IFEO-hooked -- they cannot run as SYSTEM (AppX activation needs user identity) and gmproxy's rename/copy breaks their Store redirect, so they launch natively as the user via the App Execution Alias. Prior AppX IFEO hooks removed: $appxHookRemoved (failed: $appxHookRemoveFailed). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
-        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count) droppedAppx=$seedDroppedAppx persistedAppx=$($CompatExclusions.AppX.Count) appxHookRemoved=$appxHookRemoved appxHookRemoveFailed=$appxHookRemoveFailed"
+        Write-Log -Message "IFEO elevation: $hooked hooked, $skipped already hooked, $failed failed. ($seedCount curated seed + $autoCount auto-populated = $totalUnique unique targets, $dedupOverlap deduped overlap). Detector A dropped $seedDroppedBrowser browser + $seedDroppedAppx AppX/Store-stub from the seed (launch as user from launch #1; browsers persisted reason 'P', AppX set persisted reason 'A'). AppX/Store-redirector stubs (notepad/mspaint/calc/photos/etc.) are NOT IFEO-hooked -- they cannot run as SYSTEM (AppX activation needs user identity) and gmproxy's rename/copy breaks their Store redirect, so they launch natively as the user via the App Execution Alias. Prior AppX IFEO hooks removed: $appxHookRemoved (failed: $appxHookRemoveFailed). Detector B pre-seeded $($preseededCleanGui.Count) CLEAN-GUI admin tool (mmc.exe reason 'G' -- silently refuses SYSTEM; launched as user from launch #1, IFEO hook retained). Normal programs now launch as SYSTEM via gmproxy." -Type "INFO" -Color Green
+        Write-DebugLog -FunctionName "Install-IfeoElevation" -Action "EXIT" -Message "hooked=$hooked skipped=$skipped failed=$failed seed=$seedCount auto=$autoCount unique=$totalUnique droppedBrowser=$seedDroppedBrowser persistedBrowser=$($droppedBrowserNames.Count) droppedAppx=$seedDroppedAppx persistedAppx=$($CompatExclusions.AppX.Count) appxHookRemoved=$appxHookRemoved appxHookRemoveFailed=$appxHookRemoveFailed preseededCleanGui=$($preseededCleanGui.Count)"
         return $true
     } catch {
         Write-Log -Message "Install-IfeoElevation failed: $_" -Type "WARN" -Color Yellow
