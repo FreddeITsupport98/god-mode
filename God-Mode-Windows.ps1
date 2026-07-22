@@ -2247,6 +2247,23 @@ public class TokenOps {
                         }
                     }
 
+                    // Use CreateProcessWithTokenW (not CreateProcessAsUser).
+                    // CreateProcessAsUser fails with ERROR_ACCESS_DENIED (5) on
+                    // Windows 11 26100+ even with SeTcbPrivilege + SeAssignPrimary-
+                    // TokenPrivilege enabled -- it has cross-session restrictions
+                    // that deny a Session-0 monitor from birthing a Session-1 child
+                    // even when the token has been relocated to Session 1. This was
+                    // the root cause of "CreateProcessAsSystem failed for powershell
+                    // (Win32 error 5)" -> the monitor fell through to Phase 2
+                    // (gmproxy service kill+relaunch) which KILLED the user's shell.
+                    // CreateProcessWithTokenW only needs SeImpersonatePrivilege
+                    // (already enabled by Enable-ElevationPrivileges) and has NO
+                    // cross-session restriction -- it births the child in the TOKEN's
+                    // session, regardless of the caller's session. This is the SAME
+                    // API that CreateProcessFromToken (menu [19] on-demand shell)
+                    // and gmproxy.exe both use successfully (the gmproxy logs prove
+                    // it: "Launched powershell.exe as SYSTEM (PID=6872, session=1)").
+                    // The LOGON_WITH_PROFILE flag matches CreateProcessFromToken.
                     STARTUPINFO si = new STARTUPINFO();
                     si.cb = Marshal.SizeOf(si);
                     si.lpDesktop = "WinSta0\\Default";
@@ -2258,7 +2275,7 @@ public class TokenOps {
                     uint creationFlags = CREATE_UNICODE_ENVIRONMENT;
                     if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
                     else creationFlags |= CREATE_NEW_CONSOLE;
-                    if (!CreateProcessAsUser(hPrimaryToken, appName, cmdLine, IntPtr.Zero, IntPtr.Zero, false, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
+                    if (!CreateProcessWithTokenW(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
                         return Marshal.GetLastWin32Error();
                     }
                     CloseHandle(pi.hProcess);
