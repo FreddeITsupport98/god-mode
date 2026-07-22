@@ -190,6 +190,15 @@ Add-Assertion "God-Mode-Windows.ps1: TokenOps has WTSGetActiveConsoleSessionId P
 Add-Assertion "God-Mode-Windows.ps1: CreateProcessAsSystem queries token session before launch" ($gm -match 'GetTokenInformation\(hPrimaryToken,\s*TokenSessionId') "CreateProcessAsSystem does not query the token's session before deciding to relocate"
 Add-Assertion "God-Mode-Windows.ps1: CreateProcessAsSystem returns SESSION0_REFUSED on relocation failure" ($gm -match 'return SESSION0_REFUSED') "CreateProcessAsSystem does not refuse ownerless birth when session relocation fails"
 Add-Assertion "God-Mode-Windows.ps1: Monitor-ElevateProcess logs SESSION0_REFUSED fall-through to service path" ($gm -match 'SESSION0_REFUSED[\s\S]{0,300}?service path') "Monitor-ElevateProcess does not log the SESSION0_REFUSED fall-through to the service path"
+# WTSGetActiveConsoleSessionId fail-open (2026-07-22 VM crash): on Windows 11
+# 26100 the wtsapi32.dll P/Invoke throws EntryPointNotFoundException at runtime
+# (API-set forwarding quirk). Find-SystemProcessCandidate already catches it +
+# defaults to session 1; CreateProcessAsSystem MUST too or the exception kills
+# every Monitor-ElevateProcess Phase 1 attempt -> shells stay admin (whoami ->
+# admin). The ExactSpelling DllImport hardening + the try/catch defaulting to 1
+# are the fix. Source-level tests missed it (none execute the P/Invoke).
+Add-Assertion "God-Mode-Windows.ps1: WTSGetActiveConsoleSessionId DllImport uses ExactSpelling + EntryPoint (no A/W suffix probing)" ($gm -match 'DllImport\("wtsapi32\.dll",\s*ExactSpelling\s*=\s*true,\s*EntryPoint\s*=\s*"WTSGetActiveConsoleSessionId"') "WTSGetActiveConsoleSessionId DllImport missing ExactSpelling/EntryPoint -- .NET may probe a non-existent A-suffixed name and fail to resolve the entry point on some Windows 11 builds"
+Add-Assertion "God-Mode-Windows.ps1: CreateProcessAsSystem fail-open try/catch around WTSGetActiveConsoleSessionId (defaults to 1)" ($gm -match 'try\s*\{\s*activeSession\s*=\s*WTSGetActiveConsoleSessionId\(\)' -and $gm -match 'catch\s*\{\s*activeSession\s*=\s*1') "CreateProcessAsSystem does NOT catch the WTSGetActiveConsoleSessionId P/Invoke -- an EntryPointNotFoundException on Windows 11 26100 propagates uncaught through Monitor-ElevateProcess -> Start-Monitoring loop exception -> the shell is never elevated (whoami -> admin)"
 
 # --- 12. God-Mode-Windows.ps1: Find-SystemProcessCandidate session-aware (Session 0 excluded) ---
 Add-Assertion "God-Mode-Windows.ps1: Find-SystemProcessCandidate resolves activeSession via WTSGetActiveConsoleSessionId" ($gm -match '\[TokenOps\]::WTSGetActiveConsoleSessionId') "Find-SystemProcessCandidate does not resolve the active console session via [TokenOps]::WTSGetActiveConsoleSessionId()"

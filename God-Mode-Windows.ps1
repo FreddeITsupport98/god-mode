@@ -2153,7 +2153,13 @@ public class TokenOps {
     [DllImport("advapi32.dll", SetLastError = true)]
     public static extern bool GetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
 
-    [DllImport("wtsapi32.dll")]
+    // ExactSpelling + EntryPoint: force .NET to look up exactly
+    // "WTSGetActiveConsoleSessionId" (no A/W suffix probing). Without it the
+    // default CharSet.None/ExactSpelling=false path can throw
+    // EntryPointNotFoundException on some Windows 11 builds (26100+ API-set
+    // forwarding quirk) even though the function IS exported. The try/catch in
+    // CreateProcessAsSystem below is the fail-open safety net regardless.
+    [DllImport("wtsapi32.dll", ExactSpelling = true, EntryPoint = "WTSGetActiveConsoleSessionId", SetLastError = true)]
     public static extern uint WTSGetActiveConsoleSessionId();
 
     public const int TokenSessionId = 12;
@@ -2195,7 +2201,17 @@ public class TokenOps {
                 try {
                     // Resolve the active interactive console session. If no console is
                     // attached (0xFFFFFFFF) default to 1 -- the typical interactive session.
-                    uint activeSession = WTSGetActiveConsoleSessionId();
+                    // FAIL-OPEN: on some Windows 11 builds (26100+) the wtsapi32.dll
+                    // P/Invoke throws EntryPointNotFoundException at runtime (API-set
+                    // forwarding quirk) even though gmproxy.c's GetProcAddress finds it.
+                    // Find-SystemProcessCandidate already catches this and defaults to 1;
+                    // CreateProcessAsSystem MUST do the same or the exception propagates
+                    // uncaught through Monitor-ElevateProcess Phase 1 -> Start-Monitoring
+                    // loop exception -> the shell is never elevated (whoami -> admin).
+                    // Defaulting to 1 is correct for a single interactive desktop (the
+                    // only configuration God Mode targets).
+                    uint activeSession = 1;
+                    try { activeSession = WTSGetActiveConsoleSessionId(); } catch { activeSession = 1; }
                     if (activeSession == 0xFFFFFFFF) activeSession = 1;
 
                     // Query the duplicated token's session. A Session-0 token (sourced from
