@@ -78,17 +78,41 @@ param(
 $script:FailedFiles = @()
 $script:ErrorFiles = @()
 $script:Warnings = @()
-$FileFailures = @{}  # key = fileName, value = array of failure messages (single source of truth; reference-type, aggregates across function/script scope)
+# Thread-safe failure store: ConcurrentDictionary<string, ConcurrentQueue<string>>.
+# This allows the per-file PS1 + C/C++ check loops to run in parallel (one
+# Start-ThreadJob per file, fanned out across $threadCount cores) without
+# corrupting the failure aggregation. Each file's queue is a ConcurrentQueue
+# (thread-safe Enqueue). The summary derives ERROR/WARN file lists from this
+# dictionary (single source of truth) so no separate $script: arrays are needed
+# for correctness -- they stay as best-effort caches for the serial path.
+$FileFailures = [System.Collections.Concurrent.ConcurrentDictionary[string, System.Collections.Concurrent.ConcurrentQueue[string]]]::new()
 
 function Add-Failure {
     param([string]$FileName, [string]$Message, [string]$Severity = "ERROR")
-    if (-not $FileFailures.ContainsKey($FileName)) { $FileFailures[$FileName] = @() }
-    $FileFailures[$FileName] += "[$Severity] $Message"
+    # Thread-safe: TryAdd is atomic (only one thread creates the queue); Enqueue
+    # is thread-safe on ConcurrentQueue. No lock needed.
+    $FileFailures.TryAdd($FileName, [System.Collections.Concurrent.ConcurrentQueue[string]]::new()) | Out-Null
+    $FileFailures[$FileName].Enqueue("[$Severity] $Message")
     if ($Severity -eq "ERROR") {
         if ($script:FailedFiles -notcontains $FileName) { $script:FailedFiles += $FileName }
         if ($script:ErrorFiles -notcontains $FileName) { $script:ErrorFiles += $FileName }
     } else {
         if ($script:Warnings -notcontains $FileName) { $script:Warnings += $FileName }
+    }
+}
+
+# Initialization script for parallel runspaces (Start-ThreadJob). Defines
+# Add-Failure in each runspace so the per-file check scriptblocks can call it.
+# The $script:FileFailures dictionary is passed per-file via -ArgumentList and
+# set at the top of each scriptblock; this init script runs BEFORE the
+# scriptblock in each runspace, so it references $script:FileFailures which the
+# scriptblock will set. The ConcurrentDictionary + ConcurrentQueue are
+# thread-safe, so concurrent runspaces can Enqueue failures without locks.
+$ParallelInitScript = {
+    function Add-Failure {
+        param([string]$FileName, [string]$Message, [string]$Severity = "ERROR")
+        $script:FileFailures.TryAdd($FileName, [System.Collections.Concurrent.ConcurrentQueue[string]]::new()) | Out-Null
+        $script:FileFailures[$FileName].Enqueue("[$Severity] $Message")
     }
 }
 
@@ -163,14 +187,23 @@ function Invoke-ParallelToolChecks {
     return $results
 }
 
-Write-Host "[SCAN] Checking PowerShell syntax in: $ScanDir (toolchain parallel: x$threadCount)" -ForegroundColor Cyan
+Write-Host "[SCAN] Checking PowerShell syntax in: $ScanDir (PS1 + C/C++ parallel: x$threadCount threads, auto-detected from cores)" -ForegroundColor Cyan
 
 $Ps1Files = Get-ChildItem -Path $ScanDir -Filter "*.ps1" -File -Recurse -ErrorAction SilentlyContinue |
     Where-Object { $_.Name -notmatch '_temp_' }
 
-foreach ($File in $Ps1Files) {
+# --- Per-file PS1 check scriptblock (self-contained for parallel execution) ---
+# Wrapped in a scriptblock so it can be fanned out across $threadCount cores via
+# Start-ThreadJob (PS7) or run serially (PS5.1 fallback). 'return' exits the
+# scriptblock (equivalent to 'continue' in a foreach) -- works in BOTH modes.
+# Add-Failure is defined in $ParallelInitScript for parallel runspaces; in serial
+# mode the main script's Add-Failure is used. $script:FileFailures is set from
+# the argument so both modes share the same ConcurrentDictionary.
+$ps1CheckBody = {
+    param($File, $FailuresDict)
+    $script:FileFailures = $FailuresDict
     $Content = Get-Content -Raw -Path $File.FullName -ErrorAction SilentlyContinue
-    if (-not $Content) { continue }
+    if (-not $Content) { return }
     $Lines = Get-Content -Path $File.FullName -ErrorAction SilentlyContinue
     $FileName = $File.Name
     $FilePath = $File.FullName
@@ -186,12 +219,12 @@ foreach ($File in $Ps1Files) {
                 Write-Host "  L$($Err.Extent.StartLineNumber): $($Err.Message)" -ForegroundColor DarkRed
                 Add-Failure -FileName $FileName -Message "L$($Err.Extent.StartLineNumber): $($Err.Message)" -Severity "ERROR"
             }
-            continue
+            return
         }
     } catch {
         Write-Host "[ERR]  $FilePath`: $($_.Exception.Message)" -ForegroundColor Red
         Add-Failure -FileName $FileName -Message "AST parse exception: $($_.Exception.Message)" -Severity "ERROR"
-        continue
+        return
     }
 
     # 2. PSParser check (PowerShell 5.1 tokenizer)
@@ -206,12 +239,12 @@ foreach ($File in $Ps1Files) {
                 Write-Host "  L$($Err.Token.StartLine): $($Err.Message)" -ForegroundColor DarkRed
                 Add-Failure -FileName $FileName -Message "PSParser L$($Err.Token.StartLine): $($Err.Message)" -Severity "ERROR"
             }
-            continue
+            return
         }
     } catch {
         Write-Host "[ERR]  $FilePath`: PSParser exception: $($_.Exception.Message)" -ForegroundColor Red
         Add-Failure -FileName $FileName -Message "PSParser exception: $($_.Exception.Message)" -Severity "ERROR"
-        continue
+        return
     }
 
     # 3. Execution test: run the script with -HealthCheck in a fresh subprocess
@@ -259,7 +292,7 @@ foreach ($File in $Ps1Files) {
             Write-Host "[UNICODE-ERR] $FilePath L$lineNumber`: em-dash (U+2014) detected. Replace with double-hyphen '--' to avoid PowerShell 5.1 parse errors." -ForegroundColor Red
             Add-Failure -FileName $FileName -Message "L$lineNumber`: em-dash (U+2014) detected - replace with '--'" -Severity "ERROR"
         }
-        continue
+        return
     }
 
     # 5. Regression Check: pipeline precedence bugs (Select-Object -ExpandProperty ... -eq)
@@ -893,16 +926,50 @@ foreach ($File in $Ps1Files) {
     }
 }
 
+# --- Parallel/serial dispatch for PS1 files ---
+# Fan out the per-file check scriptblock across $threadCount cores (auto-detected
+# from [System.Environment]::ProcessorCount). Each file gets one Start-ThreadJob;
+# Wait-Job blocks until all complete (600s timeout for safety). Serial fallback
+# when Start-ThreadJob is unavailable or there is only one file. The
+# ConcurrentDictionary $FileFailures is shared across all runspaces, so
+# Add-Failure calls from parallel jobs aggregate thread-safely.
+if ($canParallel -and $Ps1Files.Count -gt 1) {
+    Write-Host "[PARALLEL] PS1 checks: $($Ps1Files.Count) files across $threadCount threads" -ForegroundColor DarkGray
+    $ps1Jobs = $Ps1Files | ForEach-Object {
+        Start-ThreadJob -InitializationScript $ParallelInitScript -ScriptBlock $ps1CheckBody -ArgumentList $_, $FileFailures
+    }
+    $null = Wait-Job -Job $ps1Jobs -Timeout 600
+    # Receive and replay any output from the jobs (Write-Host lines)
+    $ps1Jobs | Receive-Job -ErrorAction SilentlyContinue | Where-Object { $_ } | ForEach-Object { Write-Host $_ }
+    # Stop + remove any timed-out jobs
+    $ps1Jobs | Where-Object { $_.State -ne 'Completed' -and $_.State -ne 'Failed' } | ForEach-Object {
+        Write-Host "[PARALLEL] PS1 check job timed out (600s), stopping: $($_.Name)" -ForegroundColor Yellow
+        Stop-Job $_ -ErrorAction SilentlyContinue
+    }
+    $ps1Jobs | Remove-Job -Force -ErrorAction SilentlyContinue
+} else {
+    foreach ($File in $Ps1Files) {
+        & $ps1CheckBody $File $FileFailures
+    }
+}
+
 # C/C++ Syntax Check Section
 $CFiles = Get-ChildItem -Path $ScanDir -Filter "*.c" -File -Recurse -ErrorAction SilentlyContinue
 $HFiles = Get-ChildItem -Path $ScanDir -Filter "*.h" -File -Recurse -ErrorAction SilentlyContinue
 $AllCFiles = @($CFiles) + @($HFiles) | Where-Object { $_ -ne $null }
 
-foreach ($CFile in $AllCFiles) {
+# --- Per-file C/C++ check scriptblock (self-contained for parallel execution) ---
+# Same pattern as the PS1 scriptblock: wrapped in a scriptblock so it can be
+# fanned out across $threadCount cores via Start-ThreadJob. 'return' exits the
+# scriptblock (equivalent to 'continue' in a foreach). Add-Failure is defined
+# in $ParallelInitScript for parallel runspaces.
+$cCheckBody = {
+    param($CFile, $FailuresDict)
+    $script:FileFailures = $FailuresDict
     $CFileName = $CFile.Name
     $CFilePath = $CFile.FullName
     $CLines = Get-Content -Path $CFilePath -ErrorAction SilentlyContinue
-    if (-not $CLines) { continue }
+    if (-not $CLines) { return }
 
     $BraceStack = [System.Collections.Generic.List[pscustomobject]]::new()
     $InString = $false
@@ -1055,6 +1122,27 @@ foreach ($CFile in $AllCFiles) {
 
     if (-not $FileFailures.ContainsKey($CFileName)) {
         Write-Host "[C-OK] $CFileName" -ForegroundColor Green
+    }
+}
+
+# --- Parallel/serial dispatch for C/C++ files ---
+# Same fan-out as the PS1 loop: one Start-ThreadJob per C/C++ file across
+# $threadCount cores, serial fallback for PS5.1 or single-file.
+if ($canParallel -and $AllCFiles.Count -gt 1) {
+    Write-Host "[PARALLEL] C/C++ checks: $($AllCFiles.Count) files across $threadCount threads" -ForegroundColor DarkGray
+    $cJobs = $AllCFiles | ForEach-Object {
+        Start-ThreadJob -InitializationScript $ParallelInitScript -ScriptBlock $cCheckBody -ArgumentList $_, $FileFailures
+    }
+    $null = Wait-Job -Job $cJobs -Timeout 600
+    $cJobs | Receive-Job -ErrorAction SilentlyContinue | Where-Object { $_ } | ForEach-Object { Write-Host $_ }
+    $cJobs | Where-Object { $_.State -ne 'Completed' -and $_.State -ne 'Failed' } | ForEach-Object {
+        Write-Host "[PARALLEL] C/C++ check job timed out (600s), stopping: $($_.Name)" -ForegroundColor Yellow
+        Stop-Job $_ -ErrorAction SilentlyContinue
+    }
+    $cJobs | Remove-Job -Force -ErrorAction SilentlyContinue
+} else {
+    foreach ($CFile in $AllCFiles) {
+        & $cCheckBody $CFile $FileFailures
     }
 }
 
@@ -1275,6 +1363,8 @@ Write-Host "=====================================================" -ForegroundCo
 # truth that aggregates correctly across function/script scope) rather than relying solely on the
 # $script: arrays. This guarantees the exit code reflects real [ERROR] findings even if a scope bug
 # ever resurfaces in Add-Failure.
+# ConcurrentQueue enumeration: $FileFailures[$_] is a ConcurrentQueue[string];
+# iterate via .ToArray() or pipeline (both are thread-safe snapshots).
 $ErrorFileList = @($FileFailures.Keys | Where-Object { @($FileFailures[$_] | Where-Object { $_ -match '^\[ERROR\]' }).Count -gt 0 } | Sort-Object)
 $WarnFileList  = @($FileFailures.Keys | Where-Object { @($FileFailures[$_] | Where-Object { $_ -match '^\[WARN\]'  }).Count -gt 0 } | Sort-Object)
 $TotalChecked = $Ps1Files.Count + $AllCFiles.Count + @($ShFiles).Count + @($PyFiles).Count + @($JsFiles).Count
@@ -1290,7 +1380,7 @@ if ($ErrorCount -gt 0) {
     Write-Host "`nFAIL SUMMARY ($ErrorCount)" -ForegroundColor Red -BackgroundColor Black
     foreach ($File in $ErrorFileList) {
         Write-Host "  $File" -ForegroundColor Red
-        foreach ($Msg in $FileFailures[$File] | Where-Object { $_ -match '^\[ERROR\]' }) {
+        foreach ($Msg in $FileFailures[$File].ToArray() | Where-Object { $_ -match '^\[ERROR\]' }) {
             Write-Host "    $Msg" -ForegroundColor DarkRed
         }
     }
