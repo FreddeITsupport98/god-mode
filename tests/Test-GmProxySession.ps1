@@ -938,6 +938,18 @@ if ($stealthMatch.Success) {
     Add-Assertion "ShellAuto: Register-StealthTask flap-proof -- NO Unregister-StealthTask call inside the body" (-not ($stealthBody -match '(?m)^\s*Unregister-StealthTask\b')) "Register-StealthTask still calls Unregister-StealthTask -- a concurrent -ToggleOn at boot would kill a just-started monitor (flap -> shells never elevate after reboot)"
     Add-Assertion "ShellAuto: Register-StealthTask flap-proof -- Running-state skip preserved" ($stealthBody.Contains('State -eq ''Running''')) "Register-StealthTask lost the Running-state skip -- an already-running monitor could be touched"
     Add-Assertion "ShellAuto: Register-StealthTask creates a new task only when none exists" ($stealthBody.Contains('$taskName = $GodModeTaskPrefix')) "Register-StealthTask does not gate the create path on no-existing-task -- could accumulate stealth tasks"
+    # Quoting regression (2026-07-21 VM crash): the stealth task -Argument MUST
+    # backtick-QUOTE the script path inside the double-quoted -Argument so -File
+    # gets a literal quoted path. A backtick-DOLLAR-quote (emits a literal `$ +
+    # terminates the outer string early) leaked `$GodModeInstallScript + -Launch
+    # as a positional arg -> New-ScheduledTaskAction threw "a positional
+    # parameter cannot be found" -> uncaught trap killed Enable-GodMode -> no
+    # stealth monitor task -> [NO LIVE MONITOR LOOP] -> shells stayed admin.
+    # Source-level tests missed it (none execute New-ScheduledTaskAction); this
+    # asserts the exact byte pattern so it can never regress.
+    Add-Assertion "ShellAuto: Register-StealthTask -Argument backtick-QUOTE-escapes the script path (literal `"`$GodModeInstallScript`" inside -File)" ($stealthBody.Contains('`"$GodModeInstallScript`"')) "Register-StealthTask -Argument does not backtick-quote the script path -- -File would not receive a literal quoted path"
+    Add-Assertion "ShellAuto: Register-StealthTask -Argument has NO broken backtick-DOLLAR-quote (the positional-parameter trap that killed Enable-GodMode)" (-not $stealthBody.Contains('`$"$GodModeInstallScript`$"')) "Register-StealthTask -Argument uses backtick-DOLLAR-quote around `$GodModeInstallScript -- that emits a literal `$ and terminates the outer string early, leaking -Launch as a positional arg -> New-ScheduledTaskAction throws 'a positional parameter cannot be found' (uncaught trap -> no stealth monitor -> shells stay admin)"
+    Add-Assertion "ShellAuto: Register-StealthTask action pins -WorkingDirectory (ERROR_DIRECTORY 267 fix)" ($stealthBody.Contains('-WorkingDirectory $GodModeInstallDir')) "Register-StealthTask action missing -WorkingDirectory `$GodModeInstallDir -- a SYSTEM task with no WorkingDirectory can die with error 267 (ERROR_DIRECTORY) -> no monitor loop -> shells stay admin"
 }
 Add-Assertion "ShellAuto: Phase 0 verifies the in-place swap for shells (Test-PidIsSystem within Phase 0)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?\$isInteractiveShell[\s\S]{0,400}?Test-PidIsSystem -ProcessId \$ProcessId') "Phase 0 does not verify the in-place swap for shells -- a silent NtSetInformationProcess success would leave whoami -> admin with no fallback"
 Add-Assertion "ShellAuto: Phase 0 settle sleep before the verify (Start-Sleep -Milliseconds 300)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?Start-Sleep -Milliseconds 300') "Phase 0 does not settle before verifying -- the owner query could race the token swap"

@@ -5086,10 +5086,17 @@ function Register-StealthTask {
     # ERROR_DIRECTORY): a SYSTEM scheduled task with no WorkingDirectory can
     # resolve to an inaccessible/invalid cwd, making the -Launch action die
     # immediately -> no monitor loop -> interactive shells stay admin. Pin it to
-    # the install dir (which exists and is readable by SYSTEM). Additive: the
-    # -Argument string is unchanged.
+    # the install dir (which exists and is readable by SYSTEM). The -Argument
+    # string MUST use backtick-QUOTE (not backtick-DOLLAR-quote) around the
+    # script path: backtick-quote embeds a literal " inside the double-quoted
+    # -Argument so -File gets a properly quoted path; backtick-DOLLAR-quote
+    # emits a literal $ and terminates the outer string early, leaking
+    # $GodModeInstallScript + -Launch as a positional arg -> New-ScheduledTaskAction
+    # throws "a positional parameter cannot be found" (the uncaught trap at the
+    # Register-StealthTask create line that killed Enable-GodMode + left no
+    # stealth monitor -> shells stayed admin). Regression: Test-GmProxySession.
     $action = New-ScheduledTaskAction -Execute "powershell.exe" `
-        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `$"$GodModeInstallScript`$" -Launch" `
+        -Argument "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$GodModeInstallScript`" -Launch" `
         -WorkingDirectory $GodModeInstallDir
 
     $trigger = New-ScheduledTaskTrigger -AtStartup
