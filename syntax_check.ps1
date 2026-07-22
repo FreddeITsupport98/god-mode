@@ -27,7 +27,28 @@
     22. Non-ASCII whitespace characters (tabs, non-breaking spaces)
     23. Backtick at end of line (accidental line continuation)
     24. Auto-chmod executable permissions
+    25. Try/Catch/Finally mismatch heuristic
+    26. OrderedDictionary .ContainsKey() trap
     --- Upgrades (2026-07-16) ---
+    * Honest ERROR aggregation + heuristic downgrades + string-aware elevation-loop
+    * Best-effort toolchain checks (C/shell/python/node) + auto-chmod .sh/.py/.js
+    --- Upgrades (2026-07-22) ---
+    * #29 Backtick-dollar-quote string trap: `` `$" `` inside a double-quoted string
+      emits a literal `$ then TERMINATES the string early (the Enable-GodMode killer:
+      `` `$"$var`$" `` leaked `$var + -Launch as positional args -> "a positional
+      parameter cannot be found" uncaught trap -> no stealth monitor -> shells stayed
+      admin). The correct pattern is `` `" `` (backtick-QUOTE). ERROR severity.
+    * #30 C# DllImport ExactSpelling: [DllImport("wtsapi32.dll")] without
+      ExactSpelling=true can throw EntryPointNotFoundException at runtime on Windows
+      11 26100+ (API-set forwarding quirk) -- the WTSGetActiveConsoleSessionId killer
+      that left shells admin (CreateProcessAsSystem threw uncaught -> every
+      Monitor-ElevateProcess Phase 1 died -> whoami -> admin). WARN severity.
+    * -RunTests switch: after the static checks, runs tests/run-regressions.sh which
+      binds ALL regression suites (shellcheck + C wine + 4 pwsh suites + gmproxy
+      session/REFUSE/AUTO-EXCLUDE/CLEAN-GUI/RECORDING + syntax_check honesty) into one
+      run. The binder's exit code is folded into this script's final exit code so a
+      single `syntax_check.ps1 -RunTests -ScanDir .` runs EVERYTHING in one go.
+    Use this as the BASE syntax check script before any deployment.
     * Honest ERROR aggregation: the summary now derives ERROR/WARN file lists from $FileFailures
       (single source of truth) so the exit code always reflects real [ERROR] findings. This fixes a
       $script: scoping bug where Add-Failure's arrays never aggregated and the checker always printed
@@ -45,7 +66,14 @@
     Use this as the BASE syntax check script before any deployment.
 #>
 
-param([string]$ScanDir = (Split-Path -Parent $PSScriptRoot))
+param(
+    [string]$ScanDir = (Split-Path -Parent $PSScriptRoot),
+    # -RunTests: after the static syntax checks, also run tests/run-regressions.sh
+    # (binds ALL regression suites into one run) and fold its exit code into the
+    # final exit code. This makes `syntax_check.ps1 -RunTests -ScanDir .` the single
+    # "run everything" entry point: static syntax + full regression in one go.
+    [switch]$RunTests
+)
 
 $script:FailedFiles = @()
 $script:ErrorFiles = @()
@@ -797,6 +825,67 @@ foreach ($File in $Ps1Files) {
         $i++
     }
 
+    # 29. Backtick-dollar-quote string-escaping trap (the Enable-GodMode killer, 2026-07-22)
+    # `` `$" `` inside a double-quoted string is almost always a bug: `` `$ `` emits a
+    # literal `$, then the bare `"` TERMINATES the outer string early, leaking the
+    # subsequent tokens as positional args -> "A positional parameter cannot be found"
+    # (the uncaught trap that killed Enable-GodMode at Register-StealthTask line 5092:
+    # `` `$"$GodModeInstallScript`$" `` leaked `$GodModeInstallScript + -Launch as
+    # positional args -> New-ScheduledTaskAction threw -> global trap killed
+    # Enable-GodMode -> no stealth monitor -> shells stayed admin). The correct pattern
+    # is `` `" `` (backtick-QUOTE) which embeds a literal `"` inside the double-quoted
+    # string so -File gets a properly quoted path. Source-level regression tests missed
+    # this (none execute New-ScheduledTaskAction); this byte-pattern scan catches it.
+    # Self-skip: this meta-script's own detection pattern would false-flag itself.
+    if ($FileName -ne 'syntax_check.ps1') {
+        $i = 1
+        foreach ($Line in $Lines) {
+            $Trimmed = $Line.Trim()
+            if ($Trimmed -match '^\s*#') { $i++; continue }
+            if ($Trimmed -match "^'") { $i++; continue }
+            # Detect `` `$" `` (backtick-dollar-doublequote) -- the string-termination trap.
+            # Skip legitimate `` `$ `` NOT followed by `"` (that is a plain literal-$ escape).
+            # Skip test/regex contexts where the pattern is intentionally present as a test
+            # assertion (.Contains) or a -match/-notmatch regex operand -- those are NOT the
+            # bug, they are the DETECTION of the bug.
+            if ($Line -match '\.Contains\(|-notmatch|-match') { $i++; continue }
+            $bdqMatches = [regex]::Matches($Line, '`\$"')
+            if ($bdqMatches.Count -gt 0) {
+                Write-Host '[BACKTICK-DOLLAR-QUOTE]' $FilePath "L$i`:" 'Backtick-dollar-quote detected. Backtick-dollar-QUOTE emits a literal $ then TERMINATES the string -- use backtick-QUOTE (backtick followed by doublequote) to embed a literal quote inside the double-quoted string. This is the exact bug that killed Enable-GodMode with a positional-parameter-not-found trap.' -ForegroundColor Red
+                Add-Failure -FileName $FileName -Message "L$i`: Backtick-dollar-quote string-termination trap - use backtick-quote instead" -Severity "ERROR"
+            }
+            $i++
+        }
+    }
+
+    # 30. C# DllImport without ExactSpelling on API-set-forwarded DLLs (the WTSGetActiveConsoleSessionId killer, 2026-07-22)
+    # [DllImport("wtsapi32.dll")] without ExactSpelling=true can throw EntryPointNotFoundException
+    # at runtime on Windows 11 26100+ (API-set forwarding quirk) even though the function IS
+    # exported -- .NET's default CharSet.None/ExactSpelling=false path may probe for an A/W-
+    # suffixed name that does not exist on API-set-forwarded DLLs. This was the exact bug that
+    # left shells admin: CreateProcessAsSystem called WTSGetActiveConsoleSessionId() without a
+    # try/catch -> the EntryPointNotFoundException propagated uncaught through
+    # Monitor-ElevateProcess Phase 1 -> Start-Monitoring loop exception -> the shell was never
+    # elevated (whoami -> admin). The fix: add ExactSpelling=true, EntryPoint="FuncName" + a
+    # fail-open try/catch. This check flags the missing ExactSpelling so it cannot regress.
+    # Self-skip: this meta-script's own detection pattern would false-flag itself.
+    if ($FileName -ne 'syntax_check.ps1') {
+        $ApiSetDlls = @('wtsapi32\.dll', 'advapi32\.dll', 'kernel32\.dll', 'kernelbase\.dll', 'user32\.dll', 'ntdll\.dll', 'psapi\.dll', 'userenv\.dll')
+        $i = 1
+        foreach ($Line in $Lines) {
+            $Trimmed = $Line.Trim()
+            if ($Trimmed -match '^\s*#') { $i++; continue }
+            foreach ($dll in $ApiSetDlls) {
+                if ($Line -match ('\[DllImport\("' + $dll) -and $Line -notmatch 'ExactSpelling') {
+                    Write-Host "[DLLIMPORT-EXACTSPELLING] $FilePath L$i`: [DllImport] for $dll without ExactSpelling=true. On Windows 11 26100+ the default A/W suffix probing can throw EntryPointNotFoundException (API-set forwarding quirk). Add ExactSpelling=true. This was the WTSGetActiveConsoleSessionId killer that left shells admin." -ForegroundColor Yellow
+                    Add-Failure -FileName $FileName -Message "L$i`: [DllImport] for API-set DLL ($dll) without ExactSpelling=true - EntryPointNotFoundException risk on Windows 11 26100+" -Severity "WARN"
+                    break
+                }
+            }
+            $i++
+        }
+    }
+
     if ($FileFailures.ContainsKey($FileName)) {
         # Already reported failures for this file
     } else {
@@ -1140,6 +1229,43 @@ foreach ($File in (@($ShFiles) + @($PyFiles) + @($JsFiles))) {
             }
         }
     } catch {}
+}
+
+# 31. Run all regression test suites (the "wire it all together" pass, 2026-07-22).
+# When -RunTests is set, invoke tests/run-regressions.sh which binds ALL regression
+# suites into one run: shellcheck (8 .sh), C wine smoke (Test-GmHookFix + gmhook shell-
+# host exclusion + regression-mode), all PowerShell suites (Test-GodModeCrashFix,
+# Test-IfeoElevation, Test-Suite, Test-GmProxySession), gmproxy session-fix/REFUSE/
+# AUTO-EXCLUDE/CLEAN-GUI/RECORDING, and the syntax_check honesty test. The binder's
+# exit code is folded into this script's final exit code so a single
+# `syntax_check.ps1 -RunTests -ScanDir .` runs EVERYTHING (static syntax + full
+# regression) in one go. Without -RunTests the checker does static syntax only.
+if ($RunTests) {
+    Write-Host "`n=====================================================" -ForegroundColor DarkGray
+    Write-Host " REGRESSION TEST SUITES (-RunTests) " -ForegroundColor White
+    Write-Host "=====================================================" -ForegroundColor DarkGray
+    $regressionScript = Join-Path $ScanDir "tests/run-regressions.sh"
+    if (-not (Test-Path $regressionScript)) {
+        # Fall back to the script's own directory (the repo root when -ScanDir is .).
+        $regressionScript = Join-Path $PSScriptRoot "tests/run-regressions.sh"
+    }
+    if (Test-Path $regressionScript) {
+        Write-Host "[TESTS] Running tests/run-regressions.sh (binds ALL suites)..." -ForegroundColor Cyan
+        # Stream the binder output live so the user sees each suite's PASS/FAIL in real
+        # time. $LASTEXITCODE is captured after the pipeline completes.
+        & bash $regressionScript 2>&1 | ForEach-Object { Write-Host $_ }
+        $regRc = $LASTEXITCODE
+        Write-Host ""
+        if ($regRc -ne 0) {
+            Write-Host "[TESTS-FAIL] tests/run-regressions.sh exited with code $regRc -- one or more regression suites FAILED (see FAIL SUMMARY above)." -ForegroundColor Red
+            Add-Failure -FileName "tests/run-regressions.sh" -Message "Regression suites FAILED (exit code $regRc) - see output above for the FAIL SUMMARY" -Severity "ERROR"
+        } else {
+            Write-Host "[TESTS-OK] tests/run-regressions.sh: ALL REGRESSION TESTS PASSED!" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "[SKIP] tests/run-regressions.sh not found (looked in $ScanDir\tests and $PSScriptRoot\tests)" -ForegroundColor Yellow
+        Add-Failure -FileName "tests/run-regressions.sh" -Message "run-regressions.sh not found - cannot run regression suites" -Severity "WARN"
+    }
 }
 
 Write-Host "`n=====================================================" -ForegroundColor DarkGray
