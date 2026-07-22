@@ -352,6 +352,61 @@ static BOOL IsShellLauncherProcess(const wchar_t* baseName) {
     return FALSE;
 }
 
+/* Interactive shells ONLY -- the strict subset of IsShellLauncherProcess that
+   the user actually types into: cmd / powershell / pwsh / powershell_ise.
+   Excludes the launcher hosts (explorer / wt / conhost / OpenConsole /
+   WindowsTerminal): those host shells and render the desktop/taskbar, and an
+   in-place SYSTEM token swap on them breaks the desktop (the monitor's
+   CriticalProcs guard skips them for the same reason). This predicate gates
+   the SHELLPID birth-signal below -- only a real interactive shell is worth
+   signaling the monitor to in-place elevate. */
+static BOOL IsInteractiveShell(const wchar_t* baseName) {
+    if (!baseName) return FALSE;
+    const wchar_t* shells[] = {
+        L"cmd.exe", L"powershell.exe", L"pwsh.exe", L"powershell_ise.exe", NULL
+    };
+    for (int i = 0; shells[i]; i++) {
+        if (_wcsicmp(baseName, shells[i]) == 0) return TRUE;
+    }
+    return FALSE;
+}
+
+/* Instant shell elevation -- the birth-signal. When a hooked host (typically
+   explorer.exe, which IS injected with gmhook) launches an interactive shell,
+   the shell is born as the host's normal user token (the real CreateProcessW
+   above) -- visible, correct session/cwd/history. This hands the new shell's
+   PID to the God Mode SYSTEM monitor over the SAME named pipe gmproxy uses
+   (\\.\pipe\GodMode-GmProxyFeedback) with a SHELLPID=<n> payload so the
+   monitor can in-place swap its token to SYSTEM (ReplaceProcessTokenForPid,
+   which needs SeTcbPrivilege -- only the SYSTEM monitor holds it) within ~ms,
+   instead of waiting for the 3s/5s/15s scan to catch it.
+   gmhook does NOT elevate the shell itself: it holds no SeTcb here, and
+   rerouting the shell's own CreateProcessW through the stolen-token
+   CreateProcessWithTokenW path crashes it with 0xC0000005 (see
+   IsShellLauncherProcess comment). It only NOTIFIES the monitor, which does
+   the safe in-place swap. Non-blocking + fail-open: CreateFileW(OPEN_EXISTING)
+   returns immediately (ERROR_FILE_NOT_FOUND) if no monitor is listening yet,
+   and any write error is swallowed -- the 3s/15s periodic scan remains the
+   fallback. The real CreateProcessW already succeeded before this is called,
+   so a signal failure never affects the launch. Mirrors gmproxy.c's
+   SignalGmProxyFeedback (same pipe, same connect/write pattern, distinct
+   SHELLPID= prefix so the monitor listener routes shell signals to the
+   shell-elevation path, not the normal-app feedback path). */
+static void SignalShellBirth(DWORD pid) {
+    if (pid == 0) return;
+    HANDLE hPipe = CreateFileW(L"\\\\.\\pipe\\GodMode-GmProxyFeedback",
+                               GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+    if (hPipe == INVALID_HANDLE_VALUE) return; /* monitor not running / not listening yet */
+    char buf[40];
+    int n = snprintf(buf, sizeof(buf), "SHELLPID=%lu\n", (unsigned long)pid);
+    if (n > 0) {
+        if (n > (int)sizeof(buf) - 1) n = (int)sizeof(buf) - 1;
+        DWORD written = 0;
+        WriteFile(hPipe, buf, (DWORD)n, &written, NULL);
+    }
+    CloseHandle(hPipe);
+}
+
 /* Attempt to launch the child directly as SYSTEM via CreateProcessWithTokenW.
    Returns TRUE on success, FALSE on failure (caller falls back to the real
    CreateProcessW). Isolated into its own function so an MSVC __try/__except
@@ -678,6 +733,22 @@ static BOOL WINAPI HookCreateProcessW(
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
                 lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        /* Instant shell elevation birth-signal: when a hooked host (typically
+           explorer.exe) launches an INTERACTIVE shell (cmd/powershell/pwsh/ISE),
+           signal its PID to the SYSTEM monitor (SHELLPID=<n> over the
+           GodMode-GmProxyFeedback pipe) so the monitor in-place swaps its token
+           to SYSTEM within ~ms, instead of waiting for the 3s/15s scan. Only the
+           4 interactive shells -- NOT explorer/wt/conhost (swapping those to
+           SYSTEM breaks the desktop/taskbar) and NOT critical OS. The real
+           CreateProcessW above already succeeded (the shell is born, visible,
+           correct session/cwd/history); SignalShellBirth is non-blocking +
+           fail-open so a missing monitor / pipe error never affects the launch
+           (the periodic scan remains the fallback). gmhook does NOT elevate the
+           shell itself (no SeTcb; rerouting its CreateProcessW crashes it). */
+        if (result && IsInteractiveShell(baseName) && lpProcessInformation &&
+            lpProcessInformation->dwProcessId != 0) {
+            SignalShellBirth(lpProcessInformation->dwProcessId);
         }
         InterlockedExchange(&inHook, 0);
         return result;

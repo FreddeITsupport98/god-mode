@@ -1203,4 +1203,63 @@ if ($epd38Match.Success) {
     Add-Assertion "ShellElev: option-11 section K reports the stored CompileReason" ($epd38Body.Contains('CompileReason') -and $epd38Body.Contains('$script:TokenOpsCompileReason')) "option-11 section K does not surface the compile failure reason"
 }
 
+# --- 39. INSTANT shell elevation via gmhook birth-signal + core/thread
+#     auto-detection improvements (2026-07-22) ---
+# The user asked "why doesn't the DLL hook shells to auto-elevate instead of
+# waiting?" Synchronous SYSTEM-birth of shells is unsafe (bootstrap paradox --
+# God Mode's own persistence launches powershell.exe; 0xC0000005 crash when the
+# shell's CreateProcessW is rerouted through the stolen-token path; no SeTcb in
+# explorer for the safe in-place swap). The fix: gmhook (injected into explorer
+# + user GUI hosts) does NOT elevate the shell -- it NOTIFIES the SYSTEM monitor
+# the instant a shell CHILD is born (SHELLPID=<n> over the existing
+# GodMode-GmProxyFeedback pipe), and the monitor does the safe in-place SYSTEM
+# token swap within the loop tick (~<=500ms) instead of waiting for the 3s/15s
+# scan. Plus core/thread auto-detection: GODMODE_JOBS override + [1,64] clamp +
+# candidate-aware chunking. Additive; sections 1-38 intact.
+
+# Part A -- gmhook.c birth-signal.
+Add-Assertion "InstantShell: gmhook IsInteractiveShell helper defined" ($gmhook -match 'static BOOL IsInteractiveShell\(const wchar_t\* baseName\)') "IsInteractiveShell helper missing -- gmhook cannot gate the shell birth-signal"
+$iisMatch = [regex]::Match($gmhook, '(?s)static BOOL IsInteractiveShell\(const wchar_t\* baseName\) \{(.*?)\nstatic void SignalShellBirth')
+$iisBody = if ($iisMatch.Success) { $iisMatch.Groups[1].Value } else { "" }
+Add-Assertion "InstantShell: IsInteractiveShell body extractable" ($iisMatch.Success) "could not isolate IsInteractiveShell body"
+if ($iisMatch.Success) {
+    Add-Assertion "InstantShell: IsInteractiveShell includes cmd/powershell/pwsh/ise (the 4 interactive shells)" ($iisBody.Contains('L"cmd.exe"') -and $iisBody.Contains('L"powershell.exe"') -and $iisBody.Contains('L"pwsh.exe"') -and $iisBody.Contains('L"powershell_ise.exe"')) "IsInteractiveShell does not list all 4 interactive shells -- a shell birth would not be signaled"
+    Add-Assertion "InstantShell: IsInteractiveShell EXCLUDES launcher hosts (no explorer/wt/conhost -- swapping those to SYSTEM breaks the desktop)" (-not ($iisBody -match 'L"explorer\.exe"|L"wt\.exe"|L"conhost\.exe"|L"OpenConsole\.exe"|L"WindowsTerminal\.exe"')) "IsInteractiveShell includes a launcher host (explorer/wt/conhost) -- an in-place SYSTEM swap on it would break the desktop/taskbar"
+}
+Add-Assertion "InstantShell: gmhook SignalShellBirth helper defined" ($gmhook -match 'static void SignalShellBirth\(DWORD pid\)') "SignalShellBirth helper missing -- gmhook cannot hand the shell PID to the monitor"
+Add-Assertion "InstantShell: SignalShellBirth writes a SHELLPID= payload (distinct from gmproxy's PID=)" ($gmhook -match 'SHELLPID=%lu') "SignalShellBirth does not write a SHELLPID= payload -- the monitor listener cannot route shell signals to the shell-elevation path"
+Add-Assertion "InstantShell: SignalShellBirth uses the SAME GodMode-GmProxyFeedback pipe (one listener, two payloads)" ($gmhook -match 'SignalShellBirth[\s\S]{0,300}?GodMode-GmProxyFeedback') "SignalShellBirth does not use the GodMode-GmProxyFeedback pipe -- a second listener would be needed"
+Add-Assertion "InstantShell: SignalShellBirth is non-blocking + fail-open (CreateFileW + OPEN_EXISTING + INVALID_HANDLE_VALUE bail)" ($gmhook -match 'SignalShellBirth[\s\S]{0,300}?CreateFileW' -and $gmhook -match 'SignalShellBirth[\s\S]{0,400}?OPEN_EXISTING' -and $gmhook -match 'SignalShellBirth[\s\S]{0,500}?INVALID_HANDLE_VALUE') "SignalShellBirth is not non-blocking/fail-open -- a missing monitor could stall the CreateProcessW hook or fault the host"
+Add-Assertion "InstantShell: shell pass-through calls SignalShellBirth AFTER the real CreateProcessW succeeds (gated on result + IsInteractiveShell + dwProcessId)" ($gmhook -match 'if \(result && IsInteractiveShell\(baseName\) && lpProcessInformation &&' -and $gmhook -match 'IsInteractiveShell\(baseName\) && lpProcessInformation &&[\s\S]{0,120}?SignalShellBirth\(lpProcessInformation->dwProcessId\)') "the shell pass-through branch does not signal the shell PID after the real CreateProcessW -- the instant-elevation fast path is not wired"
+
+# Part B -- God-Mode-Windows.ps1 listener routing + shell-elevation handler.
+Add-Assertion "InstantShell: GmHookShellQueue declared (separate from GmProxyFeedbackQueue)" ($gm -match 'GmHookShellQueue = \[System\.Collections\.ArrayList\]::Synchronized') "GmHookShellQueue missing -- SHELLPID signals have no queue"
+Add-Assertion "InstantShell: listener routes ^SHELLPID= to the shell queue" ($gm -match '\^SHELLPID=\(\\d\+\)' -and $gm -match 'SHELLPID[\s\S]{0,200}?shellQueue\.Add') "the listener does not route SHELLPID= to a shell queue -- shell signals would be lost"
+Add-Assertion "InstantShell: listener still routes ^PID= to the normal queue (gmproxy path unchanged)" ($gm -match '\^PID=\(\\d\+\)[\s\S]{0,300}?normalQueue\.Add') "the listener no longer routes PID= to the normal queue -- the gmproxy graceful-fallback path regressed"
+Add-Assertion "InstantShell: listener passes BOTH queues (normalQueue + shellQueue params)" ($gm -match 'param\(\$normalQueue, \$shellQueue\)') "the listener does not take two queue params -- one payload type would be dropped"
+Add-Assertion "InstantShell: Invoke-GmHookShellFeedbackElevation defined" ($gm -match 'function Invoke-GmHookShellFeedbackElevation') "Invoke-GmHookShellFeedbackElevation missing -- the SHELLPID drain has no handler"
+$ishMatch = [regex]::Match($gm, '(?s)function Invoke-GmHookShellFeedbackElevation \{(.*?)\nfunction Test-GmPlumbingShell \{')
+$ishBody = if ($ishMatch.Success) { $ishMatch.Groups[1].Value } else { "" }
+Add-Assertion "InstantShell: Invoke-GmHookShellFeedbackElevation body extractable" ($ishMatch.Success) "could not isolate Invoke-GmHookShellFeedbackElevation body"
+if ($ishMatch.Success) {
+    Add-Assertion "InstantShell: handler requires SYSTEM context (S-1-5-18)" ($ishBody.Contains('S-1-5-18')) "handler does not check SYSTEM context -- a non-SYSTEM monitor could attempt the swap"
+    Add-Assertion "InstantShell: handler defense-checks the PID is an interactive shell (not a launcher host)" ($ishBody.Contains('$interactiveShells') -and $ishBody -match 'interactiveShells -notcontains \$proc\.Name') "handler does not defense-check the PID is an interactive shell -- a stray signal could swap explorer/conhost to SYSTEM (breaks the desktop)"
+    Add-Assertion "InstantShell: handler skips God Mode plumbing (Test-GmPlumbingShell -- bootstrap guard)" ($ishBody.Contains('Test-GmPlumbingShell')) "handler does not skip God Mode plumbing shells -- the monitor's own -ToggleOn/-Launch powershell could be mid-flight swapped (bootstrap break)"
+    Add-Assertion "InstantShell: handler skips an already-SYSTEM shell (Test-PidIsSystem)" ($ishBody.Contains('Test-PidIsSystem')) "handler does not skip an already-SYSTEM shell -- a redundant SYSTEM->SYSTEM swap could race"
+    Add-Assertion "InstantShell: handler honors the Detector B auto-exclude store (Test-GmAutoExcluded)" ($ishBody.Contains('Test-GmAutoExcluded')) "handler does not consult the auto-exclude store -- an auto-excluded base could be re-elevated"
+    Add-Assertion "InstantShell: handler enables SeTcbPrivilege (Phase 0 NtSetInformationProcess requires it)" ($ishBody -match 'Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege"') "handler does not enable SeTcbPrivilege -- ReplaceProcessTokenForPid would fail (STATUS_PRIVILEGE_NOT_HELD) and the shell would stay admin"
+    Add-Assertion "InstantShell: handler does the in-place swap (ReplaceProcessTokenForPid)" ($ishBody -match '\[TokenOps\]::ReplaceProcessTokenForPid') "handler does not call ReplaceProcessTokenForPid -- no in-place SYSTEM swap"
+    Add-Assertion "InstantShell: handler is fail-stop no-kill on Phase 0 failure (LEAVES AS ADMIN, no Stop-Process)" ($ishBody.Contains('leaving as admin') -and -not ($ishBody -match 'Stop-Process')) "handler kills the shell on Phase 0 failure (or has no fail-stop) -- the 'it kills my shell' symptom would recur"
+}
+Add-Assertion "InstantShell: Start-Monitoring drains GmHookShellQueue into Invoke-GmHookShellFeedbackElevation" ($gm -match 'GmHookShellQueue[\s\S]{0,200}?Invoke-GmHookShellFeedbackElevation') "Start-Monitoring does not drain GmHookShellQueue -- SHELLPID signals would queue undrained"
+Add-Assertion "InstantShell: Start-Monitoring retries shells on transient failure (removes the shPid dedup key)" ($gm -match 'Invoke-GmHookShellFeedbackElevation -ProcessId \$shPid[\s\S]{0,400}?lastElevatedPid\.Remove\(\$shPid\)') "Start-Monitoring does not retry shells on transient failure -- a transient no-SYSTEM-token would strand the shell as admin"
+Add-Assertion "InstantShell: Stop-GmProxyFeedbackListener clears GmHookShellQueue (teardown parity)" ($gm -match 'function Stop-GmProxyFeedbackListener [\s\S]{0,700}?GmHookShellQueue\.Clear') "Stop-GmProxyFeedbackListener does not clear GmHookShellQueue -- a stale SHELLPID could elevate a recycled PID after re-enable"
+
+# Part C -- core/thread auto-detection improvements.
+Add-Assertion "ThreadDetect: Get-OptimalThreadCount honors the GODMODE_JOBS env override" ($gm -match 'function Get-OptimalThreadCount[\s\S]{0,1000}?GODMODE_JOBS') "Get-OptimalThreadCount does not honor GODMODE_JOBS -- the user cannot tune a low-core VM or force serial (inconsistent with syntax_check.ps1)"
+Add-Assertion "ThreadDetect: Get-OptimalThreadCount clamps to [1,64] (Min 64 + Max 1)" ($gm -match '\[math\]::Min\(64, \[math\]::Max\(1,') "Get-OptimalThreadCount does not clamp to [1,64] -- hundreds of ThreadJobs could spawn on a big server (per-job overhead)"
+Add-Assertion "ThreadDetect: Get-NonSystemProcessesParallel uses candidate-aware chunking (Max(8, ceil(candidates/(threads*2))))" ($gm -match '\$ChunkSize = \[math\]::Max\(8, \[math\]::Ceiling\(\$candidates\.Count / \(\$MaxThreads \* 2\)\)\)') "Get-NonSystemProcessesParallel does not use candidate-aware chunking -- load balancing does not scale with core count"
+Add-Assertion "ThreadDetect: Get-NonSystemProcessesParallel ChunkSize param default is 0 (compute in body)" ($gm -match 'function Get-NonSystemProcessesParallel[\s\S]{0,900}?\[int\]\$ChunkSize = 0') "Get-NonSystemProcessesParallel ChunkSize default is not 0 -- the old hardcoded formula may still bind"
+Add-Assertion "ThreadDetect: old hardcoded-50 chunk formula GONE (no Ceiling(50 /)" (-not ($gm -match 'Ceiling\(50 /')) "the old hardcoded-50 chunk formula remains -- candidate-aware chunking did not replace it"
+
 Write-Summary

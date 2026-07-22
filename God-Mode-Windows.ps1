@@ -6753,15 +6753,26 @@ function Stop-NonSystemInstances {
 }
 
 function Get-OptimalThreadCount {
+    # Thread count for the parallel WMI/elevation scans (Invoke-ParallelElevation /
+    # Get-NonSystemProcessesParallel). The workload is I/O-bound (Get-CimInstance
+    # round-trips + CreateProcessAsSystem), so LOGICAL processors are the right
+    # unit -- more threads than physical cores overlaps WMI latency. Resolution
+    # order: $env:GODMODE_JOBS override (consistency with syntax_check.ps1; lets
+    # the user tune a low-core VM or force serial GODMODE_JOBS=1) ->
+    # [Environment]::ProcessorCount -> $env:NUMBER_OF_PROCESSORS -> 4. Clamp to
+    # [1,64]: Start-ThreadJob has per-job overhead, so spawning hundreds on a big
+    # server is wasteful for this workload (and caps runaway concurrency).
     try {
-        $count = [System.Environment]::ProcessorCount
-        if ($count -gt 0) { return $count }
+        $j = $env:GODMODE_JOBS
+        if ($j) { $ji = [int]$j; if ($ji -gt 0) { return [math]::Min(64, [math]::Max(1, $ji)) } }
     } catch {}
-    try {
-        $count = [int]$env:NUMBER_OF_PROCESSORS
-        if ($count -gt 0) { return $count }
-    } catch {}
-    return 4
+    $count = 0
+    try { $count = [System.Environment]::ProcessorCount } catch {}
+    if ($count -le 0) {
+        try { $count = [int]$env:NUMBER_OF_PROCESSORS } catch {}
+    }
+    if ($count -le 0) { $count = 4 }
+    return [math]::Min(64, [math]::Max(1, $count))
 }
 
 function Invoke-ParallelElevation {
@@ -6922,7 +6933,12 @@ function Get-NonSystemProcessesParallel {
         [string[]]$CriticalProcs,
         [string[]]$systemAccounts = @("SYSTEM", "NETWORK SERVICE", "LOCAL SERVICE", "DWM-1", "UMFD-1", "UMFD-0"),
         [int]$MaxThreads = (Get-OptimalThreadCount),
-        [int]$ChunkSize = ([math]::Max(10, [math]::Ceiling(50 / (Get-OptimalThreadCount))))
+        # $ChunkSize default 0 = compute candidate-aware in the body (below). The
+        # old default ([math]::Max(10, ceil(50/threadCount))) was a hardcoded 50
+        # that under-utilized many-core boxes and over-chunked few-core ones; it
+        # also called Get-OptimalThreadCount a second time on every bind. A caller
+        # may still pass an explicit -ChunkSize to override (backward compatible).
+        [int]$ChunkSize = 0
     )
     # Fast filter: exclude by PID, path, and critical name (no owner check)
     $candidates = $allProcs | Where-Object {
@@ -6932,6 +6948,15 @@ function Get-NonSystemProcessesParallel {
         ($CriticalProcs -notcontains [System.IO.Path]::GetFileName($_.ExecutablePath))
     }
     if ($candidates.Count -eq 0) { return @() }
+    # Candidate-aware chunk size: aim for ~2x-threadCount chunks so the parallel
+    # WMI owner queries load-balance across cores (a few more chunks than threads
+    # keeps all threads busy even if one chunk finishes early). Floor of 8 so a
+    # tiny candidate set does not over-fragment into 1-PID ThreadJobs (per-job
+    # startup overhead would dominate). Only computed when the caller did not
+    # pass an explicit -ChunkSize (<=0 = unset).
+    if ($ChunkSize -le 0) {
+        $ChunkSize = [math]::Max(8, [math]::Ceiling($candidates.Count / ($MaxThreads * 2)))
+    }
 
     # Check parallel capability
     $canParallel = $false
@@ -7054,6 +7079,14 @@ $script:ProcessCreationWatcherState = [hashtable]::Synchronized(@{ Stopped = $fa
 # periodic scan kill+relaunching a duplicate. Fed by Start-GmProxyFeedbackListener
 # (ThreadJob pipe server); drained by the Start-Monitoring loop.
 $script:GmProxyFeedbackQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
+# gmhook interactive-shell birth-signals (SHELLPID=<n> over the same
+# GodMode-GmProxyFeedback pipe) land here for INSTANT in-place SYSTEM
+# elevation -- the monitor drains this queue every loop tick (right after the
+# GmProxyFeedbackQueue drain) into Invoke-GmHookShellFeedbackElevation. Kept
+# SEPARATE from $GmProxyFeedbackQueue so the gmproxy normal-app feedback path
+# (PID=) and its tests stay byte-for-byte unchanged; one pipe listener routes
+# both payloads (see Start-GmProxyFeedbackListener).
+$script:GmHookShellQueue = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
 $script:GmProxyFeedbackPipeJob = $null
 
 function Register-ProcessCreationWatcher {
@@ -7197,15 +7230,16 @@ function Start-GmProxyFeedbackListener {
     if ($script:GmProxyFeedbackPipeJob -and $script:GmProxyFeedbackPipeJob.State -eq 'Running') { return $true }
     try {
         $job = Start-ThreadJob -ScriptBlock {
-            param($queue)
+            param($normalQueue, $shellQueue)
             $pipeName = 'GodMode-GmProxyFeedback'
             while ($true) {
                 $pipe = $null
                 try {
                     # Grant SYSTEM + Administrators full control and Everyone read/write
-                    # so an admin-user-launched gmproxy.exe (IFEO) can connect to this
-                    # SYSTEM-created pipe. Fall back to the default ACL if the
-                    # access-control types are unavailable on this runtime.
+                    # so an admin-user-launched gmproxy.exe (IFEO) AND an admin-user-
+                    # injected gmhook.dll host (explorer) can connect to this SYSTEM-
+                    # created pipe. Fall back to the default ACL if the access-control
+                    # types are unavailable on this runtime.
                     try {
                         $pipeSec = New-Object System.IO.Pipes.PipeSecurity
                         $pipeSec.AddAccessRule((New-Object System.IO.Pipes.PipeAccessRule('Everyone', [System.IO.Pipes.PipeAccessRights]::ReadWrite, [System.Security.AccessControl.AccessControlType]::Allow)))
@@ -7219,10 +7253,23 @@ function Start-GmProxyFeedbackListener {
                     $sr = New-Object System.IO.StreamReader($pipe)
                     $line = $sr.ReadLine()
                     if ($line) {
+                        # gmproxy graceful-fallback normal-app handoff (PID=<n>) ->
+                        # normal queue -> Invoke-GmProxyFeedbackElevation (shells
+                        # are skipped there via $SkipNames, as before).
                         $m = [regex]::Match($line, '^PID=(\d+)')
                         if ($m.Success) {
                             $pidVal = [int]$m.Groups[1].Value
-                            if ($pidVal -gt 0) { [void]$queue.Add($pidVal) }
+                            if ($pidVal -gt 0) { [void]$normalQueue.Add($pidVal) }
+                        }
+                        # gmhook interactive-shell birth-signal (SHELLPID=<n>) ->
+                        # shell queue -> Invoke-GmHookShellFeedbackElevation (the
+                        # INSTANT in-place SYSTEM swap, no kill). ^SHELLPID= and
+                        # ^PID= are mutually exclusive prefixes so the two ifs are
+                        # independent; a line matches at most one.
+                        $ms = [regex]::Match($line, '^SHELLPID=(\d+)')
+                        if ($ms.Success) {
+                            $pidVal = [int]$ms.Groups[1].Value
+                            if ($pidVal -gt 0) { [void]$shellQueue.Add($pidVal) }
                         }
                     }
                 } catch {
@@ -7231,7 +7278,7 @@ function Start-GmProxyFeedbackListener {
                     if ($pipe) { try { $pipe.Dispose() } catch {} }
                 }
             }
-        } -ArgumentList $script:GmProxyFeedbackQueue
+        } -ArgumentList $script:GmProxyFeedbackQueue, $script:GmHookShellQueue
         Set-Variable -Name GmProxyFeedbackPipeJob -Value $job -Scope Script
         Write-Log -Message "GmProxy feedback pipe listener started (pipe: GodMode-GmProxyFeedback)." -Type "INFO" -Color Gray
         return $true
@@ -7247,6 +7294,11 @@ function Stop-GmProxyFeedbackListener {
         try { $job | Stop-Job -ErrorAction SilentlyContinue; $job | Remove-Job -Force -ErrorAction SilentlyContinue } catch {}
         Set-Variable -Name GmProxyFeedbackPipeJob -Value $null -Scope Script
     }
+    # Clear the gmhook shell-birth queue for teardown parity (the normal-app
+    # GmProxyFeedbackQueue is cleared by the monitor-loop drain / Disable-GodMode
+    # path; mirror that here so a stale SHELLPID never elevates a recycled PID
+    # after a disable/re-enable cycle).
+    if ($script:GmHookShellQueue) { $script:GmHookShellQueue.Clear() }
 }
 
 # --- Instant IFEO new-app watcher: FileSystemWatcher on the install dirs fires
@@ -7606,6 +7658,93 @@ function Invoke-GmProxyFeedbackElevation {
         return $true
     } else {
         Write-DebugLog -FunctionName "Invoke-GmProxyFeedbackElevation" -Action "INFO" -Message "In-place replacement failed for PID=$ProcessId name=$($proc.Name); periodic scan will handle it"
+        return $false
+    }
+}
+
+function Invoke-GmHookShellFeedbackElevation {
+    # INSTANT interactive-shell elevation -- the gmhook birth-signal path. gmhook
+    # (injected into explorer.exe + user GUI hosts) sees a shell CHILD born via
+    # the real CreateProcessW (cmd/powershell/pwsh/ISE launched from the Start
+    # menu / Win+R / a shortcut) and signals its PID over the GodMode-
+    # GmProxyFeedback pipe as SHELLPID=<n> (see gmhook.c SignalShellBirth).
+    # Start-GmProxyFeedbackListener routes SHELLPID= to $GmHookShellQueue; the
+    # Start-Monitoring loop drains it here. This does the SAFE in-place SYSTEM
+    # token swap (ReplaceProcessTokenForPid, needs SeTcb -- only the SYSTEM
+    # monitor holds it) that gmhook CANNOT do itself (no SeTcb in explorer; and
+    # rerouting the shell's own CreateProcessW through the stolen-token path
+    # crashes it with 0xC0000005). The shell was already born visible as admin
+    # (correct session/cwd/history); this swaps its token in place ~ms after
+    # launch -- no kill, no invisible Session-0 rebirth, no wait for the 3s/15s
+    # scan. Mirrors Monitor-ElevateProcess's interactive-shell branch safety so
+    # the bootstrap + already-SYSTEM + auto-exclude guards all hold. Fail-stop
+    # on Phase 0 failure: LEAVE AS ADMIN (no kill) -- the WMI/3s/15s scans retry.
+    param([int]$ProcessId)
+    if ($ProcessId -le 0) { return $false }
+    $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
+    if (-not $isSystem) { return $false }
+    try {
+        $proc = Get-Process -Id $ProcessId -ErrorAction Stop
+    } catch { return $false }
+    # Defense-in-depth: gmhook only signals the 4 interactive shells, but a
+    # stray/malformed signal must never in-place-swap a non-shell (a launcher
+    # host like explorer/wt/conhost or a critical OS process -- swapping those
+    # to SYSTEM breaks the desktop/taskbar). $proc.Name is bare (no .exe), so
+    # compare against the same bare-name list Monitor-ElevateProcess uses.
+    $interactiveShells = @("cmd","powershell","pwsh","powershell_ise")
+    if ($interactiveShells -notcontains $proc.Name) {
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is not an interactive shell; ignoring SHELLPID signal"
+        return $false
+    }
+    # Bootstrap guard (the reason gmhook does not synchronous-birth shells): if
+    # this shell is God Mode's OWN plumbing (scheduled-task / Run-key / temp-copy
+    # launch carrying -ToggleOn/-Launch/GodMode.ps1), leave it -- a mid-flight
+    # SYSTEM token swap would disturb the monitor/watchdog/guardian/feedback-
+    # listener work. Test-GmPlumbingShell reads the command line (only the
+    # monitor side can; gmhook in explorer cannot), so this guard lives here.
+    if (Test-GmPlumbingShell -ProcessId $ProcessId) {
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is God Mode plumbing shell; leaving token untouched (no mid-flight swap)"
+        return $true
+    }
+    # Already-SYSTEM shell (e.g. a [19] -LaunchShellAsSystem on-demand shell, or
+    # a previous birth-signal already swapped it): skip the redundant swap. Fail-
+    # open (Test-PidIsSystem returns $false on any query failure -> proceed).
+    if (Test-PidIsSystem -ProcessId $ProcessId) {
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is already SYSTEM; leaving token untouched (no redundant swap)"
+        return $true
+    }
+    # Detector B store consult (defense-in-depth): shells are not normally in
+    # the auto-exclude store, but if one somehow is, honor it (never re-elevate
+    # an auto-excluded base). Fail-open (missing store -> elevate).
+    if (Test-GmAutoExcluded "$($proc.Name).exe") {
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "SKIP" -Message "PID=$ProcessId name=$($proc.Name) is auto-excluded (Detector B); not elevating"
+        return $false
+    }
+    if (-not (Assert-TokenOpsAvailable -Caller 'Invoke-GmHookShellFeedbackElevation')) { return $false }
+    Enable-ElevationPrivileges
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
+    # SeTcbPrivilege is required by NtSetInformationProcess(ProcessAccessToken)
+    # to replace the shell's primary token in place. The C# method enables it
+    # internally too (belt-and-suspenders), but enable it on the runspace token
+    # before the P/Invoke -- mirrors Monitor-ElevateProcess Phase 0.
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege" | Out-Null
+    $systemPid = Find-SystemProcessCandidate
+    if ($systemPid -eq 0) {
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "INFO" -Message "No SYSTEM token source for shell PID=$ProcessId; WMI/3s/15s scan will retry"
+        return $false
+    }
+    $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
+    if ($result) {
+        Write-Log -Message "Monitor elevated: $($proc.Name) PID=$ProcessId (instant gmhook birth-signal, in-place token replacement)" -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place success for shell PID=$ProcessId name=$($proc.Name)"
+        return $true
+    } else {
+        # Fail-stop: LEAVE AS ADMIN (no kill). Phase 1/2 (kill+relaunch) for
+        # shells would birth an invisible Session-0 shell + kill this visible one
+        # -- the 'it kills my shell' symptom. The WMI watcher + 3s/15s scans
+        # retry Phase 0 on the next tick (the shell is still alive to retry).
+        Write-Log -Message "Monitor: instant in-place elevation failed for $($proc.Name) PID=$ProcessId; leaving as admin (not killing -- WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name); leaving as admin (no kill)"
         return $false
     }
 }
@@ -8003,6 +8142,34 @@ function Start-Monitoring {
                     if ($fbPid -gt 0 -and -not $lastElevatedPid.ContainsKey($fbPid)) {
                         $lastElevatedPid[$fbPid] = Get-Date
                         Invoke-GmProxyFeedbackElevation -ProcessId $fbPid
+                    }
+                }
+            }
+            # --- INSTANT interactive-shell elevation: gmhook (injected into explorer +
+            #     user GUI hosts) signals a shell CHILD's PID the moment it is born
+            #     (SHELLPID=<n> over the GodMode-GmProxyFeedback pipe; the listener
+            #     routes it to $GmHookShellQueue). Drain it here -> in-place SYSTEM
+            #     token swap (Invoke-GmHookShellFeedbackElevation) within the loop
+            #     tick (~<=500ms), instead of waiting for the WMI/3s/15s scan. This
+            #     is the FAST path for the primary user case (Start menu / Win+R /
+            #     shortcut -> explorer launches the shell); the WMI watcher + 3s/15s
+            #     scans remain the guaranteed fallback if gmhook is not injected into
+            #     the launching host. Shell-retry-on-failure mirrors the WMI drain:
+            #     if the in-place swap fails (transient -- no SYSTEM token source),
+            #     clear the dedup so the next tick retries (the shell is still alive). ---
+            if ($script:GmHookShellQueue -and $script:GmHookShellQueue.Count -gt 0) {
+                while ($script:GmHookShellQueue.Count -gt 0) {
+                    $shPid = [int]$script:GmHookShellQueue[0]
+                    $script:GmHookShellQueue.RemoveAt(0)
+                    if ($shPid -gt 0 -and -not $lastElevatedPid.ContainsKey($shPid)) {
+                        $lastElevatedPid[$shPid] = Get-Date
+                        $shResult = Invoke-GmHookShellFeedbackElevation -ProcessId $shPid
+                        # Transient failure (no SYSTEM token source / TokenOps not ready):
+                        # clear the dedup so the next WMI/3s/15s tick retries. The shell
+                        # is still alive (Invoke-GmHookShellFeedbackElevation never kills).
+                        if (-not $shResult) {
+                            $lastElevatedPid.Remove($shPid) | Out-Null
+                        }
                     }
                 }
             }

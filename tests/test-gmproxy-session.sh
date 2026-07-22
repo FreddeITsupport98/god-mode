@@ -253,6 +253,18 @@ if [ -f "$GMHOOK_SRC" ]; then
     grep -qF 'L"powershell_ise.exe"' "$GMHOOK_SRC" && record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 1 || record "src: gmhook IsShellLauncherProcess excludes powershell_ise.exe (ISE hardening)" 0 "not found -- ISE would be IAT-hooked (0xC0000005 crash risk)"
     grep -qF 'L"explorer.exe"' "$GMHOOK_SRC" && record "src: gmhook IsShellLauncherProcess excludes explorer.exe (STARTUPINFOEX downgrade crash/restart loop)" 1 || record "src: gmhook IsShellLauncherProcess excludes explorer.exe (STARTUPINFOEX downgrade crash/restart loop)" 0 "not found -- explorer would be IAT-hooked -> STARTUPINFOEX->STARTUPINFOW downgrade drops the extended attribute list -> explorer crash/restart loop (blank User column)"
     grep -qF 'Microsoft\\WindowsApps' "$GMHOOK_SRC" && record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 1 || record "src: gmhook alias check uses the WindowsApps reparse path (Microsoft\\WindowsApps)" 0 "not found -- the alias-stub check does not look at the WindowsApps reparse point"
+    # gmhook instant shell birth-signal (2026-07-22): gmhook does NOT elevate a
+    # shell child itself (no SeTcb; rerouting its CreateProcessW crashes it with
+    # 0xC0000005). Instead it signals the new shell PID to the SYSTEM monitor
+    # (SHELLPID=<n> over the GodMode-GmProxyFeedback pipe) the moment the real
+    # CreateProcessW succeeds, so the monitor in-place swaps it to SYSTEM within
+    # the loop tick (~<=500ms) instead of waiting for the 3s/15s scan. Only the 4
+    # interactive shells (cmd/powershell/pwsh/ise) -- NOT explorer/wt/conhost
+    # (swapping those to SYSTEM breaks the desktop). Fail-open + non-blocking.
+    grep -qF 'IsInteractiveShell' "$GMHOOK_SRC" && record "src: gmhook IsInteractiveShell helper present (gates the shell birth-signal to cmd/powershell/pwsh/ise only)" 1 || record "src: gmhook IsInteractiveShell helper present" 0 "not found -- gmhook cannot gate the shell birth-signal"
+    grep -qF 'SignalShellBirth' "$GMHOOK_SRC" && record "src: gmhook SignalShellBirth helper present (notifies the monitor of a shell birth)" 1 || record "src: gmhook SignalShellBirth helper present" 0 "not found -- gmhook cannot hand the shell PID to the monitor"
+    grep -qF 'SHELLPID=%lu' "$GMHOOK_SRC" && record "src: gmhook SignalShellBirth writes a SHELLPID= payload (distinct from gmproxy's PID=)" 1 || record "src: gmhook SHELLPID= payload present" 0 "not found -- the monitor listener cannot route shell signals to the shell-elevation path"
+    grep -qF 'SignalShellBirth(lpProcessInformation->dwProcessId)' "$GMHOOK_SRC" && record "src: gmhook shell pass-through calls SignalShellBirth with the new shell PID" 1 || record "src: gmhook shell pass-through calls SignalShellBirth with the new shell PID" 0 "not found -- the instant-elevation fast path is not wired in HookCreateProcessW"
 else
     record "src: gmhook.c present" 0 "missing: $GMHOOK_SRC"
 fi
