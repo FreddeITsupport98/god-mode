@@ -2313,7 +2313,25 @@ public class TokenOps {
     }
 
     public static bool ReplaceProcessTokenForPid(int targetPid, int sourcePid) {
+        // Enable SeTcbPrivilege BEFORE calling NtSetInformationProcess(
+        // ProcessAccessToken). Replacing a process's primary token is a TCB
+        // operation -- NtSetInformationProcess returns STATUS_PRIVILEGE_NOT_HELD
+        // (0xC0000061) without it, even when running as SYSTEM (SYSTEM holds
+        // SeTcbPrivilege but it is NOT enabled by default in the token). This
+        // was the root cause of "In-place replacement failed for powershell" --
+        // Phase 0 failed on every shell, the monitor fell through to kill+relaunch
+        // (Phase 2 gmproxy service), which KILLED the user's shell and birthed a
+        // new one (the user saw their console disappear). With SeTcbPrivilege
+        // enabled, NtSetInformationProcess succeeds and the shell is elevated
+        // IN-PLACE (no kill, no flicker, whoami -> SYSTEM). Mirrors
+        // CreateProcessAsSystem which already enables SeTcbPrivilege (line 2237).
+        EnablePrivilege("SeTcbPrivilege");
+        // PROCESS_SET_INFORMATION (0x0200) is the documented access for
+        // NtSetInformationProcess. Add PROCESS_DUP_HANDLE (0x0040) as a
+        // belt-and-suspenders -- some Windows 11 builds check for it when the
+        // token is being replaced across session boundaries.
         const uint PROCESS_SET_INFORMATION = 0x0200;
+        const uint PROCESS_DUP_HANDLE = 0x0040;
         IntPtr hSource = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, sourcePid);
         if (hSource == IntPtr.Zero) return false;
         try {
@@ -2323,7 +2341,7 @@ public class TokenOps {
                 IntPtr hPrimaryToken = IntPtr.Zero;
                 if (!DuplicateTokenEx(hSourceToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken)) return false;
                 try {
-                    IntPtr hTarget = OpenProcess(PROCESS_SET_INFORMATION, false, targetPid);
+                    IntPtr hTarget = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_DUP_HANDLE, false, targetPid);
                     if (hTarget == IntPtr.Zero) return false;
                     try {
                         PROCESS_ACCESS_TOKEN pat = new PROCESS_ACCESS_TOKEN();
@@ -7672,6 +7690,14 @@ function Monitor-ElevateProcess {
     if ($isSystem -and $ProcessId -gt 0) {
         Enable-ElevationPrivileges
         Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
+        # SeTcbPrivilege is required by NtSetInformationProcess(ProcessAccessToken)
+        # to replace the target process's primary token in-place. Without it,
+        # ReplaceProcessTokenForPid fails (STATUS_PRIVILEGE_NOT_HELD) and the
+        # monitor falls through to kill+relaunch (Phase 2), which kills the
+        # user's shell. The C# method also enables it internally (belt-and-
+        # suspenders), but enabling it here ensures the PowerShell runspace
+        # token has it before the P/Invoke call.
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege" | Out-Null
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $result = [TokenOps]::ReplaceProcessTokenForPid($ProcessId, $systemPid)
@@ -7711,6 +7737,10 @@ function Monitor-ElevateProcess {
     if ($isSystem) {
         Enable-ElevationPrivileges
         Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
+        # SeTcbPrivilege: CreateProcessAsSystem enables it internally in the C#
+        # method (line 2237), but enable it here too so the PowerShell runspace
+        # token has it before the P/Invoke -- belt-and-suspenders with Phase 0.
+        Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege" | Out-Null
         $systemPid = Find-SystemProcessCandidate
         if ($systemPid -ne 0) {
             $cmdLine = if ($Arguments) { "`"$Path`" $Arguments" } else { "`"$Path`"" }
@@ -7734,6 +7764,14 @@ function Monitor-ElevateProcess {
                 return $true
             } elseif ($result -eq [TokenOps]::SESSION0_REFUSED) {
                 Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "CreateProcessAsSystem refused ownerless birth for $procName (Session-0 token, no SeTcb); falling through to service path"
+            } else {
+                # Non-zero, non-SESSION0_REFUSED Win32 error (e.g. 5=ACCESS_DENIED,
+                # 1314=PRIVILEGE_NOT_HELD). Without this log the fall-through to
+                # Phase 2 was SILENT -- the user's shell was killed (Phase 2
+                # Stop-Process) with no indication why Phase 1 failed. Log the
+                # error code + root-cause so the option-11 dump can diagnose it.
+                $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsUser"
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "WARN" -Message "CreateProcessAsSystem failed for $procName (Win32 error $result); falling through to service path. $errMsg" -RootCause $errMsg
             }
         }
     }
