@@ -7725,10 +7725,12 @@ function Monitor-ElevateProcess {
                 # process primary token is swapped but whoami may still read a stale
                 # context), so the user would see `whoami -> admin` and conclude the
                 # auto-elevation is broken after [7]+reboot. Re-check the owner after
-                # a brief settle; if it is NOT SYSTEM, do NOT return -- fall through
-                # to Phase 1 (CreateProcessAsSystem, born-as-SYSTEM) so the user
-                # ALWAYS gets a SYSTEM shell. Non-shells keep the fast return (the
-                # 15s periodic scan is their safety net; no per-app latency).
+                # a brief settle; if it is NOT SYSTEM, leave the shell as admin (see
+                # the fail-stop rationale in the else branch below -- Phase 1/2 would
+                # birth an invisible Session-0 shell + kill this visible one). The 15s
+                # periodic scan + WMI watcher retry Phase 0 on the next tick. Non-shells
+                # keep the fast return (the 15s periodic scan is their safety net; no
+                # per-app latency).
                 if ($isInteractiveShell) {
                     Start-Sleep -Milliseconds 300
                     if (Test-PidIsSystem -ProcessId $ProcessId) {
@@ -7736,9 +7738,28 @@ function Monitor-ElevateProcess {
                         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId (verified SYSTEM)"
                         return $true
                     } else {
-                        Write-Log -Message "Monitor: in-place swap reported success but $procName PID=$ProcessId is NOT SYSTEM after settle; falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM." -Type "WARN" -Color Yellow
-                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "WARN" -Message "Phase 0 silent-failure for $procName PID=$ProcessId (reported success, not SYSTEM after settle); falling through to Phase 1"
-                        # Fall through to Phase 1 (do NOT return).
+                        # Silent Phase 0 failure: NtSetInformationProcess(ProcessAccessToken)
+                        # reported STATUS_SUCCESS but the shell is NOT SYSTEM after the
+                        # 300ms settle (primary token swapped, but whoami/threads still
+                        # read stale context, OR Test-PidIsSystem opened the wrong
+                        # handle). Do NOT fall through to Phase 1/2 for interactive
+                        # shells -- Phase 1 births a new SYSTEM shell via
+                        # CreateProcessWithTokenW but it lands in Session 0 (invisible:
+                        # the seclogon service creates it in the caller's session, not
+                        # the token's session, on Windows 11 26100) and then Phase 1
+                        # kills this visible shell, leaving the user with NO visible
+                        # shell (the "it kill shell that is non admin and still fails
+                        # to elevate" / "same problem and same issue" symptom). This
+                        # mirrors the hard-failure branch below: leaving the shell as
+                        # admin is strictly better -- the user keeps their console,
+                        # session, cwd, and history, and the 15s periodic scan + WMI
+                        # watcher retry Phase 0 on the next tick. If the swap truly
+                        # took, a later Test-PidIsSystem on a subsequent tick will see
+                        # SYSTEM and skip the swap (the already-SYSTEM guard at
+                        # line 7690). Non-shell apps keep the fast return.
+                        Write-Log -Message "Monitor: in-place swap reported success but $procName PID=$ProcessId is NOT SYSTEM after settle; leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Phase 0 silent-failure for interactive shell $procName PID=$ProcessId (reported success, not SYSTEM after settle); leaving as admin (no kill)"
+                        return $true
                     }
                 } else {
                     Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement)" -Type "INFO" -Color Gray
@@ -7747,6 +7768,25 @@ function Monitor-ElevateProcess {
                 }
             } else {
                 Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch"
+                # Interactive shells: if Phase 0 (in-place, no-kill) fails, do NOT
+                # fall through to Phase 1/2 (kill+relaunch). Phase 1 births a new
+                # SYSTEM shell via CreateProcessWithTokenW but it lands in Session 0
+                # (invisible -- the seclogon service creates it in the caller's
+                # session, not the token's session, on Windows 11 26100). Phase 1
+                # then kills the user's visible admin shell, leaving the user with
+                # NO visible shell at all (the reported "it kill shell that is non
+                # admin and still fails to elevate" symptom). Leaving the shell as
+                # admin is strictly better -- the user keeps their console, session,
+                # cwd, and history. The 15s periodic scan + the WMI watcher will
+                # retry Phase 0 on the next tick (it may succeed on a subsequent
+                # attempt if SeTcbPrivilege races are resolved). Non-shell apps
+                # (DllHost, etc.) still fall through to Phase 1/2 since they don't
+                # have visible windows the user cares about.
+                if ($isInteractiveShell) {
+                    Write-Log -Message "Monitor: in-place elevation failed for $procName PID=$ProcessId; leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
+                    Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Phase 0 failed for interactive shell $procName PID=$ProcessId; leaving as admin (no kill)"
+                    return $true
+                }
             }
         }
     }

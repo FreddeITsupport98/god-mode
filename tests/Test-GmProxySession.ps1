@@ -916,11 +916,15 @@ Add-Assertion "Shell A: Test-GmPlumbingShell `$gmFlags includes -LaunchShellAsSy
 #      Start-Monitoring mid-startup -> no stable monitor -> shells never elevated.
 #      Flap-proof fix: if a stealth task EXISTS in ANY state, nudge it (never
 #      unregister from here); only create when none exists.
-#   B. Silent in-place swap: ReplaceProcessTokenForPid can report STATUS_SUCCESS
-#      yet leave the shell admin (whoami -> admin). Phase 0 now VERIFIES the swap
-#      for interactive shells (Test-PidIsSystem after a 300ms settle) and falls
-#      through to Phase 1 (born-as-SYSTEM) on silent failure -- the user ALWAYS
-#      gets a SYSTEM shell.
+#   B. Silent/hard in-place swap failure: ReplaceProcessTokenForPid can report
+#      STATUS_SUCCESS yet leave the shell admin (whoami -> admin), OR return
+#      false outright. Phase 0 now VERIFIES the swap for interactive shells
+#      (Test-PidIsSystem after a 300ms settle) and on EITHER failure mode LEAVES
+#      the shell as admin (no kill) -- Phase 1/2 would birth an invisible
+#      Session-0 shell + kill the visible one (the "it kill shell that is non
+#      admin and still fails to elevate" / "same problem and same issue"
+#      symptom). The 15s periodic scan + WMI watcher retry Phase 0 on the next
+#      tick. Non-shell apps keep the fast return.
 #   C. No retry: the lastElevatedPid dedup marked a shell before elevation; if all
 #      phases failed, it was never retried. The drains now remove the PID on
 #      $false for shells so the next 5s polling tick retries.
@@ -960,9 +964,16 @@ if ($stealthMatch.Success) {
     Add-Assertion "ShellAuto: Register-StealthTask -Argument has NO broken backtick-DOLLAR-quote (the positional-parameter trap that killed Enable-GodMode)" (-not $stealthBody.Contains('`$"$GodModeInstallScript`$"')) "Register-StealthTask -Argument uses backtick-DOLLAR-quote around `$GodModeInstallScript -- that emits a literal `$ and terminates the outer string early, leaking -Launch as a positional arg -> New-ScheduledTaskAction throws 'a positional parameter cannot be found' (uncaught trap -> no stealth monitor -> shells stay admin)"
     Add-Assertion "ShellAuto: Register-StealthTask action pins -WorkingDirectory (ERROR_DIRECTORY 267 fix)" ($stealthBody.Contains('-WorkingDirectory $GodModeInstallDir')) "Register-StealthTask action missing -WorkingDirectory `$GodModeInstallDir -- a SYSTEM task with no WorkingDirectory can die with error 267 (ERROR_DIRECTORY) -> no monitor loop -> shells stay admin"
 }
-Add-Assertion "ShellAuto: Phase 0 verifies the in-place swap for shells (Test-PidIsSystem within Phase 0)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?\$isInteractiveShell[\s\S]{0,400}?Test-PidIsSystem -ProcessId \$ProcessId') "Phase 0 does not verify the in-place swap for shells -- a silent NtSetInformationProcess success would leave whoami -> admin with no fallback"
-Add-Assertion "ShellAuto: Phase 0 settle sleep before the verify (Start-Sleep -Milliseconds 300)" ($gm -match '# --- Phase 0:[\s\S]{0,2000}?Start-Sleep -Milliseconds 300') "Phase 0 does not settle before verifying -- the owner query could race the token swap"
-Add-Assertion "ShellAuto: Phase 0 falls through to Phase 1 on silent swap failure (born-as-SYSTEM WARN)" ($gm.Contains('falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM')) "Phase 0 does not fall through to Phase 1 on silent swap failure -- the user could be left with an admin shell"
+# The first-hop window is 4000 (not 2000) because the Phase 0 explanatory
+# comments (SeTcbPrivilege rationale + the verify/fail-stop rationale) grew the
+# header->isInteractiveShell distance to ~2017 bytes; the lazy quantifier still
+# binds to the FIRST (Phase 0) occurrence -- Phase 1's isInteractiveShell sits
+# at ~6474 bytes, far beyond the window -- so the assertion stays specific.
+Add-Assertion "ShellAuto: Phase 0 verifies the in-place swap for shells (Test-PidIsSystem within Phase 0)" ($gm -match '# --- Phase 0:[\s\S]{0,4000}?\$isInteractiveShell[\s\S]{0,400}?Test-PidIsSystem -ProcessId \$ProcessId') "Phase 0 does not verify the in-place swap for shells -- a silent NtSetInformationProcess success would leave whoami -> admin with no fallback"
+Add-Assertion "ShellAuto: Phase 0 settle sleep before the verify (Start-Sleep -Milliseconds 300)" ($gm -match '# --- Phase 0:[\s\S]{0,4000}?Start-Sleep -Milliseconds 300') "Phase 0 does not settle before verifying -- the owner query could race the token swap"
+Add-Assertion "ShellAuto: Phase 0 silent-failure LEAVES the shell as admin (no kill, no Phase 1/2 fall-through)" ($gm.Contains('Phase 0 silent-failure for interactive shell') -and $gm.Contains('leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one).')) "Phase 0 silent-failure still falls through to Phase 1/2 -- an invisible Session-0 shell would be born + the visible shell killed (the 'it kill shell' symptom)"
+Add-Assertion "ShellAuto: Phase 0 hard-failure LEAVES the shell as admin (no kill, no Phase 1/2 fall-through)" ($gm.Contains('Phase 0 failed for interactive shell') -and $gm.Contains('leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one).')) "Phase 0 hard-failure still falls through to Phase 1/2 -- an invisible Session-0 shell would be born + the visible shell killed (the 'it kill shell' symptom)"
+Add-Assertion "ShellAuto: Phase 0 NO LONGER falls through to born-as-SYSTEM on silent swap failure (old kill+invisible-shell path removed)" (-not $gm.Contains('falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM')) "Phase 0 still contains the old 'falling back to born-as-SYSTEM (Phase 1)' fall-through -- the kill+invisible-Session-0-shell regression returned"
 Add-Assertion "ShellAuto: Phase 0 keeps the fast return for NON-shells (in-place token replacement, no verify)" ($gm.Contains('Monitor elevated: $procName PID=$ProcessId (in-place token replacement)')) "Phase 0 lost the non-shell fast return -- per-app latency would be added to every elevation"
 Add-Assertion "ShellAuto: WMI watcher drain captures the elevation result (meResult)" ($gm.Contains('$meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain does not capture the elevation result -- cannot retry on failure"
 Add-Assertion "ShellAuto: WMI watcher drain retries shells on failure (lastElevatedPid.Remove evt.ProcessId + shellNames procBase)" ($gm.Contains('$lastElevatedPid.Remove($evt.ProcessId)') -and $gm.Contains('$shellNames -contains $procBase')) "WMI watcher drain does not retry shells on failure -- a transient no-SYSTEM-token strands the shell as admin forever"
