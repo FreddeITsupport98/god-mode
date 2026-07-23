@@ -7744,16 +7744,15 @@ function Invoke-GmHookShellFeedbackElevation {
     # menu / Win+R / a shortcut) and signals its PID over the GodMode-
     # GmProxyFeedback pipe as SHELLPID=<n> (see gmhook.c SignalShellBirth).
     # Start-GmProxyFeedbackListener routes SHELLPID= to $GmHookShellQueue; the
-    # Start-Monitoring loop drains it here. This does the SAFE in-place SYSTEM
-    # token swap (ReplaceProcessTokenForPid, needs SeTcb -- only the SYSTEM
-    # monitor holds it) that gmhook CANNOT do itself (no SeTcb in explorer; and
-    # rerouting the shell's own CreateProcessW through the stolen-token path
-    # crashes it with 0xC0000005). The shell was already born visible as admin
-    # (correct session/cwd/history); this swaps its token in place ~ms after
-    # launch -- no kill, no invisible Session-0 rebirth, no wait for the 3s/15s
-    # scan. Mirrors Monitor-ElevateProcess's interactive-shell branch safety so
-    # the bootstrap + already-SYSTEM + auto-exclude guards all hold. Fail-stop
-    # on Phase 0 failure: LEAVE AS ADMIN (no kill) -- the WMI/3s/15s scans retry.
+    # Start-Monitoring loop drains it here. Tries the in-place SYSTEM token swap
+    # (ReplaceProcessTokenForPid) first; on Win11 26100 that returns
+    # STATUS_NOT_SUPPORTED (0xC00000BB -- the in-place swap API is removed), so
+    # it falls back to born-as-SYSTEM: CreateProcessWithTokenW births a VISIBLE
+    # Session-1 SYSTEM shell (the same path gmproxy uses successfully) + kills
+    # only the old admin PID (targeted, not a blanket purge). The user loses the
+    # old admin shell's cwd/history but gets whoami -> nt authority\system.
+    # Mirrors Monitor-ElevateProcess's interactive-shell branch safety so the
+    # bootstrap + already-SYSTEM + auto-exclude guards all hold.
     param([int]$ProcessId)
     if ($ProcessId -le 0) { return $false }
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
@@ -7814,18 +7813,48 @@ function Invoke-GmHookShellFeedbackElevation {
         Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place success for shell PID=$ProcessId name=$($proc.Name)"
         return $true
     } else {
-        # Fail-stop: LEAVE AS ADMIN (no kill). Phase 1/2 (kill+relaunch) for
-        # shells would birth an invisible Session-0 shell + kill this visible one
-        # -- the 'it kills my shell' symptom. The WMI watcher + 3s/15s scans
-        # retry Phase 0 on the next tick (the shell is still alive to retry).
-        # Surface the NTSTATUS + SeTcb-enable + target-open errors so the dump
-        # can root-cause the failure (mirrors Monitor-ElevateProcess Phase 0).
+        # Phase 0 failed (on Win11 26100, NtSetInformationProcess(ProcessAccessToken)
+        # returns STATUS_NOT_SUPPORTED 0xC00000BB 100% -- the in-place swap is
+        # removed on that build). Fall back to born-as-SYSTEM: CreateProcessWithTokenW
+        # births a VISIBLE Session-1 SYSTEM shell (the same path gmproxy uses
+        # successfully -- "Launched updater.exe as SYSTEM session=1"), then kill
+        # ONLY this admin PID (targeted, not a blanket purge -- preserves the user's
+        # other shells). The old fail-stop (return $false -> leave as admin) was
+        # based on a misdiagnosis that Phase 1 birthed invisible Session-0 shells;
+        # CreateProcessWithTokenW births in the token's session (Session 1), visible.
+        # The user loses the old admin shell's cwd/history but gets whoami -> SYSTEM.
         $ntStatus = [TokenOps]::LastReplaceNtStatus
         $tcbErr = [TokenOps]::LastSeTcbEnableErr
         $tgtErr = [TokenOps]::LastTargetOpenErr
-        Write-Log -Message "Monitor: instant in-place elevation failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (not killing -- WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
-        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (no kill)"
-        return $false
+        $shellPath = $null
+        try { $shellPath = $proc.Path } catch {}
+        if (-not $shellPath) {
+            Write-Log -Message "Monitor: instant in-place failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr) and the shell path could not be resolved; leaving as admin." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus)); no path for born-as-SYSTEM fallback; leaving as admin"
+            return $false
+        }
+        Write-Log -Message "Monitor: instant in-place failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus)); falling back to born-as-SYSTEM (visible Session-1)." -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "INFO" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); birthing visible SYSTEM shell via CreateProcessWithTokenW + targeted kill"
+        $cmdLine = "`"$shellPath`""
+        $bResult = [TokenOps]::CreateProcessAsSystem($systemPid, $shellPath, $cmdLine, $false)
+        if ($bResult -eq 0) {
+            Start-Sleep -Milliseconds 500
+            # Targeted kill of ONLY the signaled admin PID -- NOT every non-SYSTEM
+            # sibling (would take down the user's other admin/SYSTEM shells).
+            if ($ProcessId -gt 0) { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue }
+            Write-Log -Message "Monitor elevated: $($proc.Name) PID=$ProcessId (instant birth-signal -> born-as-SYSTEM, visible Session 1; old admin PID=$ProcessId killed)" -Type "INFO" -Color Gray
+            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM success for shell PID=$ProcessId name=$($proc.Name) (old admin killed)"
+            return $true
+        } elseif ($bResult -eq [TokenOps]::SESSION0_REFUSED) {
+            Write-Log -Message "Monitor: instant born-as-SYSTEM refused (Session-0 token, no SeTcb) for $($proc.Name) PID=$ProcessId; leaving as admin (WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM SESSION0_REFUSED for shell PID=$ProcessId name=$($proc.Name); leaving as admin"
+            return $false
+        } else {
+            $errMsg = Get-Win32ErrorRootCause -ErrorCode $bResult -Context "CreateProcessAsUser"
+            Write-Log -Message "Monitor: instant born-as-SYSTEM failed for $($proc.Name) PID=$ProcessId (Win32 error $bResult); leaving as admin (WMI/3s/15s scan will retry). $errMsg" -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM failed for shell PID=$ProcessId name=$($proc.Name) (Win32 $bResult); leaving as admin. $errMsg"
+            return $false
+        }
     }
 }
 
@@ -7942,14 +7971,11 @@ function Monitor-ElevateProcess {
                 # NtSetInformationProcess(ProcessAccessToken) can report STATUS_SUCCESS
                 # yet leave the running threads on the old token on some builds (the
                 # process primary token is swapped but whoami may still read a stale
-                # context), so the user would see `whoami -> admin` and conclude the
-                # auto-elevation is broken after [7]+reboot. Re-check the owner after
-                # a brief settle; if it is NOT SYSTEM, leave the shell as admin (see
-                # the fail-stop rationale in the else branch below -- Phase 1/2 would
-                # birth an invisible Session-0 shell + kill this visible one). The 15s
-                # periodic scan + WMI watcher retry Phase 0 on the next tick. Non-shells
-                # keep the fast return (the 15s periodic scan is their safety net; no
-                # per-app latency).
+                # context), so the user would see `whoami -> admin`. Re-check the owner
+                # after a brief settle; if it is NOT SYSTEM, fall through to Phase 1
+                # (born-as-SYSTEM via CreateProcessWithTokenW -- visible Session 1).
+                # Non-shells keep the fast return (the 15s periodic scan is their
+                # safety net; no per-app latency).
                 if ($isInteractiveShell) {
                     Start-Sleep -Milliseconds 300
                     if (Test-PidIsSystem -ProcessId $ProcessId) {
@@ -7957,28 +7983,20 @@ function Monitor-ElevateProcess {
                         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "In-place replacement success for $procName PID=$ProcessId (verified SYSTEM)"
                         return $true
                     } else {
-                        # Silent Phase 0 failure: NtSetInformationProcess(ProcessAccessToken)
-                        # reported STATUS_SUCCESS but the shell is NOT SYSTEM after the
-                        # 300ms settle (primary token swapped, but whoami/threads still
-                        # read stale context, OR Test-PidIsSystem opened the wrong
-                        # handle). Do NOT fall through to Phase 1/2 for interactive
-                        # shells -- Phase 1 births a new SYSTEM shell via
-                        # CreateProcessWithTokenW but it lands in Session 0 (invisible:
-                        # the seclogon service creates it in the caller's session, not
-                        # the token's session, on Windows 11 26100) and then Phase 1
-                        # kills this visible shell, leaving the user with NO visible
-                        # shell (the "it kill shell that is non admin and still fails
-                        # to elevate" / "same problem and same issue" symptom). This
-                        # mirrors the hard-failure branch below: leaving the shell as
-                        # admin is strictly better -- the user keeps their console,
-                        # session, cwd, and history, and the 15s periodic scan + WMI
-                        # watcher retry Phase 0 on the next tick. If the swap truly
-                        # took, a later Test-PidIsSystem on a subsequent tick will see
-                        # SYSTEM and skip the swap (the already-SYSTEM guard at
-                        # line 7690). Non-shell apps keep the fast return.
-                        Write-Log -Message "Monitor: in-place swap reported success but $procName PID=$ProcessId is NOT SYSTEM after settle; leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
-                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Phase 0 silent-failure for interactive shell $procName PID=$ProcessId (reported success, not SYSTEM after settle); leaving as admin (no kill)"
-                        return $true
+                        # Silent Phase 0 failure: NtSetInformationProcess reported
+                        # STATUS_SUCCESS but the shell is NOT SYSTEM after the 300ms
+                        # settle. Fall through to Phase 1 (born-as-SYSTEM via
+                        # CreateProcessWithTokenW into the active session -- the same
+                        # path gmproxy uses successfully, "Launched ... as SYSTEM
+                        # session=1"). Phase 1 births a VISIBLE Session-1 SYSTEM
+                        # shell + kills only this admin PID. The old fail-stop
+                        # (return $true) was based on a misdiagnosis that Phase 1
+                        # birthed invisible Session-0 shells -- that was when Phase 1
+                        # used CreateProcessAsUser (Win32 error 5); it now uses
+                        # CreateProcessWithTokenW which births in the token's session.
+                        $silentNt = [TokenOps]::LastReplaceNtStatus
+                        Write-Log -Message "Monitor: in-place swap reported success but $procName PID=$ProcessId is NOT SYSTEM after settle (NTSTATUS=0x$('{0:X8}' -f $silentNt); falling back to born-as-SYSTEM (Phase 1)." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "Phase 0 silent-failure for interactive shell $procName PID=$ProcessId (reported success, not SYSTEM after settle); falling through to Phase 1 born-as-SYSTEM"
                     }
                 } else {
                     Write-Log -Message "Monitor elevated: $procName PID=$ProcessId (in-place token replacement)" -Type "INFO" -Color Gray
@@ -7989,33 +8007,30 @@ function Monitor-ElevateProcess {
                 # Surface the NTSTATUS + SeTcb-enable + target-open errors so the
                 # option-11 dump can root-cause the Phase 0 failure (previously
                 # swallowed: the log said only "In-place replacement failed" with
-                # no error code). NTSTATUS 0xC0000061=-1073741727=PRIVILEGE_NOT_HELD,
-                # 0xC0000022=-1073741790=ACCESS_DENIED, etc. SeTcbEnableErr 1300=
-                # ERROR_NOT_ALL_ASSIGNED (the SYSTEM token lacks SeTcb). TargetOpenErr
-                # 5=ACCESS_DENIED (PPL / ACL). All 0 = the failure was upstream
-                # (OpenProcess source / OpenProcessToken / DuplicateTokenEx).
+                # no error code). NTSTATUS 0xC00000BB=STATUS_NOT_SUPPORTED (Win11
+                # 26100 removed NtSetInformationProcess(ProcessAccessToken) -- the
+                # in-place token swap is dead on this build; fall through to Phase 1
+                # born-as-SYSTEM). 0xC0000061=PRIVILEGE_NOT_HELD. 0xC0000022=
+                # ACCESS_DENIED. SeTcbEnableErr 1300=ERROR_NOT_ALL_ASSIGNED. All 0
+                # = the failure was upstream (OpenProcess/OpenProcessToken/Dup).
                 $ntStatus = [TokenOps]::LastReplaceNtStatus
                 $tcbErr = [TokenOps]::LastSeTcbEnableErr
                 $tgtErr = [TokenOps]::LastTargetOpenErr
-                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr)"
-                # Interactive shells: if Phase 0 (in-place, no-kill) fails, do NOT
-                # fall through to Phase 1/2 (kill+relaunch). Phase 1 births a new
-                # SYSTEM shell via CreateProcessWithTokenW but it lands in Session 0
-                # (invisible -- the seclogon service creates it in the caller's
-                # session, not the token's session, on Windows 11 26100). Phase 1
-                # then kills the user's visible admin shell, leaving the user with
-                # NO visible shell at all (the reported "it kill shell that is non
-                # admin and still fails to elevate" symptom). Leaving the shell as
-                # admin is strictly better -- the user keeps their console, session,
-                # cwd, and history. The 15s periodic scan + the WMI watcher will
-                # retry Phase 0 on the next tick (it may succeed on a subsequent
-                # attempt if SeTcbPrivilege races are resolved). Non-shell apps
-                # (DllHost, etc.) still fall through to Phase 1/2 since they don't
-                # have visible windows the user cares about.
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to born-as-SYSTEM (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr)"
+                # Interactive shells: fall through to Phase 1 (born-as-SYSTEM via
+                # CreateProcessWithTokenW into the active session). The old fail-stop
+                # (return $true -> leave as admin) was based on a misdiagnosis that
+                # Phase 1 birthed invisible Session-0 shells; it now uses
+                # CreateProcessWithTokenW which births VISIBLE in the token's session
+                # (gmproxy logs prove it: "Launched updater.exe as SYSTEM session=1").
+                # On Win11 26100, Phase 0 returns STATUS_NOT_SUPPORTED (0xC00000BB)
+                # 100% of the time -- the in-place swap is removed -- so Phase 1 is
+                # THE working shell-elevation path. Phase 1 kills only this admin PID
+                # (targeted, not a blanket purge) after the SYSTEM child is confirmed.
+                # The user loses the old admin shell's cwd/history but gets a visible
+                # Session-1 SYSTEM shell (whoami -> nt authority\system) -- the goal.
                 if ($isInteractiveShell) {
-                    Write-Log -Message "Monitor: in-place elevation failed for $procName PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
-                    Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Phase 0 failed for interactive shell $procName PID=$ProcessId; leaving as admin (no kill)"
-                    return $true
+                    Write-Log -Message "Monitor: in-place elevation failed for $procName PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus); falling back to born-as-SYSTEM (Phase 1)." -Type "WARN" -Color Yellow
                 }
             }
         }

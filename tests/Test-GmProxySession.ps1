@@ -918,13 +918,19 @@ Add-Assertion "Shell A: Test-GmPlumbingShell `$gmFlags includes -LaunchShellAsSy
 #      unregister from here); only create when none exists.
 #   B. Silent/hard in-place swap failure: ReplaceProcessTokenForPid can report
 #      STATUS_SUCCESS yet leave the shell admin (whoami -> admin), OR return
-#      false outright. Phase 0 now VERIFIES the swap for interactive shells
-#      (Test-PidIsSystem after a 300ms settle) and on EITHER failure mode LEAVES
-#      the shell as admin (no kill) -- Phase 1/2 would birth an invisible
-#      Session-0 shell + kill the visible one (the "it kill shell that is non
-#      admin and still fails to elevate" / "same problem and same issue"
-#      symptom). The 15s periodic scan + WMI watcher retry Phase 0 on the next
-#      tick. Non-shell apps keep the fast return.
+#      false outright. Phase 0 VERIFIES the swap for interactive shells
+#      (Test-PidIsSystem after a 300ms settle). PIVOT (2026-07-23, Win11 26100):
+#      the in-place swap API was REMOVED on build 26100 -- NtSetInformationProcess
+#      (ProcessAccessToken) returns STATUS_NOT_SUPPORTED (0xC00000BB) 100%, so the
+#      old fail-stop (LEAVE the shell as admin, no kill) left every shell admin
+#      forever with NO working elevation path. The fail-stop was based on a
+#      misdiagnosis that Phase 1 birthed an invisible Session-0 shell; in fact
+#      CreateProcessWithTokenW births a VISIBLE Session-1 SYSTEM shell (gmproxy
+#      logs prove it: "Launched ... as SYSTEM session=1"). So Phase 0 now FALLS
+#      THROUGH to Phase 1 (born-as-SYSTEM via CreateProcessWithTokenW) on EITHER
+#      failure mode, then kills ONLY the failed admin PID (targeted, not a blanket
+#      purge -- preserves the user's other shells). The 15s periodic scan + WMI
+#      watcher still retry. Non-shell apps keep the fast return.
 #   C. No retry: the lastElevatedPid dedup marked a shell before elevation; if all
 #      phases failed, it was never retried. The drains now remove the PID on
 #      $false for shells so the next 5s polling tick retries.
@@ -971,9 +977,9 @@ if ($stealthMatch.Success) {
 # at ~6474 bytes, far beyond the window -- so the assertion stays specific.
 Add-Assertion "ShellAuto: Phase 0 verifies the in-place swap for shells (Test-PidIsSystem within Phase 0)" ($gm -match '# --- Phase 0:[\s\S]{0,4000}?\$isInteractiveShell[\s\S]{0,400}?Test-PidIsSystem -ProcessId \$ProcessId') "Phase 0 does not verify the in-place swap for shells -- a silent NtSetInformationProcess success would leave whoami -> admin with no fallback"
 Add-Assertion "ShellAuto: Phase 0 settle sleep before the verify (Start-Sleep -Milliseconds 300)" ($gm -match '# --- Phase 0:[\s\S]{0,4000}?Start-Sleep -Milliseconds 300') "Phase 0 does not settle before verifying -- the owner query could race the token swap"
-Add-Assertion "ShellAuto: Phase 0 silent-failure LEAVES the shell as admin (no kill, no Phase 1/2 fall-through)" ($gm.Contains('Phase 0 silent-failure for interactive shell') -and $gm.Contains('leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one).')) "Phase 0 silent-failure still falls through to Phase 1/2 -- an invisible Session-0 shell would be born + the visible shell killed (the 'it kill shell' symptom)"
-Add-Assertion "ShellAuto: Phase 0 hard-failure LEAVES the shell as admin (no kill, no Phase 1/2 fall-through)" ($gm.Contains('Phase 0 failed for interactive shell') -and $gm.Contains('leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one).')) "Phase 0 hard-failure still falls through to Phase 1/2 -- an invisible Session-0 shell would be born + the visible shell killed (the 'it kill shell' symptom)"
-Add-Assertion "ShellAuto: Phase 0 NO LONGER falls through to born-as-SYSTEM on silent swap failure (old kill+invisible-shell path removed)" (-not $gm.Contains('falling back to born-as-SYSTEM (Phase 1) so the shell is SYSTEM')) "Phase 0 still contains the old 'falling back to born-as-SYSTEM (Phase 1)' fall-through -- the kill+invisible-Session-0-shell regression returned"
+Add-Assertion "ShellAuto: Phase 0 silent-failure FALLS THROUGH to born-as-SYSTEM Phase 1 (Win11 26100 STATUS_NOT_SUPPORTED pivot)" ($gm.Contains('Phase 0 silent-failure for interactive shell') -and $gm.Contains('falling through to Phase 1 born-as-SYSTEM')) "Phase 0 silent-failure does not fall through to born-as-SYSTEM Phase 1 -- on Win11 26100 (in-place swap removed, NTSTATUS 0xC00000BB) the shell would be left admin with no working elevation path"
+Add-Assertion "ShellAuto: Phase 0 hard-failure FALLS THROUGH to born-as-SYSTEM Phase 1 (Win11 26100 STATUS_NOT_SUPPORTED pivot)" ($gm.Contains('falling back to born-as-SYSTEM (NTSTATUS=0x') -and $gm.Contains('falling back to born-as-SYSTEM (Phase 1)')) "Phase 0 hard-failure does not fall through to born-as-SYSTEM Phase 1 -- on Win11 26100 (in-place swap removed, NTSTATUS 0xC00000BB 100%) the shell would be left admin with no working elevation path"
+Add-Assertion "ShellAuto: Phase 0 fall-through births a VISIBLE Session-1 SYSTEM shell via CreateProcessWithTokenW (not invisible Session-0)" ($gm.Contains('falling back to born-as-SYSTEM (Phase 1)')) "Phase 0 does not fall through to a visible Session-1 born-as-SYSTEM shell -- the old misdiagnosis (invisible Session-0 fail-stop) would leave shells admin on Win11 26100 where the in-place swap is removed"
 Add-Assertion "ShellAuto: Phase 0 keeps the fast return for NON-shells (in-place token replacement, no verify)" ($gm.Contains('Monitor elevated: $procName PID=$ProcessId (in-place token replacement)')) "Phase 0 lost the non-shell fast return -- per-app latency would be added to every elevation"
 Add-Assertion "ShellAuto: WMI watcher drain captures the elevation result (meResult)" ($gm.Contains('$meResult = Monitor-ElevateProcess -Path $path -Arguments $arguments -ProcessId $evt.ProcessId -HideWindow')) "WMI watcher drain does not capture the elevation result -- cannot retry on failure"
 Add-Assertion "ShellAuto: WMI watcher drain retries shells on failure (lastElevatedPid.Remove evt.ProcessId + shellNames procBase)" ($gm.Contains('$lastElevatedPid.Remove($evt.ProcessId)') -and $gm.Contains('$shellNames -contains $procBase')) "WMI watcher drain does not retry shells on failure -- a transient no-SYSTEM-token strands the shell as admin forever"
@@ -1249,7 +1255,7 @@ if ($ishMatch.Success) {
     Add-Assertion "InstantShell: handler honors the Detector B auto-exclude store (Test-GmAutoExcluded)" ($ishBody.Contains('Test-GmAutoExcluded')) "handler does not consult the auto-exclude store -- an auto-excluded base could be re-elevated"
     Add-Assertion "InstantShell: handler enables SeTcbPrivilege (Phase 0 NtSetInformationProcess requires it)" ($ishBody -match 'Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege"') "handler does not enable SeTcbPrivilege -- ReplaceProcessTokenForPid would fail (STATUS_PRIVILEGE_NOT_HELD) and the shell would stay admin"
     Add-Assertion "InstantShell: handler does the in-place swap (ReplaceProcessTokenForPid)" ($ishBody -match '\[TokenOps\]::ReplaceProcessTokenForPid') "handler does not call ReplaceProcessTokenForPid -- no in-place SYSTEM swap"
-    Add-Assertion "InstantShell: handler is fail-stop no-kill on Phase 0 failure (LEAVES AS ADMIN, no Stop-Process)" ($ishBody.Contains('leaving as admin') -and -not ($ishBody -match 'Stop-Process')) "handler kills the shell on Phase 0 failure (or has no fail-stop) -- the 'it kills my shell' symptom would recur"
+Add-Assertion "InstantShell: handler falls back to born-as-SYSTEM on Phase 0 failure (CreateProcessAsSystem + TARGETED kill of only the signaled PID, no blanket purge)" ($ishBody -match 'CreateProcessAsSystem' -and $ishBody -match 'Stop-Process -Id \$ProcessId -Force' -and -not ($ishBody -match 'Stop-NonSystemInstances')) "handler does not fall back to born-as-SYSTEM + targeted kill on Phase 0 failure -- on Win11 26100 (in-place swap removed) the shell would be left admin, or a blanket purge would kill the user's other shells"
 }
 Add-Assertion "InstantShell: Start-Monitoring drains GmHookShellQueue into Invoke-GmHookShellFeedbackElevation" ($gm -match 'GmHookShellQueue[\s\S]{0,200}?Invoke-GmHookShellFeedbackElevation') "Start-Monitoring does not drain GmHookShellQueue -- SHELLPID signals would queue undrained"
 Add-Assertion "InstantShell: Start-Monitoring retries shells on transient failure (removes the shPid dedup key)" ($gm -match 'Invoke-GmHookShellFeedbackElevation -ProcessId \$shPid[\s\S]{0,400}?lastElevatedPid\.Remove\(\$shPid\)') "Start-Monitoring does not retry shells on transient failure -- a transient no-SYSTEM-token would strand the shell as admin"
@@ -1277,7 +1283,7 @@ Add-Assertion "Phase0Diag: TokenOps LastTargetOpenErr static field present (surf
 Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid sets LastReplaceNtStatus = status (no longer swallowed)" ($gm -match 'LastReplaceNtStatus = status;') "ReplaceProcessTokenForPid does not store the NTSTATUS -- the 100% Phase 0 failure stays undiagnosable"
 Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid captures the SeTcb enable result (LastSeTcbEnableErr on failure)" ($gm -match 'bool tcbOk = EnablePrivilege\("SeTcbPrivilege"\);' -and $gm -match 'if \(!tcbOk\) \{ LastSeTcbEnableErr = Marshal\.GetLastWin32Error\(\); \}') "ReplaceProcessTokenForPid discards the SeTcb enable result -- the dump cannot tell a SeTcb-not-held token from a NtSetInformationProcess rejection"
 Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid captures the target-open error (LastTargetOpenErr on OpenProcess(hTarget) failure)" ($gm -match 'if \(hTarget == IntPtr\.Zero\) \{ LastTargetOpenErr = Marshal\.GetLastWin32Error\(\); return false; \}') "ReplaceProcessTokenForPid does not capture the target-open error -- a PPL/ACL open denial looks identical to a NtSetInformationProcess rejection"
-Add-Assertion "Phase0Diag: Monitor-ElevateProcess Phase 0 logs the NTSTATUS on failure (NTSTATUS=0x... SeTcbErr=... TargetOpenErr=...)" ($gm -match 'In-place replacement failed for \$procName PID=\$ProcessId, falling back to kill-relaunch \(NTSTATUS=0x') "Monitor-ElevateProcess Phase 0 does not log the NTSTATUS on failure -- the dump cannot root-cause the 100% Phase 0 failure"
+Add-Assertion "Phase0Diag: Monitor-ElevateProcess Phase 0 logs the NTSTATUS on failure (NTSTATUS=0x... SeTcbErr=... TargetOpenErr=...)" ($gm -match 'In-place replacement failed for \$procName PID=\$ProcessId, falling back to born-as-SYSTEM \(NTSTATUS=0x') "Monitor-ElevateProcess Phase 0 does not log the NTSTATUS on failure -- the dump cannot root-cause the 100% Phase 0 failure"
 Add-Assertion "Phase0Diag: Invoke-GmHookShellFeedbackElevation logs the NTSTATUS on instant-path failure" ($gm -match 'Instant in-place failed for shell PID=\$ProcessId name=\$\(\$proc\.Name\) \(NTSTATUS=0x') "Invoke-GmHookShellFeedbackElevation does not log the NTSTATUS on failure -- the instant-path failure stays undiagnosable"
 
 # Part E -- WMI watcher RPC-server-failure self-heal + zombie detection
