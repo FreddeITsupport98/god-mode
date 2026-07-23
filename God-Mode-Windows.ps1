@@ -2329,7 +2329,28 @@ public class TokenOps {
         }
     }
 
+    // Diagnostic surfaces (2026-07-23): ReplaceProcessTokenForPid previously
+    // swallowed the NTSTATUS (returned status == 0) + discarded the SeTcb
+    // enable result, so a 100% Phase 0 failure logged only "In-place
+    // replacement failed" with no error code -- impossible to root-cause.
+    // These static fields are read by the PowerShell callers after a $false
+    // return + logged, so the option-11 dump shows the exact NTSTATUS + the
+    // SeTcb-enable Win32 error. 0 = success / not-yet-set; a value present
+    // means the LAST call set it. NTSTATUS is a signed int (NTSTATUS codes
+    // are negative, e.g. 0xC0000061 == -1073741727).
+    public static int LastReplaceNtStatus = 0;
+    public static int LastSeTcbEnableErr = 0;
+    // Win32 error (GetLastError) when OpenProcess(hTarget) failed (0 = n/a).
+    // Lets the dump distinguish "could not open the target" (5=ACCESS_DENIED,
+    // e.g. PPL) from "NtSetInformationProcess rejected the token".
+    public static int LastTargetOpenErr = 0;
+
     public static bool ReplaceProcessTokenForPid(int targetPid, int sourcePid) {
+        // Reset the diagnostic surfaces on every call so a stale value from a
+        // prior call never misleads the caller's log.
+        LastReplaceNtStatus = 0;
+        LastSeTcbEnableErr = 0;
+        LastTargetOpenErr = 0;
         // Enable SeTcbPrivilege BEFORE calling NtSetInformationProcess(
         // ProcessAccessToken). Replacing a process's primary token is a TCB
         // operation -- NtSetInformationProcess returns STATUS_PRIVILEGE_NOT_HELD
@@ -2342,7 +2363,12 @@ public class TokenOps {
         // enabled, NtSetInformationProcess succeeds and the shell is elevated
         // IN-PLACE (no kill, no flicker, whoami -> SYSTEM). Mirrors
         // CreateProcessAsSystem which already enables SeTcbPrivilege (line 2237).
-        EnablePrivilege("SeTcbPrivilege");
+        // Capture the enable result so the dump can tell SeTcb-not-held from
+        // NtSetInformationProcess-rejected (ERROR_NOT_ALL_ASSIGNED=1300 means the
+        // SYSTEM token does not actually carry SeTcbPrivilege -- a service-task
+        // SYSTEM token can lack it on some hardened builds).
+        bool tcbOk = EnablePrivilege("SeTcbPrivilege");
+        if (!tcbOk) { LastSeTcbEnableErr = Marshal.GetLastWin32Error(); }
         // PROCESS_SET_INFORMATION (0x0200) is the documented access for
         // NtSetInformationProcess. Add PROCESS_DUP_HANDLE (0x0040) as a
         // belt-and-suspenders -- some Windows 11 builds check for it when the
@@ -2359,12 +2385,13 @@ public class TokenOps {
                 if (!DuplicateTokenEx(hSourceToken, TOKEN_ALL_ACCESS, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken)) return false;
                 try {
                     IntPtr hTarget = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_DUP_HANDLE, false, targetPid);
-                    if (hTarget == IntPtr.Zero) return false;
+                    if (hTarget == IntPtr.Zero) { LastTargetOpenErr = Marshal.GetLastWin32Error(); return false; }
                     try {
                         PROCESS_ACCESS_TOKEN pat = new PROCESS_ACCESS_TOKEN();
                         pat.Token = hPrimaryToken;
                         pat.Thread = IntPtr.Zero;
                         int status = NtSetInformationProcess(hTarget, ProcessAccessToken, ref pat, Marshal.SizeOf(pat));
+                        LastReplaceNtStatus = status;  // surface the NTSTATUS (0 = STATUS_SUCCESS)
                         return status == 0;
                     } finally {
                         CloseHandle(hTarget);
@@ -7743,8 +7770,13 @@ function Invoke-GmHookShellFeedbackElevation {
         # shells would birth an invisible Session-0 shell + kill this visible one
         # -- the 'it kills my shell' symptom. The WMI watcher + 3s/15s scans
         # retry Phase 0 on the next tick (the shell is still alive to retry).
-        Write-Log -Message "Monitor: instant in-place elevation failed for $($proc.Name) PID=$ProcessId; leaving as admin (not killing -- WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
-        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name); leaving as admin (no kill)"
+        # Surface the NTSTATUS + SeTcb-enable + target-open errors so the dump
+        # can root-cause the failure (mirrors Monitor-ElevateProcess Phase 0).
+        $ntStatus = [TokenOps]::LastReplaceNtStatus
+        $tcbErr = [TokenOps]::LastSeTcbEnableErr
+        $tgtErr = [TokenOps]::LastTargetOpenErr
+        Write-Log -Message "Monitor: instant in-place elevation failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (not killing -- WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (no kill)"
         return $false
     }
 }
@@ -7906,7 +7938,18 @@ function Monitor-ElevateProcess {
                     return $true
                 }
             } else {
-                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch"
+                # Surface the NTSTATUS + SeTcb-enable + target-open errors so the
+                # option-11 dump can root-cause the Phase 0 failure (previously
+                # swallowed: the log said only "In-place replacement failed" with
+                # no error code). NTSTATUS 0xC0000061=-1073741727=PRIVILEGE_NOT_HELD,
+                # 0xC0000022=-1073741790=ACCESS_DENIED, etc. SeTcbEnableErr 1300=
+                # ERROR_NOT_ALL_ASSIGNED (the SYSTEM token lacks SeTcb). TargetOpenErr
+                # 5=ACCESS_DENIED (PPL / ACL). All 0 = the failure was upstream
+                # (OpenProcess source / OpenProcessToken / DuplicateTokenEx).
+                $ntStatus = [TokenOps]::LastReplaceNtStatus
+                $tcbErr = [TokenOps]::LastSeTcbEnableErr
+                $tgtErr = [TokenOps]::LastTargetOpenErr
+                Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "INFO" -Message "In-place replacement failed for $procName PID=$ProcessId, falling back to kill-relaunch (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr)"
                 # Interactive shells: if Phase 0 (in-place, no-kill) fails, do NOT
                 # fall through to Phase 1/2 (kill+relaunch). Phase 1 births a new
                 # SYSTEM shell via CreateProcessWithTokenW but it lands in Session 0
@@ -7922,7 +7965,7 @@ function Monitor-ElevateProcess {
                 # (DllHost, etc.) still fall through to Phase 1/2 since they don't
                 # have visible windows the user cares about.
                 if ($isInteractiveShell) {
-                    Write-Log -Message "Monitor: in-place elevation failed for $procName PID=$ProcessId; leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
+                    Write-Log -Message "Monitor: in-place elevation failed for $procName PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); leaving as admin (not killing -- Phase 1/2 would birth an invisible Session-0 shell + kill this one)." -Type "WARN" -Color Yellow
                     Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Phase 0 failed for interactive shell $procName PID=$ProcessId; leaving as admin (no kill)"
                     return $true
                 }

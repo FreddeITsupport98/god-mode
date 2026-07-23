@@ -1262,4 +1262,22 @@ Add-Assertion "ThreadDetect: Get-NonSystemProcessesParallel uses candidate-aware
 Add-Assertion "ThreadDetect: Get-NonSystemProcessesParallel ChunkSize param default is 0 (compute in body)" ($gm -match 'function Get-NonSystemProcessesParallel[\s\S]{0,900}?\[int\]\$ChunkSize = 0') "Get-NonSystemProcessesParallel ChunkSize default is not 0 -- the old hardcoded formula may still bind"
 Add-Assertion "ThreadDetect: old hardcoded-50 chunk formula GONE (no Ceiling(50 /)" (-not ($gm -match 'Ceiling\(50 /')) "the old hardcoded-50 chunk formula remains -- candidate-aware chunking did not replace it"
 
+# Part D -- Phase 0 NTSTATUS diagnostic surfacing (2026-07-23). The VM dump
+# showed ReplaceProcessTokenForPid failing 100% (every shell + every non-shell)
+# but the log said only "In-place replacement failed" with NO error code -- the
+# C# method swallowed the NTSTATUS (returned status == 0) + discarded the
+# SeTcb-enable result. These assertions guard the 3 static diagnostic fields +
+# the PS-side logging that surfaces them, so the next dump shows the exact
+# NTSTATUS (e.g. 0xC0000061 PRIVILEGE_NOT_HELD / 0xC0000022 ACCESS_DENIED) +
+# the SeTcb-enable Win32 error (1300 = ERROR_NOT_ALL_ASSIGNED) + the target-open
+# error (5 = ACCESS_DENIED / PPL). Additive; no behavior change (logging only).
+Add-Assertion "Phase0Diag: TokenOps LastReplaceNtStatus static field present (surfaces the NtSetInformationProcess NTSTATUS)" ($gm.Contains('public static int LastReplaceNtStatus')) "LastReplaceNtStatus missing -- the Phase 0 NTSTATUS is still swallowed, the dump cannot root-cause the 100% failure"
+Add-Assertion "Phase0Diag: TokenOps LastSeTcbEnableErr static field present (surfaces the SeTcb enable Win32 error)" ($gm.Contains('public static int LastSeTcbEnableErr')) "LastSeTcbEnableErr missing -- the dump cannot tell SeTcb-not-held (1300) from NtSetInformationProcess-rejected"
+Add-Assertion "Phase0Diag: TokenOps LastTargetOpenErr static field present (surfaces the OpenProcess(hTarget) Win32 error)" ($gm.Contains('public static int LastTargetOpenErr')) "LastTargetOpenErr missing -- the dump cannot distinguish 'could not open target' (5/PPL) from 'NtSetInformationProcess rejected'"
+Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid sets LastReplaceNtStatus = status (no longer swallowed)" ($gm -match 'LastReplaceNtStatus = status;') "ReplaceProcessTokenForPid does not store the NTSTATUS -- the 100% Phase 0 failure stays undiagnosable"
+Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid captures the SeTcb enable result (LastSeTcbEnableErr on failure)" ($gm -match 'bool tcbOk = EnablePrivilege\("SeTcbPrivilege"\);' -and $gm -match 'if \(!tcbOk\) \{ LastSeTcbEnableErr = Marshal\.GetLastWin32Error\(\); \}') "ReplaceProcessTokenForPid discards the SeTcb enable result -- the dump cannot tell a SeTcb-not-held token from a NtSetInformationProcess rejection"
+Add-Assertion "Phase0Diag: ReplaceProcessTokenForPid captures the target-open error (LastTargetOpenErr on OpenProcess(hTarget) failure)" ($gm -match 'if \(hTarget == IntPtr\.Zero\) \{ LastTargetOpenErr = Marshal\.GetLastWin32Error\(\); return false; \}') "ReplaceProcessTokenForPid does not capture the target-open error -- a PPL/ACL open denial looks identical to a NtSetInformationProcess rejection"
+Add-Assertion "Phase0Diag: Monitor-ElevateProcess Phase 0 logs the NTSTATUS on failure (NTSTATUS=0x... SeTcbErr=... TargetOpenErr=...)" ($gm -match 'In-place replacement failed for \$procName PID=\$ProcessId, falling back to kill-relaunch \(NTSTATUS=0x') "Monitor-ElevateProcess Phase 0 does not log the NTSTATUS on failure -- the dump cannot root-cause the 100% Phase 0 failure"
+Add-Assertion "Phase0Diag: Invoke-GmHookShellFeedbackElevation logs the NTSTATUS on instant-path failure" ($gm -match 'Instant in-place failed for shell PID=\$ProcessId name=\$\(\$proc\.Name\) \(NTSTATUS=0x') "Invoke-GmHookShellFeedbackElevation does not log the NTSTATUS on failure -- the instant-path failure stays undiagnosable"
+
 Write-Summary
