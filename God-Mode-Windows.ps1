@@ -7170,7 +7170,22 @@ function Register-ProcessCreationWatcher {
         $watcher = $script:ProcessCreationWatcher
 
         $job = Start-ThreadJob -ScriptBlock {
-            param($watcher, $q, $st)
+            param($watcher, $q, $st, $wmiQuery)
+            # The WMI event subscription can die when the WMI/RPC subsystem hiccups
+            # -- classically "RPC server is unavailable" (0x800706BA) when explorer
+            # restarts (the crash/restart loop) or the WinMgmt service recycles. A
+            # dead ManagementEventWatcher CANNOT be retried: WaitForNextEvent() keeps
+            # throwing the same RPC error on the same invalidated subscription
+            # forever, so the ThreadJob would spin in a 500ms catch loop with Beats
+            # frozen -- a ZOMBIE (State=Running but delivering nothing) the heartbeat
+            # could not detect (it only re-registers on State!=Running). Self-heal:
+            # on a catch, dispose the dead watcher + create a FRESH one with the same
+            # query, log the RPC error ONCE (avoid spam), and keep looping. If the
+            # re-create itself fails N consecutive times, break out (let the ThreadJob
+            # die -> the heartbeat sees State!=Running -> re-registers). A successful
+            # event resets the consecutive-failure counter.
+            $consecutiveFail = 0
+            $loggedRpcErr = $false
             while (-not $st.Stopped) {
                 try {
                     # WaitForNextEvent() blocks THIS thread until a WMI event fires
@@ -7178,6 +7193,7 @@ function Register-ProcessCreationWatcher {
                     # cancels it -> throws -> the catch breaks the loop.
                     $evt = $watcher.WaitForNextEvent()
                     if ($st.Stopped) { try { $evt.Dispose() } catch {}; break }
+                    $consecutiveFail = 0   # event delivered -> subscription is healthy
                     $proc = $evt.TargetInstance
                     if ($proc -and $proc.ExecutablePath -and $proc.ExecutablePath -like "*.exe" -and $proc.SessionId -gt 0) {
                         $arguments = ""
@@ -7209,13 +7225,45 @@ function Register-ProcessCreationWatcher {
                     try { $evt.Dispose() } catch {}
                 } catch {
                     if ($st.Stopped) { break }
-                    # WaitForNextEvent threw (transient WMI error or watcher stopped
-                    # externally). Brief pause then retry; the Start-Monitoring
-                    # liveness heartbeat will re-register if this ThreadJob dies.
+                    # WaitForNextEvent threw. Surface the error via the shared state
+                    # hashtable ($st) -- the Start-Monitoring loop reads it + logs via
+                    # Write-DebugLog (NOT callable here: Start-ThreadJob runs in a fresh
+                    # runspace that does NOT inherit script-scope functions). Then
+                    # self-heal: dispose the dead watcher + build a FRESH
+                    # ManagementEventWatcher with the same query. A dead WMI
+                    # subscription cannot be retried on the same object -- it keeps
+                    # throwing RPC_S_SERVER_UNAVAILABLE (0x800706BA) forever (the
+                    # "RPC server failure" the user sees when explorer restarts).
+                    $errMsg = ''
+                    try { $errMsg = $_.Exception.Message } catch {}
+                    if (-not $loggedRpcErr) {
+                        $loggedRpcErr = $true
+                        try { $st.WmiErrorPending = $true; $st.LastWmiError = $errMsg } catch {}
+                    }
+                    try { $watcher.Stop() } catch {}
+                    try { $watcher.Dispose() } catch {}
+                    $consecutiveFail++
+                    if ($consecutiveFail -ge 5) {
+                        # 5 consecutive failures (re-create kept throwing too) -- give
+                        # up self-healing; break out so the ThreadJob dies + the
+                        # Start-Monitoring heartbeat sees State!=Running + re-registers.
+                        try { $st.WmiGaveUp = $true; $st.LastWmiError = $errMsg } catch {}
+                        break
+                    }
+                    try {
+                        $watcher = New-Object System.Management.ManagementEventWatcher($wmiQuery)
+                    } catch {
+                        # re-create threw -- loop will catch again + increment; the
+                        # consecutiveFail cap above eventually breaks out.
+                        Start-Sleep -Milliseconds 500
+                        continue
+                    }
+                    # Brief pause before retrying on the fresh watcher (back off a
+                    # little so a thrashing WMI service is not hammered).
                     Start-Sleep -Milliseconds 500
                 }
             }
-        } -ArgumentList $watcher, $queue, $state
+        } -ArgumentList $watcher, $queue, $state, $query
         Set-Variable -Name ProcessCreationWatcherJob -Value $job -Scope Script
         $script:ProcessCreationWatcherActive = $true
         return $true
@@ -8070,6 +8118,14 @@ function Start-Monitoring {
     $lastNewProcPoll = [datetime]::MinValue
     $lastWatcherHealthCheck = [datetime]::MinValue
     $lastWatcherBeats = 0
+    # Zombie-detection counter: consecutive 30s heartbeat intervals where Beats
+    # did NOT increment while the ThreadJob is still State=Running. >=2 means the
+    # WMI subscription died (e.g. RPC server unavailable after an explorer
+    # restart) but the ThreadJob is spinning in its catch loop instead of dying
+    # -- the heartbeat's old State!=Running check would NOT re-register it. The
+    # ThreadJob now self-heals (re-creates the watcher), but this is the
+    # belt-and-suspenders: force a re-register if it stays frozen.
+    $consecutiveZeroDelta = 0
     $isSystem = ([Environment]::UserName -eq "SYSTEM") -or (([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) -eq "S-1-5-18")
     if (-not $isSystem) {
         Write-Log -Message "Monitor is running as Administrator (not SYSTEM). Elevation blocks will be skipped; only resurrection-killer and stealth mode are active." -Type "WARN" -Color Yellow
@@ -8320,12 +8376,54 @@ function Start-Monitoring {
                 if ($script:ProcessCreationWatcherJob) {
                     try { $jobAlive = ($script:ProcessCreationWatcherJob.State -eq 'Running') } catch {}
                 }
-                if ($script:ProcessCreationWatcherActive -and -not $jobAlive) {
-                    Write-Log -Message "WMI watcher ThreadJob died (State=$($script:ProcessCreationWatcherJob.State)); re-registering for fast shell elevation (5s polling fallback remains active)." -Type "WARN" -Color Yellow
-                    Write-DebugLog -FunctionName "Start-Monitoring" -Action "WARN" -Message "Watcher ThreadJob not Running; re-registering (beatsTotal=$beatsNow)"
+                # Drain + log a pending WMI error the ThreadJob surfaced via $st
+                # (it cannot call Write-DebugLog itself -- Start-ThreadJob runs in a
+                # fresh runspace without script-scope functions). This is the
+                # "RPC server failure" the user sees when explorer restarts: the WMI
+                # event subscription died (RPC_S_SERVER_UNAVAILABLE 0x800706BA) and
+                # the ThreadJob disposed + re-created the watcher to self-heal.
+                try {
+                    if ($script:ProcessCreationWatcherState.WmiErrorPending) {
+                        $wmiErr = [string]$script:ProcessCreationWatcherState.LastWmiError
+                        $script:ProcessCreationWatcherState.WmiErrorPending = $false
+                        Write-Log -Message "WMI watcher: RPC/event error recovered (watcher re-created). Error was: $wmiErr" -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Start-Monitoring" -Action "WARN" -Message "WMI WaitForNextEvent threw (RPC server unavailable / explorer restart); ThreadJob disposed + re-created the watcher. Error: $wmiErr"
+                    }
+                    if ($script:ProcessCreationWatcherState.WmiGaveUp) {
+                        $wmiErr = [string]$script:ProcessCreationWatcherState.LastWmiError
+                        $script:ProcessCreationWatcherState.WmiGaveUp = $false
+                        Write-Log -Message "WMI watcher gave up self-healing after repeated RPC failures; re-registering. Last error: $wmiErr" -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Start-Monitoring" -Action "ERROR" -Message "WMI watcher re-create failed repeatedly; ThreadJob exited. Re-registering. Last error: $wmiErr"
+                    }
+                } catch {}
+                # Zombie detection: the job is State=Running but Beats have not
+                # incremented for >=2 consecutive 30s intervals. The WMI
+                # subscription is dead but the ThreadJob is spinning in its catch
+                # loop (the self-heal re-create is not taking) -- force a re-register
+                # which tears down the zombie job + starts a fresh watcher/ThreadJob.
+                $forceReRegister = $false
+                if ($script:ProcessCreationWatcherActive -and $jobAlive) {
+                    if ($beatsDelta -le 0) {
+                        $consecutiveZeroDelta++
+                        if ($consecutiveZeroDelta -ge 2) { $forceReRegister = $true }
+                    } else {
+                        $consecutiveZeroDelta = 0
+                    }
+                } else {
+                    $consecutiveZeroDelta = 0
+                }
+                if ($script:ProcessCreationWatcherActive -and (-not $jobAlive -or $forceReRegister)) {
+                    if ($forceReRegister) {
+                        Write-Log -Message "WMI watcher zombie detected (State=Running but no events for $([math]::Max(1,$consecutiveZeroDelta)*30)s); force re-registering for fast shell elevation (5s polling fallback remains active)." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Start-Monitoring" -Action "WARN" -Message "Watcher ThreadJob zombie (Running but Beats frozen for $($consecutiveZeroDelta * 30)s); force re-registering (beatsTotal=$beatsNow)"
+                    } else {
+                        Write-Log -Message "WMI watcher ThreadJob died (State=$($script:ProcessCreationWatcherJob.State)); re-registering for fast shell elevation (5s polling fallback remains active)." -Type "WARN" -Color Yellow
+                        Write-DebugLog -FunctionName "Start-Monitoring" -Action "WARN" -Message "Watcher ThreadJob not Running; re-registering (beatsTotal=$beatsNow)"
+                    }
+                    $consecutiveZeroDelta = 0
                     $null = Register-ProcessCreationWatcher
                 } else {
-                    Write-DebugLog -FunctionName "Start-Monitoring" -Action "INFO" -Message "Watcher heartbeat: alive=$jobAlive beatsTotal=$beatsNow beatsDelta30s=$beatsDelta queueLen=$($script:ProcessCreationQueue.Count) watcherActive=$script:ProcessCreationWatcherActive"
+                    Write-DebugLog -FunctionName "Start-Monitoring" -Action "INFO" -Message "Watcher heartbeat: alive=$jobAlive beatsTotal=$beatsNow beatsDelta30s=$beatsDelta zeroDeltaStreak=$consecutiveZeroDelta queueLen=$($script:ProcessCreationQueue.Count) watcherActive=$script:ProcessCreationWatcherActive"
                 }
             }
 
