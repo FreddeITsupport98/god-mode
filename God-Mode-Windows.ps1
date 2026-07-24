@@ -2214,37 +2214,29 @@ public class TokenOps {
                     try { activeSession = WTSGetActiveConsoleSessionId(); } catch { activeSession = 1; }
                     if (activeSession == 0xFFFFFFFF) activeSession = 1;
 
-                    // Query the duplicated token's session. A Session-0 token (sourced from
-                    // services.exe / svchost when winlogon/dwm/fontdrvhost are PPL-protected)
-                    // would birth the child ownerless in Session 0 -> empty User column, no
-                    // visible window. We MUST relocate it to the active session before launch.
-                    int tokenSession = 0;
-                    IntPtr tokenInfo = IntPtr.Zero;
-                    try {
-                        tokenInfo = Marshal.AllocHGlobal(4);
-                        int returnLength = 0;
-                        if (GetTokenInformation(hPrimaryToken, TokenSessionId, tokenInfo, 4, out returnLength)) {
-                            tokenSession = Marshal.ReadInt32(tokenInfo);
-                        }
-                    } finally {
-                        if (tokenInfo != IntPtr.Zero) Marshal.FreeHGlobal(tokenInfo);
-                    }
-
                     // SeTcbPrivilege ("Act as part of the operating system") is required for
                     // SetTokenInformation(TokenSessionId) to relocate a token across sessions.
                     // Only held when running as SYSTEM (this path is guarded by $isSystem in
                     // PowerShell). Enable it best-effort; if it is absent, relocation fails.
                     EnablePrivilege("SeTcbPrivilege");
 
-                    if (tokenSession != (int)activeSession) {
-                        int sid = (int)activeSession;
-                        if (!SetTokenInformation(hPrimaryToken, TokenSessionId, ref sid, 4)) {
-                            // Refuse ownerless birth: return a distinctive sentinel so the
-                            // PowerShell caller logs it and falls through to the service path
-                            // (Monitor-ElevateProcess Phase 2) instead of producing a broken
-                            // ownerless window (empty User column / no launch).
-                            return SESSION0_REFUSED;
-                        }
+                    // ALWAYS pin the duplicated token to the active interactive session,
+                    // even when the source token already reports activeSession.
+                    // CreateProcessWithTokenW births the child in the CALLER's session, NOT
+                    // the duplicated token's reported session -- the monitor runs in Session
+                    // 0, so without an explicit SetTokenInformation(TokenSessionId) the child
+                    // is born in Session 0 (invisible). Proven by the VM dump (Win11 26100):
+                    // 5 SYSTEM powershell.exe born in Session 0 from a Session-1 winlogon
+                    // token, because this relocate was previously SKIPPED when
+                    // tokenSession==activeSession==1. Explicitly setting TokenSessionId=
+                    // activeSession pins the child to the interactive session so it is
+                    // VISIBLE (whoami -> SYSTEM on the desktop). Requires SeTcbPrivilege
+                    // (enabled above). If it fails (SeTcb not held / blocked on a hardened
+                    // build), REFUSE (SESSION0_REFUSED) rather than birth an invisible
+                    // Session-0 shell the caller would then kill the visible admin shell for.
+                    int sid = (int)activeSession;
+                    if (!SetTokenInformation(hPrimaryToken, TokenSessionId, ref sid, 4)) {
+                        return SESSION0_REFUSED;
                     }
 
                     // Use CreateProcessWithTokenW (not CreateProcessAsUser).
@@ -7737,6 +7729,97 @@ function Invoke-GmProxyFeedbackElevation {
     }
 }
 
+function Invoke-BornAsSystemShellVisible {
+    # Born-as-SYSTEM fallback for an interactive shell that FAILED in-place
+    # elevation (Phase 0 -- NtSetInformationProcess(ProcessAccessToken) returns
+    # STATUS_NOT_SUPPORTED 0xC00000BB 100% on Win11 26100; the in-place swap API
+    # is removed). Births a NEW SYSTEM shell via CreateProcessAsSystem, which
+    # PINS the duplicated token to the active interactive session via
+    # SetTokenInformation(TokenSessionId) so CreateProcessWithTokenW births the
+    # child in the interactive session (the monitor itself runs in Session 0, and
+    # CreateProcessWithTokenW otherwise births in the CALLER's session -> an
+    # invisible Session-0 shell, proven by the VM dump: 5 SYSTEM powershell.exe
+    # born in Session 0). Then snapshots before/after PIDs to identify the new
+    # child and verifies it is SYSTEM AND in an interactive session (Session>0).
+    # ONLY then kills the OLD admin PID (targeted -- not a blanket purge). If the
+    # birth fails OR the child lands in Session 0 (invisible -- SetTokenInformation
+    # blocked on a hardened build), KILLS the invisible failed child (prevent
+    # accumulation across retry ticks) and LEAVES the visible admin shell alive
+    # (fail-stop) so the user never sees their shell vanish ('it just kills my
+    # shell'). Returns $true only when a visible SYSTEM shell replaced the admin
+    # one; $false when the admin shell was left (the drain retries on the next
+    # tick). No Phase 2 service path for shells -- a service births Session 0 too.
+    param([int]$SystemPid = 0, [string]$ShellPath, [int]$OldAdminPid = 0)
+    if (-not $ShellPath) { return $false }
+    if (-not (Test-Path $ShellPath)) {
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "ShellPath not found: $ShellPath; leaving admin PID=$OldAdminPid alive"
+        return $false
+    }
+    if (-not (Assert-TokenOpsAvailable -Caller 'Invoke-BornAsSystemShellVisible')) { return $false }
+    if ($SystemPid -le 0) { $SystemPid = Find-SystemProcessCandidate }
+    if ($SystemPid -le 0) {
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "No SYSTEM token source; leaving admin PID=$OldAdminPid alive"
+        return $false
+    }
+    Enable-ElevationPrivileges
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeIncreaseQuotaPrivilege" | Out-Null
+    Invoke-TokenOpsPrivilege -PrivilegeName "SeTcbPrivilege" | Out-Null
+    $shellBase = [System.IO.Path]::GetFileName($ShellPath)
+    # Snapshot existing PIDs of this shell exe BEFORE birth so the new child can
+    # be identified (CreateProcessAsSystem closes the child handle + discards the
+    # PID on return -- mirrors Start-SystemShell's before/after pattern).
+    $beforePids = @()
+    try { $beforePids = @(Get-CimInstance Win32_Process -Filter "Name='$shellBase'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.ProcessId }) } catch {}
+    $cmdLine = "`"$ShellPath`""
+    $result = [TokenOps]::CreateProcessAsSystem($SystemPid, $ShellPath, $cmdLine, $false)
+    if ($result -ne 0) {
+        $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsSystem"
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM CreateProcessAsSystem failed (Win32 $result) for $shellBase; leaving admin PID=$OldAdminPid alive. $errMsg"
+        return $false
+    }
+    Start-Sleep -Milliseconds 700
+    # Find the new child (a PID of this shell exe NOT in the before-snapshot) and
+    # verify it is SYSTEM AND in an interactive session (Session>0). A Session-0
+    # child is INVISIBLE (the Win11 26100 monitor-runs-in-Session-0 case when
+    # SetTokenInformation could not pin the token) -- killing the visible admin
+    # shell to keep an invisible one reproduces 'it just kills my shell'.
+    $newPid = 0
+    $newSession = -1
+    $verified = $false
+    try {
+        $afterProcs = Get-CimInstance Win32_Process -Filter "Name='$shellBase'" -ErrorAction SilentlyContinue
+        $newProc = $afterProcs | Where-Object { $beforePids -notcontains ([int]$_.ProcessId) } | Select-Object -First 1
+        if ($newProc -and $newProc.ProcessId -gt 0) {
+            $newPid = [int]$newProc.ProcessId
+            $newSession = [int]$newProc.SessionId
+            if (($newSession -gt 0) -and (Test-PidIsSystem -ProcessId $newPid)) { $verified = $true }
+        }
+    } catch {
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born child verify threw for ${shellBase}: $($_.Exception.Message)"
+    }
+    if ($verified) {
+        if ($OldAdminPid -gt 0) { Stop-Process -Id $OldAdminPid -Force -ErrorAction SilentlyContinue }
+        Write-Log -Message "Monitor elevated: $shellBase (born-as-SYSTEM, visible Session $newSession, child PID=$newPid; old admin PID=$OldAdminPid killed)" -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "EXIT" -Message "Visible SYSTEM shell born: $shellBase newPid=$newPid session=$newSession; old admin PID=$OldAdminPid killed"
+        return $true
+    } else {
+        # Birth produced an INVISIBLE (Session-0) or non-SYSTEM child, or no child
+        # was found. Kill the failed invisible child (prevent accumulation across
+        # retry ticks -- each failed Phase 1 would otherwise orphan a Session-0
+        # SYSTEM shell) but LEAVE the visible admin shell alive (fail-stop). The
+        # drain retries on the next tick; the 15s periodic scan skips shells
+        # (CriticalProcs) so no kill loop.
+        if ($newPid -gt 0) {
+            Stop-Process -Id $newPid -Force -ErrorAction SilentlyContinue
+            Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM child NOT visible-SYSTEM ($shellBase newPid=$newPid session=$newSession); killed the invisible failed child + LEFT admin PID=$OldAdminPid alive (no visible-shell kill)"
+        } else {
+            Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM produced no identifiable child for $shellBase; LEFT admin PID=$OldAdminPid alive"
+        }
+        Write-Log -Message "Monitor: born-as-SYSTEM did not yield a visible Session>0 SYSTEM shell for $shellBase (newPid=$newPid session=$newSession); left the admin shell alive. On Win11 26100 the in-place swap is removed and a Session-0 monitor cannot birth a visible Session-1 shell when SetTokenInformation(TokenSessionId) is blocked -- use menu [19] Launch Shell as SYSTEM for an on-demand visible SYSTEM shell." -Type "WARN" -Color Yellow
+        return $false
+    }
+}
+
 function Invoke-GmHookShellFeedbackElevation {
     # INSTANT interactive-shell elevation -- the gmhook birth-signal path. gmhook
     # (injected into explorer.exe + user GUI hosts) sees a shell CHILD born via
@@ -7747,10 +7830,12 @@ function Invoke-GmHookShellFeedbackElevation {
     # Start-Monitoring loop drains it here. Tries the in-place SYSTEM token swap
     # (ReplaceProcessTokenForPid) first; on Win11 26100 that returns
     # STATUS_NOT_SUPPORTED (0xC00000BB -- the in-place swap API is removed), so
-    # it falls back to born-as-SYSTEM: CreateProcessWithTokenW births a VISIBLE
-    # Session-1 SYSTEM shell (the same path gmproxy uses successfully) + kills
-    # only the old admin PID (targeted, not a blanket purge). The user loses the
-    # old admin shell's cwd/history but gets whoami -> nt authority\system.
+    # it falls back to born-as-SYSTEM via Invoke-BornAsSystemShellVisible, which
+    # PINS the token to the active interactive session (SetTokenInformation(
+    # TokenSessionId)) so the child is VISIBLE, verifies the new child is SYSTEM +
+    # Session>0, and ONLY then kills the old admin PID (targeted, not a blanket
+    # purge). If the visible birth fails, the admin shell is LEFT ALIVE (no kill)
+    # -- never the unconditional kill that birthed an invisible Session-0 shell.
     # Mirrors Monitor-ElevateProcess's interactive-shell branch safety so the
     # bootstrap + already-SYSTEM + auto-exclude guards all hold.
     param([int]$ProcessId)
@@ -7814,47 +7899,28 @@ function Invoke-GmHookShellFeedbackElevation {
         return $true
     } else {
         # Phase 0 failed (on Win11 26100, NtSetInformationProcess(ProcessAccessToken)
-        # returns STATUS_NOT_SUPPORTED 0xC00000BB 100% -- the in-place swap is
-        # removed on that build). Fall back to born-as-SYSTEM: CreateProcessWithTokenW
-        # births a VISIBLE Session-1 SYSTEM shell (the same path gmproxy uses
-        # successfully -- "Launched updater.exe as SYSTEM session=1"), then kill
-        # ONLY this admin PID (targeted, not a blanket purge -- preserves the user's
-        # other shells). The old fail-stop (return $false -> leave as admin) was
-        # based on a misdiagnosis that Phase 1 birthed invisible Session-0 shells;
-        # CreateProcessWithTokenW births in the token's session (Session 1), visible.
-        # The user loses the old admin shell's cwd/history but gets whoami -> SYSTEM.
+        # returns STATUS_NOT_SUPPORTED 0xC00000BB 100% -- the in-place swap API is
+        # removed). Fall back to a VISIBLE born-as-SYSTEM shell via the session-
+        # pinned path. Invoke-BornAsSystemShellVisible births the shell with the
+        # token PINNED to the active interactive session (SetTokenInformation(
+        # TokenSessionId)), verifies the new child is SYSTEM + Session>0 (visible),
+        # and ONLY then kills this admin PID -- so a Session-0 (invisible) birth
+        # never kills the visible admin shell (the 'it just kills my shell' symptom
+        # the unconditional kill caused). The monitor runs in Session 0; without the
+        # session pin + visible verify, CreateProcessWithTokenW births an invisible
+        # Session-0 shell (proven by the VM dump).
         $ntStatus = [TokenOps]::LastReplaceNtStatus
         $tcbErr = [TokenOps]::LastSeTcbEnableErr
         $tgtErr = [TokenOps]::LastTargetOpenErr
         $shellPath = $null
         try { $shellPath = $proc.Path } catch {}
+        Write-Log -Message "Monitor: instant in-place failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); falling back to born-as-SYSTEM (visible verify)." -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "INFO" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x('{0:X8}' -f $ntStatus)); delegating to Invoke-BornAsSystemShellVisible (visible verify + conditional kill)"
         if (-not $shellPath) {
-            Write-Log -Message "Monitor: instant in-place failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr) and the shell path could not be resolved; leaving as admin." -Type "WARN" -Color Yellow
-            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus)); no path for born-as-SYSTEM fallback; leaving as admin"
+            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "No shell path for born-as-SYSTEM fallback; leaving admin PID=$ProcessId alive"
             return $false
         }
-        Write-Log -Message "Monitor: instant in-place failed for $($proc.Name) PID=$ProcessId (NTSTATUS=0x$('{0:X8}' -f $ntStatus)); falling back to born-as-SYSTEM (visible Session-1)." -Type "WARN" -Color Yellow
-        Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "INFO" -Message "Instant in-place failed for shell PID=$ProcessId name=$($proc.Name) (NTSTATUS=0x$('{0:X8}' -f $ntStatus) SeTcbErr=$tcbErr TargetOpenErr=$tgtErr); birthing visible SYSTEM shell via CreateProcessWithTokenW + targeted kill"
-        $cmdLine = "`"$shellPath`""
-        $bResult = [TokenOps]::CreateProcessAsSystem($systemPid, $shellPath, $cmdLine, $false)
-        if ($bResult -eq 0) {
-            Start-Sleep -Milliseconds 500
-            # Targeted kill of ONLY the signaled admin PID -- NOT every non-SYSTEM
-            # sibling (would take down the user's other admin/SYSTEM shells).
-            if ($ProcessId -gt 0) { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue }
-            Write-Log -Message "Monitor elevated: $($proc.Name) PID=$ProcessId (instant birth-signal -> born-as-SYSTEM, visible Session 1; old admin PID=$ProcessId killed)" -Type "INFO" -Color Gray
-            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM success for shell PID=$ProcessId name=$($proc.Name) (old admin killed)"
-            return $true
-        } elseif ($bResult -eq [TokenOps]::SESSION0_REFUSED) {
-            Write-Log -Message "Monitor: instant born-as-SYSTEM refused (Session-0 token, no SeTcb) for $($proc.Name) PID=$ProcessId; leaving as admin (WMI/3s/15s scan will retry)." -Type "WARN" -Color Yellow
-            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM SESSION0_REFUSED for shell PID=$ProcessId name=$($proc.Name); leaving as admin"
-            return $false
-        } else {
-            $errMsg = Get-Win32ErrorRootCause -ErrorCode $bResult -Context "CreateProcessAsUser"
-            Write-Log -Message "Monitor: instant born-as-SYSTEM failed for $($proc.Name) PID=$ProcessId (Win32 error $bResult); leaving as admin (WMI/3s/15s scan will retry). $errMsg" -Type "WARN" -Color Yellow
-            Write-DebugLog -FunctionName "Invoke-GmHookShellFeedbackElevation" -Action "EXIT" -Message "Instant born-as-SYSTEM failed for shell PID=$ProcessId name=$($proc.Name) (Win32 $bResult); leaving as admin. $errMsg"
-            return $false
-        }
+        return Invoke-BornAsSystemShellVisible -SystemPid $systemPid -ShellPath $shellPath -OldAdminPid $ProcessId
     }
 }
 
@@ -8035,6 +8101,23 @@ function Monitor-ElevateProcess {
             }
         }
     }
+    # --- Interactive shells: born-as-SYSTEM VISIBLE fallback (no generic Phase
+    #     1/2). Phase 0 (in-place swap) is the only in-place path and is DEAD on
+    #     Win11 26100 (NtSetInformationProcess(ProcessAccessToken) -> STATUS_NOT_
+    #     SUPPORTED 0xC00000BB 100%). The generic Phase 1 (CreateProcessAsSystem)
+    #     + Phase 2 (service) below birth the child in the CALLER's session -- the
+    #     monitor runs in Session 0, so CreateProcessWithTokenW births an INVISIBLE
+    #     Session-0 SYSTEM shell (proven by the VM dump: 5 SYSTEM powershell.exe in
+    #     Session 0) + then kills the visible admin shell -> 'it just kills my
+    #     shell'. Invoke-BornAsSystemShellVisible PINS the token to the active
+    #     interactive session via SetTokenInformation(TokenSessionId) first, births
+    #     the shell, verifies the new child is SYSTEM + Session>0 (visible), and
+    #     ONLY then kills the old admin PID. If the visible birth fails, the admin
+    #     shell is LEFT ALIVE (fail-stop). Shells never reach the generic Phase 1/2.
+    if ($isInteractiveShell -and $isSystem) {
+        $born = Invoke-BornAsSystemShellVisible -ShellPath $Path -OldAdminPid $ProcessId
+        return $born
+    }
     # --- Phase 1: CreateProcessAsSystem (kill-relaunch fallback) ---
     if ($isSystem) {
         Enable-ElevationPrivileges
@@ -8077,20 +8160,23 @@ function Monitor-ElevateProcess {
             }
         }
     }
-    # --- Phase 2: Service-based elevation (last resort) ---
-    # Interactive shells: visible (HideWindow forced off) + targeted kill of only
-    # the failed in-place instance (same rationale as Phase 1 -- never purge the
-    # user's other admin/SYSTEM shells).
-    $svcHidden = [bool]$HideWindow -and -not $isInteractiveShell
+    # --- Phase 2: Service-based elevation (last resort, NON-SHELLS only) ---
+    # A service births the process in Session 0 (LocalSystem service) -- invisible
+    # for an interactive shell + the purge below would take the visible admin shell
+    # -> 'it just kills my shell'. Interactive shells are handled by the
+    # born-as-SYSTEM visible fallback above (Session-pinned) and never reach here;
+    # guard anyway so an admin-monitor (non-SYSTEM) shell never hits the service
+    # kill path (it cannot elevate a shell regardless).
+    if ($isInteractiveShell) {
+        Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Interactive shell $procName PID=${ProcessId}: no visible SYSTEM birth available (monitor not SYSTEM or born-as-SYSTEM visible failed); leaving as admin"
+        return $false
+    }
+    $svcHidden = [bool]$HideWindow
     $elevated = Start-ProcessWithService -Path $Path -Arguments $Arguments -HideWindow:$svcHidden
     if ($elevated) {
         Start-Sleep -Milliseconds 500
-        if ($isInteractiveShell) {
-            if ($ProcessId -gt 0) { Stop-Process -Id $ProcessId -Force -ErrorAction SilentlyContinue }
-        } else {
-            # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
-            Stop-NonSystemInstances -ProcessName "$procName.exe"
-        }
+        # After spawning SYSTEM, purge any Administrator/user duplicates so only SYSTEM remains
+        Stop-NonSystemInstances -ProcessName "$procName.exe"
         Write-Log -Message "Monitor elevated: $procName (service + purge)" -Type "INFO" -Color Gray
         Write-DebugLog -FunctionName "Monitor-ElevateProcess" -Action "EXIT" -Message "Success for $procName"
     } else {
