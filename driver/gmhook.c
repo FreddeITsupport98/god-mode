@@ -714,41 +714,120 @@ static BOOL WINAPI HookCreateProcessW(
         if (slash) baseName = slash + 1;
     }
 
-    /* Pass through critical OS processes AND shell/launcher hosts untouched.
-       Hooking pwsh/powershell/cmd in-process is what caused the 0xC0000005
-       access violation inside Kernel32.CreateProcess (PowerShell launches
-       native commands via CreateProcessW as its core job, and rerouting
-       those calls through the stolen-token CreateProcessWithTokenW path
-       destabilizes the host). Terminals host those shells, so they are
-       excluded too. explorer.exe is excluded here too: it launches shell
-       apps with STARTUPINFOEX and the TryCreateProcessWithSystemToken
-       STARTUPINFOEX -> plain STARTUPINFOW DOWNGRADE drops the caller's
-       extended attribute list, crashing explorer on its next CreateProcessW
-       -> the repeated explorer.exe crash/restart loop (blank User column
-       alongside the live monitor loop missing). These hosts are still
-       elevated to SYSTEM by the task / service path in God-Mode-Windows.ps1;
-       they are simply not IAT-hooked. */
-    if (IsCriticalProcess(baseName) || IsShellLauncherProcess(baseName)) {
+    /* Critical OS processes are NEVER touched (passthrough to the real
+       CreateProcessW). Shell/launcher HOSTS and interactive shells are split
+       below: interactive shells (cmd/powershell/pwsh/ISE) are now BORN AS
+       SYSTEM directly in THIS session (see the IsInteractiveShell branch),
+       while the remaining launcher hosts (wt/conhost/explorer) still
+       passthrough (birthing those as SYSTEM breaks the desktop/taskbar).
+       Hooking a shell IN-PROCESS (gmhook injected into pwsh.exe and rerouting
+       ITS CreateProcessW) caused the 0xC0000005 inside Kernel32.CreateProcess
+       -- but gmhook is never injected into shells (IsShellLauncherProcess is
+       excluded from injection), so the host here is always a non-shell
+       (explorer / GUI app) and birthing a shell TARGET as SYSTEM from it is
+       safe. */
+    if (IsCriticalProcess(baseName)) {
         if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
             result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
                 lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
                 lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
         }
-        /* Instant shell elevation birth-signal: when a hooked host (typically
-           explorer.exe) launches an INTERACTIVE shell (cmd/powershell/pwsh/ISE),
-           signal its PID to the SYSTEM monitor (SHELLPID=<n> over the
-           GodMode-GmProxyFeedback pipe) so the monitor in-place swaps its token
-           to SYSTEM within ~ms, instead of waiting for the 3s/15s scan. Only the
-           4 interactive shells -- NOT explorer/wt/conhost (swapping those to
-           SYSTEM breaks the desktop/taskbar) and NOT critical OS. The real
-           CreateProcessW above already succeeded (the shell is born, visible,
-           correct session/cwd/history); SignalShellBirth is non-blocking +
-           fail-open so a missing monitor / pipe error never affects the launch
-           (the periodic scan remains the fallback). gmhook does NOT elevate the
-           shell itself (no SeTcb; rerouting its CreateProcessW crashes it). */
-        if (result && IsInteractiveShell(baseName) && lpProcessInformation &&
-            lpProcessInformation->dwProcessId != 0) {
+        InterlockedExchange(&inHook, 0);
+        return result;
+    }
+
+    /* Interactive shells (cmd/powershell/pwsh/ISE) -> BORN AS SYSTEM directly
+       in THIS session. The hooked host (explorer / a GUI app) runs in the
+       interactive Session 1, so CreateProcessWithTokenW births the shell in
+       Session 1 -> VISIBLE + SYSTEM (whoami -> nt authority\system). This
+       replaces the monitor's born-as-SYSTEM fallback, which is INVISIBLE on
+       Win11 26100 because the monitor runs in Session 0 and
+       CreateProcessWithTokenW births in the CALLER's session (proven by the
+       VM dump: 5 SYSTEM powershell.exe born Session 0, killed as invisible).
+       The host's lpCurrentDirectory flows through so the SYSTEM shell opens in
+       the folder the user chose. Env parity: when the host did not pass an
+       explicit env block, use the host's env (explorer's env = the USER's env)
+       via GetEnvironmentStringsW so the SYSTEM shell inherits %USERPROFILE%/
+       %PATH% instead of SYSTEM's System32 profile. Falls back to the real
+       CreateProcessW (normal USER shell -- visible, correct cwd) +
+       SignalShellBirth if the SYSTEM birth fails (no SYSTEM donor / seclogon
+       down / token-path fault) so the shell is at least launched and the
+       monitor retries in-place. Never kills the visible user shell. */
+    if (IsInteractiveShell(baseName)) {
+        CreateProcessWithTokenW_t pCpwt = ResolveCreateProcessWithTokenW();
+        if (pCpwt && pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            if (!gSystemToken) {
+                EnablePrivilege(L"SeDebugPrivilege");
+                EnablePrivilege(L"SeImpersonatePrivilege");
+                PrepareSystemToken();
+            }
+            if (gSystemToken) {
+                /* Env parity: inherit the host's (user's) env when the caller
+                   passed none. GetEnvironmentStringsW is unicode -> set
+                   CREATE_UNICODE_ENVIRONMENT. Freed after the birth. */
+                LPVOID envToPass = lpEnvironment;
+                BOOL freeEnv = FALSE;
+                DWORD shellFlags = dwCreationFlags;
+                if (!envToPass) {
+                    envToPass = (LPVOID)GetEnvironmentStringsW();
+                    if (envToPass) { freeEnv = TRUE; shellFlags |= 0x00000400u; /* CREATE_UNICODE_ENVIRONMENT */ }
+                }
+                BOOL tokOk = FALSE;
+#ifdef _MSC_VER
+                __try {
+                    tokOk = TryCreateProcessWithSystemToken(pCpwt, lpApplicationName, lpCommandLine,
+                        shellFlags, envToPass, lpCurrentDirectory, lpStartupInfo,
+                        lpProcessInformation);
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    tokOk = FALSE;
+                }
+#else
+                /* MinGW: no portable __try/__except (see the general-app path
+                   below for the rationale). The deterministic STARTUPINFO
+                   validation inside TryCreateProcessWithSystemToken is the
+                   actual 0xC0000005 fix; the SEH above is defense-in-depth. */
+                tokOk = TryCreateProcessWithSystemToken(pCpwt, lpApplicationName, lpCommandLine,
+                    shellFlags, envToPass, lpCurrentDirectory, lpStartupInfo,
+                    lpProcessInformation);
+#endif
+                if (freeEnv) FreeEnvironmentStringsW((LPWCH)envToPass);
+                if (tokOk) {
+                    /* Born as SYSTEM, visible, Session 1, correct cwd. Signal
+                       so the monitor sees it is already SYSTEM (it skips the
+                       redundant in-place swap via Test-PidIsSystem). */
+                    if (lpProcessInformation && lpProcessInformation->dwProcessId != 0) {
+                        SignalShellBirth(lpProcessInformation->dwProcessId);
+                    }
+                    InterlockedExchange(&inHook, 0);
+                    return TRUE;
+                }
+            }
+        }
+        /* SYSTEM birth failed -> normal USER birth (visible, correct cwd) +
+           signal so the monitor retries in-place. The shell is launched
+           regardless; never vanishes. */
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
+        }
+        if (result && lpProcessInformation && lpProcessInformation->dwProcessId != 0) {
             SignalShellBirth(lpProcessInformation->dwProcessId);
+        }
+        InterlockedExchange(&inHook, 0);
+        return result;
+    }
+
+    /* Other launcher hosts (wt/conhost/OpenConsole/WindowsTerminal/explorer)
+       passthrough untouched: birthing these as SYSTEM breaks the desktop /
+       taskbar / console association. They are still elevated to SYSTEM by the
+       task / service path in God-Mode-Windows.ps1; they are simply not
+       IAT-hooked in-process. */
+    if (IsShellLauncherProcess(baseName)) {
+        if (pOrigCreateProcessW && pOrigCreateProcessW != HookCreateProcessW) {
+            result = pOrigCreateProcessW(lpApplicationName, lpCommandLine, lpProcessAttributes,
+                lpThreadAttributes, bInheritHandles, dwCreationFlags, lpEnvironment,
+                lpCurrentDirectory, lpStartupInfo, lpProcessInformation);
         }
         InterlockedExchange(&inHook, 0);
         return result;

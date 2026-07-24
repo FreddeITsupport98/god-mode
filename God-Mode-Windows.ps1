@@ -7906,6 +7906,17 @@ function Invoke-GmProxyFeedbackElevation {
 # guard needed (mirrors $script:CachedSystemPid).
 $script:BornShellContextCache = @{}
 
+# Session-0-blocked set (2026-07-24): when the monitor's born-as-SYSTEM fallback
+# yields an INVISIBLE Session-0 child (the monitor runs in Session 0 and
+# CreateProcessWithTokenW births in the caller's session -> invisible on Win11
+# 26100, proven by the dump: newPid session=0), recording the OldAdminPid here
+# prevents the drain from spawning + killing another invisible Session-0 shell
+# on EVERY retry tick for the same admin shell. The admin shell is already alive
+# (visible, as admin) from gmhook's fallback user-birth, so the user keeps a
+# working shell; the next launch is caught by gmhook's direct Session-1 SYSTEM
+# birth. 30s TTL so a recycled PID is retried. Single-threaded monitor drain.
+$script:Session0BlockedPids = @{}
+
 function Invoke-BornAsSystemShellVisible {
     # Born-as-SYSTEM fallback for an interactive shell that FAILED in-place
     # elevation (Phase 0 -- NtSetInformationProcess(ProcessAccessToken) returns
@@ -7944,6 +7955,26 @@ function Invoke-BornAsSystemShellVisible {
     if (-not (Test-Path $ShellPath)) {
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "ShellPath not found: $ShellPath; leaving admin PID=$OldAdminPid alive"
         return $false
+    }
+    # Session-0-blocked short-circuit: if a PREVIOUS birth for this OldAdminPid
+    # yielded an invisible Session-0 child, do NOT keep spawning + killing
+    # invisible Session-0 shells every retry tick. The monitor runs in Session 0
+    # and CreateProcessWithTokenW births in the caller's session, so a Session-0
+    # monitor CANNOT birth a visible Session-1 shell on Win11 26100 (the dump
+    # proves it: every born-as-SYSTEM child lands session=0). The admin shell is
+    # already alive (visible, as admin) from gmhook's fallback user-birth; leave
+    # it and return $false. The next launch is caught by gmhook's direct
+    # Session-1 SYSTEM birth (visible). 30s TTL so a recycled PID is retried.
+    if ($OldAdminPid -gt 0) {
+        $now = [int](Get-Date -UFormat %s)
+        if ($script:Session0BlockedPids.ContainsKey($OldAdminPid)) {
+            if (($now - $script:Session0BlockedPids[$OldAdminPid]) -gt 30) {
+                $script:Session0BlockedPids.Remove($OldAdminPid)
+            } else {
+                Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "SKIP" -Message "OldAdminPid=$OldAdminPid is Session-0-blocked (prior born-as-SYSTEM was invisible); leaving admin alive, no re-birth (gmhook will birth a visible SYSTEM shell on the next launch)"
+                return $false
+            }
+        }
     }
     if (-not (Assert-TokenOpsAvailable -Caller 'Invoke-BornAsSystemShellVisible')) { return $false }
     if ($SystemPid -le 0) { $SystemPid = Find-SystemProcessCandidate }
@@ -8044,7 +8075,12 @@ function Invoke-BornAsSystemShellVisible {
         # (CriticalProcs) so no kill loop.
         if ($newPid -gt 0) {
             Stop-Process -Id $newPid -Force -ErrorAction SilentlyContinue
-            Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM child NOT visible-SYSTEM ($shellBase newPid=$newPid session=$newSession); killed the invisible failed child + LEFT admin PID=$OldAdminPid alive (no visible-shell kill)"
+            # Record this OldAdminPid as Session-0-blocked so the next retry tick
+            # does NOT spawn + kill another invisible Session-0 shell for it. The
+            # admin shell is left alive (visible); gmhook's direct Session-1
+            # SYSTEM birth handles the next launch. 30s TTL (enforced at the top).
+            if ($OldAdminPid -gt 0) { $script:Session0BlockedPids[$OldAdminPid] = [int](Get-Date -UFormat %s) }
+            Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM child NOT visible-SYSTEM ($shellBase newPid=$newPid session=$newSession); killed the invisible failed child + LEFT admin PID=$OldAdminPid alive (no visible-shell kill); marked Session-0-blocked so the next tick skips re-birthing"
         } else {
             Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM produced no identifiable child for $shellBase; LEFT admin PID=$OldAdminPid alive"
         }

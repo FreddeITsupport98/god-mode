@@ -79,8 +79,16 @@ if (Test-Path $GmHook) {
         ($hookSrc -match 'L"powershell\.exe"') "powershell.exe not in shell exclusion list"
     Add-Assertion "gmhook.c: cmd.exe excluded from hooking" `
         ($hookSrc -match 'L"cmd\.exe"') "cmd.exe not in shell exclusion list"
-    Add-Assertion "gmhook.c: HookCreateProcessW uses shell exclusion" `
-        ($hookSrc -match 'IsCriticalProcess\(baseName\)\s*\|\|\s*IsShellLauncherProcess\(baseName\)') "HookCreateProcessW does not OR IsShellLauncherProcess"
+    # Shell/launcher HOSTS are still excluded from INJECTION (GetMsgProc/DllMain
+    # skip-list below -- the actual 0xC0000005 fix: never IAT-hook a shell in-
+    # process). HookCreateProcessW now SPLITS the old combined passthrough:
+    # critical OS -> passthrough; interactive shells (cmd/powershell/pwsh/ISE) ->
+    # BORN AS SYSTEM in the host's Session 1 (visible); other launcher hosts
+    # (wt/conhost/explorer) -> passthrough (birthing those as SYSTEM breaks the
+    # desktop). Both exclusion branches must remain so critical + launcher hosts
+    # are never born as SYSTEM via the generic token path.
+    Add-Assertion "gmhook.c: HookCreateProcessW excludes critical OS + launcher hosts from SYSTEM birth (separate IsCriticalProcess + IsShellLauncherProcess branches)" `
+        ($hookSrc -match 'if \(IsCriticalProcess\(baseName\)\) \{' -and $hookSrc -match 'if \(IsShellLauncherProcess\(baseName\)\) \{') "HookCreateProcessW no longer has separate critical + launcher-host passthrough branches -- the desktop/taskbar/critical OS could be born as SYSTEM"
     Add-Assertion "gmhook.c: auto-install sites use shell exclusion (GetMsgProc/DllMain)" `
         ($hookSrc -match '!IsCriticalProcess\(baseName\)\s*&&\s*!IsShellLauncherProcess\(baseName\)') "GetMsgProc/DllMain do not AND IsShellLauncherProcess"
     Add-Assertion "gmhook.c: recursion guard resets on re-entry return" `
