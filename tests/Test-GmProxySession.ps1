@@ -1338,4 +1338,29 @@ if ($vbsMatch.Success) {
 Add-Assertion "VisShell: CreateProcessAsSystem ALWAYS relocates the token to the active session (SetTokenInformation unconditional, no skip-on-equal)" ($gm -match 'int sid = \(int\)activeSession;\s*\n\s*if \(!SetTokenInformation\(hPrimaryToken, TokenSessionId, ref sid, 4\)\)') "CreateProcessAsSystem still skips SetTokenInformation when tokenSession==activeSession -- the child is born in the caller's Session 0 (invisible)"
 Add-Assertion "VisShell: CreateProcessAsSystem no longer conditions relocate on tokenSession!=activeSession (old conditional GONE)" (-not ($gm -match 'if \(tokenSession != \(int\)activeSession\) \{')) "CreateProcessAsSystem still conditions the relocate on tokenSession!=activeSession -- a Session-1 token from a Session-0 monitor still births Session 0 (the dump's 5 invisible SYSTEM shells)"
 
+# Part F2 -- working-directory preservation for the born-as-SYSTEM shell fallback
+# (2026-07-24). Without this the new SYSTEM shell opens in the MONITOR's cwd
+# (C:\Windows\System32 -- the monitor runs as SYSTEM in Session 0) instead of
+# the folder the user was in, disorienting them after the swap. Fix: a new C#
+# TokenOps.GetProcessWorkingDirectory reads the old admin shell's cwd directly
+# from its PEB (x64 offsets: PEB->ProcessParameters=0x20, CurrentDirectoryPath
+# UNICODE_STRING at 0x38, Buffer at 0x40) via ReadProcessMemory, and the helper
+# passes it as lpCurrentDirectory to CreateProcessWithTokenW. Best-effort +
+# fail-open: null on x86 / non-positive pid / blocked VM_READ / PPL -> the new
+# shell falls back to a system default dir (launch still succeeds). Additive.
+Add-Assertion "CwdPreserve: TokenOps.GetProcessWorkingDirectory defined (PEB cwd read for the born-as-SYSTEM swap)" ($gm -match 'public static string GetProcessWorkingDirectory\(int pid\)') "GetProcessWorkingDirectory missing -- the born-as-SYSTEM shell cannot inherit the old admin shell's cwd"
+Add-Assertion "CwdPreserve: GetProcessWorkingDirectory is x64-only (fails open on x86 -- IntPtr.Size != 8 returns null)" ($gm -match 'public static string GetProcessWorkingDirectory\(int pid\)[\s\S]{0,200}?if \(IntPtr\.Size != 8\) return null;') "GetProcessWorkingDirectory is not x64-guarded -- x86 PEB offsets differ and would read garbage / throw"
+Add-Assertion "CwdPreserve: GetProcessWorkingDirectory rejects non-positive pid (fail-open null)" ($gm -match 'public static string GetProcessWorkingDirectory\(int pid\)[\s\S]{0,200}?if \(pid <= 0\) return null;') "GetProcessWorkingDirectory does not guard pid<=0 -- an invalid pid would be passed to OpenProcess"
+Add-Assertion "CwdPreserve: GetProcessWorkingDirectory reads the PEB CurrentDirectoryPath (ProcessParameters 0x20 + UNICODE_STRING 0x38/0x40)" ($gm.Contains('peb.ToInt64() + 0x20') -and $gm.Contains('procParams.ToInt64() + 0x38') -and $gm.Contains('procParams.ToInt64() + 0x40')) "GetProcessWorkingDirectory does not read the PEB CurrentDirectoryPath -- the cwd cannot be recovered from the old admin shell"
+Add-Assertion "CwdPreserve: GetProcessWorkingDirectory uses ReadProcessMemory + NtQueryInformationProcess (remote PEB walk)" ($gm -match 'DllImport\("kernel32\.dll"' -and $gm -match 'public static extern bool ReadProcessMemory' -and $gm -match 'DllImport\("ntdll\.dll"' -and $gm -match 'public static extern int NtQueryInformationProcess') "GetProcessWorkingDirectory lacks ReadProcessMemory/NtQueryInformationProcess -- it cannot walk a remote process's PEB"
+Add-Assertion "CwdPreserve: GetProcessWorkingDirectory is best-effort + fail-open (whole body wrapped in try/catch returning null)" ($gm -match 'public static string GetProcessWorkingDirectory\(int pid\)[\s\S]{0,4000}?\} catch \{\s*\n\s*return null;') "GetProcessWorkingDirectory is not fail-open -- a PPL target or blocked VM_READ would throw out of CreateProcessAsSystem and abort the launch"
+Add-Assertion "CwdPreserve: CreateProcessAsSystem accepts a workingDirectory param (lpCurrentDirectory for CreateProcessWithTokenW)" ($gm -match 'public static int CreateProcessAsSystem\(int pid, string appName, string cmdLine, bool hideWindow, string workingDirectory = null\)') "CreateProcessAsSystem does not accept a workingDirectory param -- the new SYSTEM shell cwd cannot be set"
+Add-Assertion "CwdPreserve: CreateProcessAsSystem passes workingDirectory through to CreateProcessWithTokenW (not a hardcoded null)" ($gm -match 'CreateProcessWithTokenW\(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, IntPtr\.Zero, workingDirectory,') "CreateProcessAsSystem does not pass workingDirectory to CreateProcessWithTokenW -- the new shell ignores the preserved cwd"
+if ($vbsMatch.Success) {
+    Add-Assertion "CwdPreserve: helper reads the old admin cwd via GetProcessWorkingDirectory (before birth)" ($vbsBody -match '\[TokenOps\]::GetProcessWorkingDirectory\(\$OldAdminPid\)') "helper does not read the old admin cwd -- the new SYSTEM shell cannot inherit the user's folder"
+    Add-Assertion "CwdPreserve: helper passes the preserved cwd as the 5th arg to CreateProcessAsSystem (workingDirectory)" ($vbsBody -match '\[TokenOps\]::CreateProcessAsSystem\(\$SystemPid, \$ShellPath, \$cmdLine, \$false, \$preserveCwd\)') "helper does not pass the preserved cwd to CreateProcessAsSystem -- the new SYSTEM shell falls back to System32"
+    Add-Assertion "CwdPreserve: helper guards the cwd read on OldAdminPid>0 (no OpenProcess on a missing pid)" ($vbsBody -match 'if \(\$OldAdminPid -gt 0\) \{[\s\S]{0,200}?GetProcessWorkingDirectory\(\$OldAdminPid\)') "helper reads the cwd without guarding OldAdminPid>0 -- a zero pid would be passed to OpenProcess"
+    Add-Assertion "CwdPreserve: helper logs whether a cwd was preserved (diagnostic for fail-open fallback)" ($vbsBody.Contains('Preserving old admin') -or $vbsBody.Contains('No cwd preserved')) "helper does not log the cwd-preservation outcome -- a fail-open to System32 is invisible in the dump"
+}
+
 Write-Summary

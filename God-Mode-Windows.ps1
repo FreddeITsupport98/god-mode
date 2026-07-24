@@ -2185,7 +2185,7 @@ public class TokenOps {
         ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    public static int CreateProcessAsSystem(int pid, string appName, string cmdLine, bool hideWindow) {
+    public static int CreateProcessAsSystem(int pid, string appName, string cmdLine, bool hideWindow, string workingDirectory = null) {
         IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
         if (hProcess == IntPtr.Zero) return Marshal.GetLastWin32Error();
         try {
@@ -2267,7 +2267,7 @@ public class TokenOps {
                     uint creationFlags = CREATE_UNICODE_ENVIRONMENT;
                     if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
                     else creationFlags |= CREATE_NEW_CONSOLE;
-                    if (!CreateProcessWithTokenW(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, IntPtr.Zero, null, ref si, out pi)) {
+                    if (!CreateProcessWithTokenW(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, IntPtr.Zero, workingDirectory, ref si, out pi)) {
                         return Marshal.GetLastWin32Error();
                     }
                     CloseHandle(pi.hProcess);
@@ -2318,6 +2318,87 @@ public class TokenOps {
             }
         } finally {
             CloseHandle(hProcess);
+        }
+    }
+
+    // --- Best-effort remote working-directory read (2026-07-24). When the born-
+    //     as-SYSTEM shell fallback replaces the user's admin shell, the new SYSTEM
+    //     shell would otherwise open in the MONITOR's cwd (C:\Windows\System32 --
+    //     the monitor runs as SYSTEM in Session 0) instead of the folder the user
+    //     was in. This reads the target (old admin shell) process's current
+    //     directory directly from its PEB so the new SYSTEM shell can be launched
+    //     with the SAME lpCurrentDirectory (CreateProcessWithTokenW) -- a seamless
+    //     swap. x64-only (God Mode targets x64); the PEB + RTL_USER_PROCESS_
+    //     PARAMETERS offsets (PEB->ProcessParameters=0x20, CurrentDirectoryPath
+    //     UNICODE_STRING=0x38, Buffer=0x40) are the stable x64 Win10/11 layout used
+    //     by Process Hacker et al. Best-effort + fail-open: returns null on ANY
+    //     failure (x86, PPL target, blocked VM_READ, bad offset, partial read) so
+    //     the caller falls back to a default dir -- never breaks the launch.
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool ReadProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, [Out] byte[] lpBuffer, IntPtr nSize, out IntPtr lpNumberOfBytesRead);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    public static extern int NtQueryInformationProcess(IntPtr ProcessHandle, int ProcessInformationClass, IntPtr ProcessInformation, int ProcessInformationLength, out int ReturnLength);
+
+    private static IntPtr ReadRemoteIntPtr(IntPtr hProc, IntPtr addr) {
+        if (addr == IntPtr.Zero) return IntPtr.Zero;
+        byte[] b = new byte[8];
+        IntPtr got = IntPtr.Zero;
+        if (!ReadProcessMemory(hProc, addr, b, (IntPtr)8, out got) || got.ToInt64() != 8) return IntPtr.Zero;
+        return new IntPtr(BitConverter.ToInt64(b, 0));
+    }
+
+    private static short ReadRemoteInt16(IntPtr hProc, IntPtr addr) {
+        if (addr == IntPtr.Zero) return 0;
+        byte[] b = new byte[2];
+        IntPtr got = IntPtr.Zero;
+        if (!ReadProcessMemory(hProc, addr, b, (IntPtr)2, out got) || got.ToInt64() != 2) return 0;
+        return BitConverter.ToInt16(b, 0);
+    }
+
+    public static string GetProcessWorkingDirectory(int pid) {
+        if (IntPtr.Size != 8) return null; // x64 PEB offsets only -- fail-open on x86
+        if (pid <= 0) return null;
+        try {
+            const uint PROCESS_VM_READ = 0x0010;
+            const uint PROCESS_QUERY_INFORMATION = 0x0400;
+            const int ProcessBasicInformation = 0;
+            IntPtr hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
+            if (hProc == IntPtr.Zero) return null;
+            try {
+                // PROCESS_BASIC_INFORMATION is 48 bytes on x64; PebBaseAddress sits at
+                // offset 8 (after the 4-byte ExitStatus + 4 bytes alignment padding).
+                IntPtr pbi = Marshal.AllocHGlobal(48);
+                try {
+                    int retLen = 0;
+                    if (NtQueryInformationProcess(hProc, ProcessBasicInformation, pbi, 48, out retLen) != 0) return null;
+                    IntPtr peb = Marshal.ReadIntPtr(pbi, 8); // PebBaseAddress (in our buffer)
+                    if (peb == IntPtr.Zero) return null;
+                    // PEB->ProcessParameters (x64 offset 0x20) -> RTL_USER_PROCESS_PARAMETERS*
+                    IntPtr procParams = ReadRemoteIntPtr(hProc, new IntPtr(peb.ToInt64() + 0x20));
+                    if (procParams == IntPtr.Zero) return null;
+                    // CurrentDirectoryPath is a UNICODE_STRING at offset 0x38: Length (USHORT,
+                    // bytes) at 0x38, Buffer pointer at 0x40. Read Length first, then Buffer.
+                    short lenBytes = ReadRemoteInt16(hProc, new IntPtr(procParams.ToInt64() + 0x38));
+                    IntPtr bufPtr = ReadRemoteIntPtr(hProc, new IntPtr(procParams.ToInt64() + 0x40));
+                    if (bufPtr == IntPtr.Zero || lenBytes <= 0) return null;
+                    int len = lenBytes;
+                    if (len > 2048) len = 2048; // sanity cap (a path is at most ~520 bytes)
+                    byte[] raw = new byte[len];
+                    IntPtr got = IntPtr.Zero;
+                    if (!ReadProcessMemory(hProc, bufPtr, raw, (IntPtr)len, out got)) return null;
+                    int n = got.ToInt32();
+                    if (n <= 0) return null;
+                    if (n < len) { byte[] t = new byte[n]; Array.Copy(raw, t, n); raw = t; }
+                    return System.Text.Encoding.Unicode.GetString(raw).TrimEnd('\0');
+                } finally {
+                    Marshal.FreeHGlobal(pbi);
+                }
+            } finally {
+                CloseHandle(hProc);
+            }
+        } catch {
+            return null; // best-effort: any failure -> caller falls back to a default dir
         }
     }
 
@@ -7749,6 +7830,13 @@ function Invoke-BornAsSystemShellVisible {
     # shell'). Returns $true only when a visible SYSTEM shell replaced the admin
     # one; $false when the admin shell was left (the drain retries on the next
     # tick). No Phase 2 service path for shells -- a service births Session 0 too.
+    # Working-directory preservation: reads the OLD admin shell's cwd from its PEB
+    # (TokenOps.GetProcessWorkingDirectory -- best-effort x64 PEB read) and passes
+    # it as lpCurrentDirectory to CreateProcessWithTokenW so the new SYSTEM shell
+    # opens in the SAME folder the user was in, instead of the monitor's
+    # C:\Windows\System32 (the monitor runs as SYSTEM in Session 0). Fail-open:
+    # if the PEB read returns null (x86, PPL target, blocked VM_READ), the new
+    # shell falls back to a system default dir -- the launch still succeeds.
     param([int]$SystemPid = 0, [string]$ShellPath, [int]$OldAdminPid = 0)
     if (-not $ShellPath) { return $false }
     if (-not (Test-Path $ShellPath)) {
@@ -7771,7 +7859,24 @@ function Invoke-BornAsSystemShellVisible {
     $beforePids = @()
     try { $beforePids = @(Get-CimInstance Win32_Process -Filter "Name='$shellBase'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.ProcessId }) } catch {}
     $cmdLine = "`"$ShellPath`""
-    $result = [TokenOps]::CreateProcessAsSystem($SystemPid, $ShellPath, $cmdLine, $false)
+    # Preserve the old admin shell's working directory: read it directly from the
+    # process PEB (TokenOps.GetProcessWorkingDirectory) so the new SYSTEM shell
+    # opens in the same folder the user was in. The monitor runs as SYSTEM in
+    # Session 0 (cwd C:\Windows\System32); without this the born shell would land
+    # in System32 -- disorienting the user. Best-effort + fail-open: null is
+    # passed through to CreateProcessWithTokenW, which then uses the system
+    # default (System32) -- the launch still succeeds. Read BEFORE the birth so
+    # the old PID is still queryable.
+    $preserveCwd = $null
+    if ($OldAdminPid -gt 0) {
+        try { $preserveCwd = [TokenOps]::GetProcessWorkingDirectory($OldAdminPid) } catch { $preserveCwd = $null }
+    }
+    if ($preserveCwd) {
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "Preserving old admin PID=$OldAdminPid cwd for new SYSTEM shell: $preserveCwd"
+    } else {
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "No cwd preserved for new SYSTEM shell (OldAdminPid=$OldAdminPid unreadable or null); new shell falls back to system default dir"
+    }
+    $result = [TokenOps]::CreateProcessAsSystem($SystemPid, $ShellPath, $cmdLine, $false, $preserveCwd)
     if ($result -ne 0) {
         $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsSystem"
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM CreateProcessAsSystem failed (Win32 $result) for $shellBase; leaving admin PID=$OldAdminPid alive. $errMsg"
