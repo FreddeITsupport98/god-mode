@@ -2185,7 +2185,7 @@ public class TokenOps {
         ref STARTUPINFO lpStartupInfo,
         out PROCESS_INFORMATION lpProcessInformation);
 
-    public static int CreateProcessAsSystem(int pid, string appName, string cmdLine, bool hideWindow, string workingDirectory = null) {
+    public static int CreateProcessAsSystem(int pid, string appName, string cmdLine, bool hideWindow, string workingDirectory = null, byte[] environmentBlock = null) {
         IntPtr hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
         if (hProcess == IntPtr.Zero) return Marshal.GetLastWin32Error();
         try {
@@ -2267,8 +2267,24 @@ public class TokenOps {
                     uint creationFlags = CREATE_UNICODE_ENVIRONMENT;
                     if (hideWindow) creationFlags |= CREATE_NO_WINDOW;
                     else creationFlags |= CREATE_NEW_CONSOLE;
-                    if (!CreateProcessWithTokenW(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, IntPtr.Zero, workingDirectory, ref si, out pi)) {
-                        return Marshal.GetLastWin32Error();
+                    // Pin the preserved environment block for the duration of the
+                    // CreateProcessWithTokenW call: lpEnvironment is an IntPtr to a raw
+                    // CREATE_UNICODE_ENVIRONMENT block (already unicode + double-null
+                    // terminated by ReadRemoteShellContext). Null/empty -> IntPtr.Zero
+                    // -> CreateProcessWithTokenW uses the token's default env.
+                    // CREATE_UNICODE_ENVIRONMENT is already OR'd into creationFlags.
+                    GCHandle envPin = new GCHandle();
+                    IntPtr envPtr = IntPtr.Zero;
+                    try {
+                        if (environmentBlock != null && environmentBlock.Length > 0) {
+                            envPin = GCHandle.Alloc(environmentBlock, GCHandleType.Pinned);
+                            envPtr = envPin.AddrOfPinnedObject();
+                        }
+                        if (!CreateProcessWithTokenW(hPrimaryToken, LOGON_WITH_PROFILE, appName, cmdLine, creationFlags, envPtr, workingDirectory, ref si, out pi)) {
+                            return Marshal.GetLastWin32Error();
+                        }
+                    } finally {
+                        if (envPin.IsAllocated) envPin.Free();
                     }
                     CloseHandle(pi.hProcess);
                     CloseHandle(pi.hThread);
@@ -2356,47 +2372,116 @@ public class TokenOps {
         return BitConverter.ToInt16(b, 0);
     }
 
-    public static string GetProcessWorkingDirectory(int pid) {
-        if (IntPtr.Size != 8) return null; // x64 PEB offsets only -- fail-open on x86
-        if (pid <= 0) return null;
+    // ShellContext: cwd + raw unicode environment block recovered from a remote
+    // process's PEB in ONE walk. Both fields are best-effort + fail-open (null on
+    // any read failure) so the caller can pass them straight to
+    // CreateProcessWithTokenW (lpCurrentDirectory + lpEnvironment) and fall back
+    // to defaults where a field could not be recovered.
+    public struct ShellContext {
+        public string Cwd;
+        public byte[] Environment; // raw CREATE_UNICODE_ENVIRONMENT block (double-null terminated); null = unreadable
+    }
+
+    // ONE PEB walk resolves BOTH the current directory (CurrentDirectoryPath at
+    // 0x38/0x40) AND the environment block (Environment pointer at 0x80). Doing
+    // both in a single OpenProcess + NtQueryInformationProcess + PEB-resolution
+    // avoids a second full remote-read round-trip when the born-as-SYSTEM fallback
+    // needs cwd + env together. x64-only; fail-open (empty struct on any failure).
+    public static ShellContext GetProcessShellContext(int pid) {
+        ShellContext empty = new ShellContext();
+        if (IntPtr.Size != 8) return empty; // x64 PEB offsets only -- fail-open on x86
+        if (pid <= 0) return empty;
         try {
             const uint PROCESS_VM_READ = 0x0010;
             const uint PROCESS_QUERY_INFORMATION = 0x0400;
             const int ProcessBasicInformation = 0;
             IntPtr hProc = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid);
-            if (hProc == IntPtr.Zero) return null;
+            if (hProc == IntPtr.Zero) return empty;
             try {
                 // PROCESS_BASIC_INFORMATION is 48 bytes on x64; PebBaseAddress sits at
                 // offset 8 (after the 4-byte ExitStatus + 4 bytes alignment padding).
                 IntPtr pbi = Marshal.AllocHGlobal(48);
                 try {
                     int retLen = 0;
-                    if (NtQueryInformationProcess(hProc, ProcessBasicInformation, pbi, 48, out retLen) != 0) return null;
+                    if (NtQueryInformationProcess(hProc, ProcessBasicInformation, pbi, 48, out retLen) != 0) return empty;
                     IntPtr peb = Marshal.ReadIntPtr(pbi, 8); // PebBaseAddress (in our buffer)
-                    if (peb == IntPtr.Zero) return null;
+                    if (peb == IntPtr.Zero) return empty;
                     // PEB->ProcessParameters (x64 offset 0x20) -> RTL_USER_PROCESS_PARAMETERS*
                     IntPtr procParams = ReadRemoteIntPtr(hProc, new IntPtr(peb.ToInt64() + 0x20));
-                    if (procParams == IntPtr.Zero) return null;
-                    // CurrentDirectoryPath is a UNICODE_STRING at offset 0x38: Length (USHORT,
-                    // bytes) at 0x38, Buffer pointer at 0x40. Read Length first, then Buffer.
-                    short lenBytes = ReadRemoteInt16(hProc, new IntPtr(procParams.ToInt64() + 0x38));
-                    IntPtr bufPtr = ReadRemoteIntPtr(hProc, new IntPtr(procParams.ToInt64() + 0x40));
-                    if (bufPtr == IntPtr.Zero || lenBytes <= 0) return null;
-                    int len = lenBytes;
-                    if (len > 2048) len = 2048; // sanity cap (a path is at most ~520 bytes)
-                    byte[] raw = new byte[len];
-                    IntPtr got = IntPtr.Zero;
-                    if (!ReadProcessMemory(hProc, bufPtr, raw, (IntPtr)len, out got)) return null;
-                    int n = got.ToInt32();
-                    if (n <= 0) return null;
-                    if (n < len) { byte[] t = new byte[n]; Array.Copy(raw, t, n); raw = t; }
-                    return System.Text.Encoding.Unicode.GetString(raw).TrimEnd('\0');
+                    if (procParams == IntPtr.Zero) return empty;
+                    return ReadRemoteShellContext(hProc, procParams);
                 } finally {
                     Marshal.FreeHGlobal(pbi);
                 }
             } finally {
                 CloseHandle(hProc);
             }
+        } catch {
+            return empty; // best-effort: any failure -> caller falls back to defaults
+        }
+    }
+
+    // Resolve cwd + environment from an already-mapped RTL_USER_PROCESS_PARAMETERS.
+    // x64 offsets: CurrentDirectoryPath UNICODE_STRING (Length@0x38, Buffer@0x40);
+    // Environment pointer @0x80. The env block is double-null-terminated unicode;
+    // we read up to 64KB (ReadProcessMemory returns the partial `got` count if the
+    // region is smaller / crosses an unmapped page), then trim at the first
+    // double-null (two null wchars = 4 zero bytes) and keep wchar alignment. If no
+    // terminator is found in what we read we append a trailing double-null so
+    // CreateProcessWithTokenW gets a valid CREATE_UNICODE_ENVIRONMENT block.
+    private static ShellContext ReadRemoteShellContext(IntPtr hProc, IntPtr procParams) {
+        ShellContext sc = new ShellContext();
+        // --- current directory (UNICODE_STRING at 0x38: Length, 0x40: Buffer) ---
+        short cwdLenBytes = ReadRemoteInt16(hProc, new IntPtr(procParams.ToInt64() + 0x38));
+        IntPtr cwdBuf = ReadRemoteIntPtr(hProc, new IntPtr(procParams.ToInt64() + 0x40));
+        if (cwdBuf != IntPtr.Zero && cwdLenBytes > 0) {
+            int n = cwdLenBytes;
+            if (n > 2048) n = 2048; // sanity cap (a path is at most ~520 bytes)
+            byte[] raw = new byte[n];
+            IntPtr got = IntPtr.Zero;
+            if (ReadProcessMemory(hProc, cwdBuf, raw, (IntPtr)n, out got)) {
+                int r = got.ToInt32();
+                if (r > 0) {
+                    if (r < n) { byte[] t = new byte[r]; Array.Copy(raw, t, r); raw = t; }
+                    sc.Cwd = System.Text.Encoding.Unicode.GetString(raw).TrimEnd('\0');
+                }
+            }
+        }
+        // --- environment block (pointer at 0x80) ---
+        IntPtr envBuf = ReadRemoteIntPtr(hProc, new IntPtr(procParams.ToInt64() + 0x80));
+        if (envBuf != IntPtr.Zero) {
+            const int ENV_CAP = 65536;
+            byte[] envRaw = new byte[ENV_CAP];
+            IntPtr got = IntPtr.Zero;
+            if (ReadProcessMemory(hProc, envBuf, envRaw, (IntPtr)ENV_CAP, out got)) {
+                int r = got.ToInt32();
+                if (r > 0) {
+                    // Find the double-null terminator (4 consecutive zero bytes = two
+                    // null wchars). Trim to include it so the block is validly terminated.
+                    int end = -1;
+                    for (int i = 0; i + 3 < r; i++) {
+                        if (envRaw[i] == 0 && envRaw[i + 1] == 0 && envRaw[i + 2] == 0 && envRaw[i + 3] == 0) { end = i + 4; break; }
+                    }
+                    int take = (end > 0) ? end : r;
+                    if (take % 2 != 0) take -= 1; // keep wchar (2-byte) alignment
+                    byte[] envFinal = new byte[take + 4]; // +4 = trailing double-null (zero-initialized)
+                    Array.Copy(envRaw, envFinal, take);
+                    sc.Environment = envFinal;
+                }
+            }
+        }
+        return sc;
+    }
+
+    // Thin wrapper over GetProcessShellContext for callers that need only the cwd.
+    // Kept for backward compatibility (tests + any external caller). Same x64 +
+    // pid + fail-open guarantees; delegates the single PEB walk to the combined
+    // method so there is never a second remote-read pass for the same pid.
+    public static string GetProcessWorkingDirectory(int pid) {
+        if (IntPtr.Size != 8) return null; // x64 PEB offsets only -- fail-open on x86
+        if (pid <= 0) return null;
+        try {
+            return GetProcessShellContext(pid).Cwd;
         } catch {
             return null; // best-effort: any failure -> caller falls back to a default dir
         }
@@ -7810,6 +7895,17 @@ function Invoke-GmProxyFeedbackElevation {
     }
 }
 
+# Born-shell context cache (2026-07-24): the born-as-SYSTEM fallback can retry
+# across drain ticks for the same OldAdminPid before the visible verify succeeds.
+# Each retry would otherwise repeat the full PEB walk (OpenProcess +
+# NtQueryInformationProcess + ReadProcessMemory x N) for the SAME dying shell.
+# This script-scoped cache keys on OldAdminPid with a 5s TTL: the first retry
+# resolves cwd+env once (TokenOps.GetProcessShellContext); subsequent retries
+# within 5s reuse it. Cleared on verified kill (the old PID is killed) so a
+# recycled PID gets a fresh read. Single-threaded monitor drain -> no concurrency
+# guard needed (mirrors $script:CachedSystemPid).
+$script:BornShellContextCache = @{}
+
 function Invoke-BornAsSystemShellVisible {
     # Born-as-SYSTEM fallback for an interactive shell that FAILED in-place
     # elevation (Phase 0 -- NtSetInformationProcess(ProcessAccessToken) returns
@@ -7837,6 +7933,12 @@ function Invoke-BornAsSystemShellVisible {
     # C:\Windows\System32 (the monitor runs as SYSTEM in Session 0). Fail-open:
     # if the PEB read returns null (x86, PPL target, blocked VM_READ), the new
     # shell falls back to a system default dir -- the launch still succeeds.
+    # Environment + cache: the SAME one PEB walk also recovers the env block
+    # (RTL_USER_PROCESS_PARAMETERS->Environment @0x80) so the new SYSTEM shell
+    # inherits the user's %USERPROFILE%/%PATH% (not the monitor's Session-0 env);
+    # the resolved context is cached per-OldAdminPid (5s TTL) so a retry storm for
+    # the same dying shell does not repeat the OpenProcess + NtQuery +
+    # ReadProcessMemory round-trips, and cleared on verified kill. Same fail-open.
     param([int]$SystemPid = 0, [string]$ShellPath, [int]$OldAdminPid = 0)
     if (-not $ShellPath) { return $false }
     if (-not (Test-Path $ShellPath)) {
@@ -7867,16 +7969,42 @@ function Invoke-BornAsSystemShellVisible {
     # passed through to CreateProcessWithTokenW, which then uses the system
     # default (System32) -- the launch still succeeds. Read BEFORE the birth so
     # the old PID is still queryable.
+    # Resolve the old admin shell's context (cwd + environment) ONCE from its PEB
+    # (TokenOps.GetProcessShellContext -- a single x64 PEB walk that returns BOTH
+    # the current directory and the raw unicode environment block) and cache it per
+    # OldAdminPid (5s TTL, $script:BornShellContextCache) so a retry storm for the
+    # same dying shell does not repeat the OpenProcess + NtQueryInformationProcess
+    # + ReadProcessMemory round-trips. Passing cwd as lpCurrentDirectory opens the
+    # new SYSTEM shell in the same folder; passing env as lpEnvironment (with
+    # CREATE_UNICODE_ENVIRONMENT already set) inherits the user's %USERPROFILE% /
+    # %PATH% instead of the monitor's Session-0 SYSTEM env. Fail-open: a null field
+    # falls back to a CreateProcessWithTokenW default (System32 / token env) -- the
+    # launch still succeeds. Read BEFORE the birth so the old PID is still queryable.
     $preserveCwd = $null
+    $preserveEnv = $null
     if ($OldAdminPid -gt 0) {
-        try { $preserveCwd = [TokenOps]::GetProcessWorkingDirectory($OldAdminPid) } catch { $preserveCwd = $null }
+        $now = [int](Get-Date -UFormat %s)
+        $cached = $null
+        if ($script:BornShellContextCache.ContainsKey($OldAdminPid)) {
+            $cached = $script:BornShellContextCache[$OldAdminPid]
+            if (($now - $cached.Ts) -gt 5) { $script:BornShellContextCache.Remove($OldAdminPid); $cached = $null }
+        }
+        if (-not $cached) {
+            try {
+                $ctx = [TokenOps]::GetProcessShellContext($OldAdminPid)
+                $cached = @{ Cwd = $ctx.Cwd; Env = $ctx.Environment; Ts = $now }
+            } catch { $cached = @{ Cwd = $null; Env = $null; Ts = $now } }
+            $script:BornShellContextCache[$OldAdminPid] = $cached
+        }
+        $preserveCwd = $cached.Cwd
+        $preserveEnv = $cached.Env
     }
     if ($preserveCwd) {
-        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "Preserving old admin PID=$OldAdminPid cwd for new SYSTEM shell: $preserveCwd"
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "Preserving old admin PID=$OldAdminPid cwd for new SYSTEM shell: $preserveCwd (env preserved: $([bool]$preserveEnv))"
     } else {
-        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "No cwd preserved for new SYSTEM shell (OldAdminPid=$OldAdminPid unreadable or null); new shell falls back to system default dir"
+        Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "No context preserved for new SYSTEM shell (OldAdminPid=$OldAdminPid unreadable or null); new shell falls back to system default dir/env"
     }
-    $result = [TokenOps]::CreateProcessAsSystem($SystemPid, $ShellPath, $cmdLine, $false, $preserveCwd)
+    $result = [TokenOps]::CreateProcessAsSystem($SystemPid, $ShellPath, $cmdLine, $false, $preserveCwd, $preserveEnv)
     if ($result -ne 0) {
         $errMsg = Get-Win32ErrorRootCause -ErrorCode $result -Context "CreateProcessAsSystem"
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born-as-SYSTEM CreateProcessAsSystem failed (Win32 $result) for $shellBase; leaving admin PID=$OldAdminPid alive. $errMsg"
@@ -7903,7 +8031,7 @@ function Invoke-BornAsSystemShellVisible {
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "Born child verify threw for ${shellBase}: $($_.Exception.Message)"
     }
     if ($verified) {
-        if ($OldAdminPid -gt 0) { Stop-Process -Id $OldAdminPid -Force -ErrorAction SilentlyContinue }
+        if ($OldAdminPid -gt 0) { Stop-Process -Id $OldAdminPid -Force -ErrorAction SilentlyContinue; $script:BornShellContextCache.Remove($OldAdminPid) }
         Write-Log -Message "Monitor elevated: $shellBase (born-as-SYSTEM, visible Session $newSession, child PID=$newPid; old admin PID=$OldAdminPid killed)" -Type "INFO" -Color Gray
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "EXIT" -Message "Visible SYSTEM shell born: $shellBase newPid=$newPid session=$newSession; old admin PID=$OldAdminPid killed"
         return $true
