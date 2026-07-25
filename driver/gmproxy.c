@@ -16,6 +16,7 @@
 #include <stdarg.h>   /* va_list for DiagLog() */
 #include <userenv.h>  /* CreateEnvironmentBlock/DestroyEnvironmentBlock (Layer 1 env fix) */
 #include <sddl.h>    /* ConvertSidToStringSidW (elevation-context token SID logging) */
+#include <aclapi.h>  /* SetEntriesInAcl + EXPLICIT_ACCESS (broker pipe DACL: SYSTEM + Administrators) */
 #include <time.h>     /* time_t / time() for auto-exclude store timestamps (Detector B) */
 #include <stdlib.h>   /* _wtoi / _wtoi64 / wcstoul for auto-exclude store line parsing */
 
@@ -1077,6 +1078,260 @@ static DWORD FindAnySystemProcessPid(void) {
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* Session-1 SYSTEM shell broker (--broker mode).                     */
+/* A persistent process launched as the logged-on admin user in the   */
+/* interactive Session 1 (God-Mode-Windows.ps1 scheduled task,        */
+/* LogonType Interactive + RunLevel Highest). It steals a Session-1   */
+/* SYSTEM token ONCE and serves delegated shell-birth requests from   */
+/* the Session-0 monitor over \\.\pipe\GodMode-ShellBroker so shells   */
+/* launched from explorer (which gmhook deliberately does NOT hook --  */
+/* in-process IAT hooking of explorer's STARTUPINFOEX launches crashes */
+/* it) are born VISIBLE + SYSTEM in Session 1. This is the ONLY        */
+/* proven path on Win11 26100, where NtSetInformationProcess(          */
+/* ProcessAccessToken) is removed (STATUS_NOT_SUPPORTED 0xC00000BB)   */
+/* and SetTokenInformation(TokenSessionId) is blocked on the hardened  */
+/* build, so the Session-0 monitor cannot birth a visible Session-1   */
+/* SYSTEM shell itself. Mirrors Start-SystemShell (menu 19): a         */
+/* Session-1 admin process + a stolen Session>0 SYSTEM token +        */
+/* CreateProcessWithTokenW (SeImpersonate only, NO SeTcb) -> a visible */
+/* Session-1 SYSTEM shell. The broker runs in Session 1, so the stolen */
+/* token already carries Session 1 -- no SetTokenInformation(          */
+/* TokenSessionId) is needed (the hardened-build blocker).            */
+/*                                                                    */
+/* Wire protocol (one request per pipe connection, UTF-8, line-term   */
+/* '\n'):                                                            */
+/*   client writes: "BIRTHSHELL=<exe>|<cwd>\n" (<cwd> may be empty)  */
+/*   broker replies: "BORNPID=<pid>\n" (0 on any failure)            */
+/* Best-effort + fail-open throughout (mirrors the rest of gmproxy):  */
+/* any error -> log via DiagLog + reply BORNPID=0 + keep serving.      */
+/* ------------------------------------------------------------------ */
+static void RunShellBroker(void) {
+    DiagLog(L"[GM-BROKER] starting --broker mode (Session-1 SYSTEM shell broker).\n");
+
+    /* CreateProcessWithTokenW is serviced by seclogon (Secondary Logon).
+       If seclogon is stopped/disabled, every SYSTEM birth fails (Win32
+       1460/1058). Best-effort ensure it is running -- mirrors
+       Start-SystemShell / -LaunchTaskMgrAsSystem in God-Mode-Windows.ps1.
+       The PS task installer also sets seclogon to Manual; this is the
+       belt-and-suspenders for a manual broker launch. */
+    {
+        SC_HANDLE hScm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+        if (hScm) {
+            SC_HANDLE hSec = OpenServiceW(hScm, L"seclogon", SERVICE_QUERY_STATUS | SERVICE_START);
+            if (hSec) {
+                SERVICE_STATUS st = {0};
+                if (QueryServiceStatus(hSec, &st) && st.dwCurrentState != SERVICE_RUNNING) {
+                    (void)StartServiceW(hSec, 0, NULL);
+                }
+                CloseServiceHandle(hSec);
+            }
+            CloseServiceHandle(hScm);
+        }
+    }
+
+    EnablePrivilege(L"SeDebugPrivilege");
+    EnablePrivilege(L"SeImpersonatePrivilege");
+    EnablePrivilege(L"SeAssignPrimaryTokenPrivilege");
+
+    DWORD activeSession = GetActiveConsoleSessionId();
+
+    /* Resolve CreateProcessWithTokenW dynamically (same as the IFEO path). */
+    HMODULE hAdv = GetModuleHandleW(L"advapi32.dll");
+    CreateProcessWithTokenW_t pCpwt = NULL;
+    if (hAdv) {
+        pCpwt = (CreateProcessWithTokenW_t)GetProcAddress(hAdv, "CreateProcessWithTokenW");
+    }
+    if (!pCpwt) {
+        DiagLog(L"[GM-BROKER] FATAL: CreateProcessWithTokenW unavailable; exiting broker.\n");
+        return;
+    }
+
+    /* Build the pipe SECURITY_DESCRIPTOR + DACL ONCE: grant SYSTEM and
+       Administrators full control so the SYSTEM monitor (Session 0, the
+       client) AND the admin-user broker (the server/creator) can both
+       use the pipe. Uses CreateWellKnownSid for portability (no string
+       SDDL parse dependency). The DACL + SIDs are kept alive for the
+       broker's lifetime (the SD references them; the broker is a forever-
+       loop process so a one-time ~few hundred bytes is acceptable and
+       mirrors gmproxy's pragmatic best-effort style). */
+    SECURITY_ATTRIBUTES sa = {0};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = FALSE;
+    SECURITY_DESCRIPTOR sd = {0};
+    PACL pDacl = NULL;
+    PSID pSysSid = NULL, pAdmSid = NULL;
+    if (InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION)) {
+        DWORD sidSz = SECURITY_MAX_SID_SIZE;
+        pSysSid = (PSID)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sidSz);
+        pAdmSid = (PSID)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sidSz);
+        if (pSysSid && pAdmSid &&
+            CreateWellKnownSid(WinLocalSystemSid, NULL, pSysSid, &sidSz)) {
+            DWORD sidSz2 = SECURITY_MAX_SID_SIZE;
+            if (CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, pAdmSid, &sidSz2)) {
+                EXPLICIT_ACCESSW ea[2] = {0};
+                ea[0].grfAccessPermissions = GENERIC_ALL;
+                ea[0].grfAccessMode = SET_ACCESS;
+                ea[0].grfInheritance = NO_INHERITANCE;
+                ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[0].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+                ea[0].Trustee.ptstrName = (LPWCH)pSysSid;
+                ea[1].grfAccessPermissions = GENERIC_ALL;
+                ea[1].grfAccessMode = SET_ACCESS;
+                ea[1].grfInheritance = NO_INHERITANCE;
+                ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
+                ea[1].Trustee.TrusteeType = TRUSTEE_IS_GROUP;
+                ea[1].Trustee.ptstrName = (LPWCH)pAdmSid;
+                DWORD aclRc = SetEntriesInAclW(2, ea, NULL, &pDacl);
+                if (aclRc == ERROR_SUCCESS && pDacl) {
+                    if (SetSecurityDescriptorDacl(&sd, TRUE, pDacl, FALSE)) {
+                        sa.lpSecurityDescriptor = &sd;
+                    }
+                }
+            }
+        }
+    }
+    if (!sa.lpSecurityDescriptor) {
+        DiagLog(L"[GM-BROKER] WARN: pipe DACL build failed; falling back to default ACL.\n");
+    }
+
+    /* Cached Session-1 SYSTEM primary token + its donor PID. Re-steal if
+       the donor dies (IsOpenableSystemProcess returns FALSE). The broker
+       runs in Session 1 so this token already carries Session 1 -- NO
+       SetTokenInformation(TokenSessionId) is needed. */
+    HANDLE gBrokerToken = NULL;
+    DWORD brokerSrcPid = 0;
+
+    /* Serve forever. Each iteration: create the pipe, wait for one client,
+       read one BIRTHSHELL request, birth the shell as SYSTEM in Session 1,
+       reply BORNPID, flush, disconnect, close, loop. Best-effort: any
+       error -> log + reply BORNPID=0 + keep serving. */
+    for (;;) {
+        HANDLE hPipe = CreateNamedPipeW(L"\\\\.\\pipe\\GodMode-ShellBroker",
+            PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, 4096, 4096, 0, (sa.lpSecurityDescriptor ? &sa : NULL));
+        if (hPipe == INVALID_HANDLE_VALUE) {
+            DiagLog(L"[GM-BROKER] CreateNamedPipeW failed GLE=%lu; retry in 2s.\n", (unsigned long)GetLastError());
+            Sleep(2000);
+            continue;
+        }
+
+        /* Block until a client connects. ERROR_PIPE_CONNECTED means a client
+           already connected between CreateNamedPipeW and ConnectNamedPipe
+           (valid -- proceed to read). */
+        BOOL connected = ConnectNamedPipe(hPipe, NULL);
+        DWORD connErr = connected ? 0 : GetLastError();
+        if (!connected && connErr != ERROR_PIPE_CONNECTED) {
+            DiagLog(L"[GM-BROKER] ConnectNamedPipe failed GLE=%lu; retry.\n", (unsigned long)connErr);
+            CloseHandle(hPipe);
+            if (connErr == ERROR_NO_DATA || connErr == ERROR_BROKEN_PIPE) { Sleep(200); continue; }
+            Sleep(1000);
+            continue;
+        }
+
+        /* Read one line: "BIRTHSHELL=<exe>|<cwd>\n". PIPE_WAIT blocks per
+           ReadFile; read in small chunks until a newline or the buffer fills. */
+        char buf[8192] = {0};
+        DWORD totalRead = 0;
+        BOOL got = FALSE;
+        for (;;) {
+            char chunk[512] = {0};
+            DWORD gotN = 0;
+            if (!ReadFile(hPipe, chunk, sizeof(chunk) - 1, &gotN, NULL) || gotN == 0) break;
+            for (DWORD k = 0; k < gotN && totalRead < sizeof(buf) - 1; k++) {
+                buf[totalRead++] = chunk[k];
+                if (chunk[k] == '\n') { got = TRUE; break; }
+            }
+            buf[totalRead] = 0;
+            if (got || totalRead >= sizeof(buf) - 1) break;
+        }
+
+        DWORD replyPid = 0;
+        if (totalRead > 0 && strncmp(buf, "BIRTHSHELL=", sizeof("BIRTHSHELL=") - 1) == 0) {
+            char* rest = buf + (sizeof("BIRTHSHELL=") - 1);
+            char* nl = strchr(rest, '\n'); if (nl) *nl = 0;
+            char* cr = strchr(rest, '\r'); if (cr) *cr = 0;
+            char* pipeSep = strchr(rest, '|');
+            char* exeUtf8 = rest;
+            char* cwdUtf8 = NULL;
+            if (pipeSep) { *pipeSep = 0; cwdUtf8 = pipeSep + 1; }
+
+            /* Convert UTF-8 -> wide (the monitor writes UTF-8 over the pipe). */
+            wchar_t exePathW[MAX_PATH] = {0};
+            wchar_t cwdW[MAX_PATH] = {0};
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, exeUtf8, -1, exePathW, MAX_PATH);
+            LPCWSTR lpCwd = NULL;
+            if (cwdUtf8 && cwdUtf8[0]) {
+                MultiByteToWideChar(CP_UTF8, 0, cwdUtf8, -1, cwdW, MAX_PATH);
+                lpCwd = cwdW;
+            }
+
+            if (wlen > 0 && exePathW[0]) {
+                /* Ensure a SYSTEM token is held (steal once; re-steal if the
+                   donor died). */
+                if (!gBrokerToken) {
+                    brokerSrcPid = FindSystemProcessForToken(activeSession);
+                    if (brokerSrcPid) gBrokerToken = StealSystemToken(brokerSrcPid);
+                }
+                if (gBrokerToken && brokerSrcPid && !IsOpenableSystemProcess(brokerSrcPid)) {
+                    CloseHandle(gBrokerToken); gBrokerToken = NULL;
+                    brokerSrcPid = FindSystemProcessForToken(activeSession);
+                    if (brokerSrcPid) gBrokerToken = StealSystemToken(brokerSrcPid);
+                }
+
+                if (!gBrokerToken) {
+                    DiagLog(L"[GM-BROKER] No session-%lu SYSTEM token; cannot birth %ls.\n",
+                            (unsigned long)activeSession, exePathW);
+                } else {
+                    /* Env parity: the broker's own (user) env via
+                       GetEnvironmentStringsW so the SYSTEM shell inherits the
+                       user's %USERPROFILE%/%PATH% (the broker runs as the user
+                       in Session 1, so its env = the user's env), NOT SYSTEM's
+                       System32 profile. CREATE_UNICODE_ENVIRONMENT matches. */
+                    LPVOID env = (LPVOID)GetEnvironmentStringsW();
+                    STARTUPINFOW si = {0};
+                    si.cb = sizeof(si);
+                    si.lpDesktop = L"WinSta0\\Default";
+                    PROCESS_INFORMATION pi = {0};
+                    DWORD flags = CREATE_NEW_CONSOLE | CREATE_UNICODE_ENVIRONMENT;
+                    BOOL ok = pCpwt(gBrokerToken, LOGON_WITH_PROFILE, exePathW, exePathW,
+                                    flags, env, lpCwd, &si, &pi);
+                    if (env) FreeEnvironmentStringsW((LPWCH)env);
+                    if (ok) {
+                        replyPid = pi.dwProcessId;
+                        DiagLog(L"[GM-BROKER] BIRTH: exe=%ls cwd=%ls pid=%lu session=%lu.\n",
+                                exePathW, lpCwd ? lpCwd : L"(default)",
+                                (unsigned long)pi.dwProcessId, (unsigned long)activeSession);
+                        CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                    } else {
+                        DWORD e = GetLastError();
+                        DiagLog(L"[GM-BROKER] CreateProcessWithTokenW failed GLE=%lu for %ls.\n",
+                                (unsigned long)e, exePathW);
+                    }
+                }
+            } else {
+                DiagLog(L"[GM-BROKER] Malformed BIRTHSHELL exe (empty); ignoring.\n");
+            }
+        } else if (totalRead > 0) {
+            DiagLog(L"[GM-BROKER] Unknown request (no BIRTHSHELL= prefix); ignoring.\n");
+        }
+
+        /* Reply BORNPID=<n>\n. */
+        char reply[40] = {0};
+        int rn = snprintf(reply, sizeof(reply), "BORNPID=%lu\n", (unsigned long)replyPid);
+        if (rn > 0) {
+            if (rn > (int)sizeof(reply) - 1) rn = (int)sizeof(reply) - 1;
+            DWORD wr = 0;
+            WriteFile(hPipe, reply, (DWORD)rn, &wr, NULL);
+            FlushFileBuffers(hPipe);
+        }
+        DisconnectNamedPipe(hPipe);
+        CloseHandle(hPipe);
+    }
+    /* Unreachable: the broker runs until the task is stopped/killed. The
+       cached token + DACL + SIDs are released by process exit. */
+}
+
 int wmain(int argc, wchar_t* argv[]) {
     if (argc < 2) {
         DiagLog(L"[GM-PROXY] Usage: gmproxy.exe <path_to_original.exe> [args...]\n");
@@ -1091,6 +1346,19 @@ int wmain(int argc, wchar_t* argv[]) {
     if (_wcsicmp(argv[1], L"--gm-reset-autoexclude") == 0) {
         GmProxyAutoExcludeReset();
         DiagLog(L"[GM-PROXY] AUTO-EXCLUDE store reset (--gm-reset-autoexclude).\n");
+        return 0;
+    }
+
+    /* Session-1 SYSTEM shell broker mode (called by God-Mode-Windows.ps1
+       Register-ShellBrokerTask -> scheduled task action
+       "<install>\gmproxy.exe --broker"). Runs a persistent named-pipe server
+       that births interactive shells as SYSTEM in the interactive session on
+       behalf of the Session-0 monitor -- the only proven path for
+       explorer-launched shells on Win11 26100 (gmhook cannot hook explorer).
+       See RunShellBroker() above. Returns when the broker loop exits (never,
+       in normal operation -- the task stops/kills it). */
+    if (_wcsicmp(argv[1], L"--broker") == 0) {
+        RunShellBroker();
         return 0;
     }
 

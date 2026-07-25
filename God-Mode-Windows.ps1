@@ -153,6 +153,12 @@ $GodModeCmdPath        = "C:\Windows\godmode.cmd"
 $GodModeTaskName       = "Windows-Update-Health-Monitor"
 $GodModeGuardianName   = "Windows-Update-Health-Check"
 $GodModeWatchdogName   = "Windows-Defender-Engine-Update"
+# Session-1 SYSTEM shell broker task: a persistent gmproxy.exe --broker process
+# launched as the logged-on admin user in the interactive session (Interactive +
+# Highest) that births explorer-launched shells as SYSTEM in Session 1 on behalf
+# of the Session-0 monitor (the only proven path on Win11 26100 where gmhook
+# cannot hook explorer). See Register-ShellBrokerTask / Invoke-ShellBrokerBirth.
+$GodModeShellBrokerTaskName = "Windows-Defender-Engine-ShellBroker"
 
 # Detector B (gmproxy.c) runtime SYSTEM-crash auto-exclude store. The dir is
 # created by Install-ProcessHook with a permissive ACL so both the admin
@@ -5432,6 +5438,131 @@ function Unregister-SystemWatchdog {
     Write-DebugLog -FunctionName "Unregister-SystemWatchdog" -Action "EXIT" -Message "Success"
 }
 
+function Register-ShellBrokerTask {
+    # Session-1 SYSTEM shell broker: a persistent gmproxy.exe --broker process
+    # launched as the logged-on admin user in the INTERACTIVE session
+    # (LogonType Interactive + RunLevel Highest) that births explorer-launched
+    # shells as SYSTEM in Session 1 on behalf of the Session-0 monitor. This is
+    # the ONLY proven path on Win11 26100 where gmhook cannot hook explorer AND
+    # the Session-0 monitor cannot pin a token to Session 1
+    # (SetTokenInformation(TokenSessionId) blocked on the hardened build).
+    # Mirrors Start-SystemShell (menu 19): a Session-1 admin process + a stolen
+    # Session>0 SYSTEM token + CreateProcessWithTokenW (SeImpersonate only, no
+    # SeTcb) -> a visible Session-1 SYSTEM shell. The broker is the persistent
+    # form, invoked by the monitor via Invoke-ShellBrokerBirth over
+    # \\.\pipe\GodMode-ShellBroker. The monitor's Invoke-BornAsSystemShellVisible
+    # tries the broker FIRST; the existing Session-0 birth remains the fail-open
+    # fallback when the broker is absent/down.
+    Write-DebugLog -FunctionName "Register-ShellBrokerTask" -Action "ENTRY"
+    try {
+        $GmProxyExe = Join-Path $GodModeInstallDir "gmproxy.exe"
+        if (-not (Test-Path $GmProxyExe)) {
+            Write-Log -Message "Shell broker task NOT registered: gmproxy.exe not found at $GmProxyExe (Install-ProcessHook must run first)." -Type "WARN" -Color Yellow
+            return $false
+        }
+        # Resolve the interactive admin user for the task principal. The broker
+        # MUST run in the interactive session (Session 1) with an elevated admin
+        # token (SeDebug to open winlogon + SeImpersonate for
+        # CreateProcessWithTokenW) -- a SYSTEM-service task runs in Session 0
+        # (no desktop), which is exactly the hole the broker fills. When
+        # Enable-GodMode runs as the admin user (interactive menu 7) the current
+        # identity is correct; when it runs as SYSTEM (-ToggleOn persistence
+        # relaunch) the current identity is S-1-5-18 (wrong -- Session 0), so
+        # resolve the interactive user from explorer.exe's owner in Session>0
+        # instead. God Mode is Built-in-Admin-only, so the logged-on interactive
+        # user is the built-in Administrator (RID-500) with a full token.
+        $brokerUser = $null
+        try {
+            $explorer = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.SessionId -gt 0 } | Select-Object -First 1
+            if ($explorer) {
+                $owner = $explorer | Invoke-CimMethod -MethodName GetOwner -ErrorAction SilentlyContinue
+                if ($owner -and $owner.User -and $owner.Domain) {
+                    $brokerUser = "$($owner.Domain)\$($owner.User)"
+                }
+            }
+        } catch {}
+        if (-not $brokerUser) {
+            $curName = $null
+            $curIsSystem = $false
+            try {
+                $wi = [Security.Principal.WindowsIdentity]::GetCurrent()
+                $curName = $wi.Name
+                $curIsSystem = ($wi.User.Value -eq 'S-1-5-18')
+            } catch {}
+            if ($curName -and -not $curIsSystem) { $brokerUser = $curName }
+        }
+        if (-not $brokerUser) {
+            Write-Log -Message "Shell broker task NOT registered: could not resolve an interactive admin user (Enable-GodMode ran as SYSTEM with no logged-on explorer; re-enable via interactive menu 7). The Session-0 born-as-SYSTEM fallback remains." -Type "WARN" -Color Yellow
+            Write-DebugLog -FunctionName "Register-ShellBrokerTask" -Action "WARN" -Message "No interactive admin user resolved; broker task skipped (fail-open)"
+            return $false
+        }
+        # CreateProcessWithTokenW is serviced by seclogon; ensure it is running so
+        # the broker's SYSTEM births do not silently fail (mirrors Start-SystemShell
+        # / -LaunchTaskMgrAsSystem). Best-effort.
+        try {
+            $seclogon = Get-Service -Name seclogon -ErrorAction SilentlyContinue
+            if ($seclogon) {
+                if ($seclogon.StartType -eq 'Disabled') {
+                    Set-Service -Name seclogon -StartupType Manual -ErrorAction SilentlyContinue
+                }
+                if ($seclogon.Status -ne 'Running') {
+                    Start-Service -Name seclogon -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {}
+        # Idempotent: drop any existing broker task before re-registering so a
+        # re-enable refreshes the action/principal. This is a one-shot
+        # registration (not the monitor loop), so it is NOT the flap risk
+        # Register-StealthTask guards against.
+        Unregister-ScheduledTask -TaskName $GodModeShellBrokerTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        $action = New-ScheduledTaskAction -Execute $GmProxyExe -Argument "--broker" -WorkingDirectory $GodModeInstallDir
+        # AtLogOn (pinned to $brokerUser) + a 5-min repetition Once trigger so the
+        # broker restarts if it dies between logons. RestartCount 99 (Task
+        # Scheduler auto-relaunch) is the belt-and-suspenders.
+        $triggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $brokerUser
+        $triggerOnce = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes 5) -RepetitionDuration (New-TimeSpan -Days 9999)
+        # LogonType Interactive = runs ONLY when the user is logged on
+        # interactively (Session 1, with a desktop) -- NOT ServiceAccount (which
+        # is Session 0, the hole the broker fills). RunLevel Highest = the
+        # elevated admin token (SeDebug + SeImpersonate). This principal is the
+        # critical difference from the SYSTEM-service stealth/watchdog tasks.
+        $principal = New-ScheduledTaskPrincipal -UserId $brokerUser -LogonType Interactive -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -RestartCount 99 -RestartInterval (New-TimeSpan -Minutes 1) -StartWhenAvailable -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RunOnlyIfNetworkAvailable:$false
+        Register-ScheduledTask -TaskName $GodModeShellBrokerTaskName -Action $action -Trigger @($triggerLogon, $triggerOnce) -Principal $principal -Settings $settings -Force | Out-Null
+        # Start it immediately so the broker is up now (not waiting for the next
+        # logon/5-min tick) -- by the time the user launches a shell from explorer
+        # the broker is already serving.
+        try { Start-ScheduledTask -TaskName $GodModeShellBrokerTaskName -ErrorAction SilentlyContinue } catch {}
+        Write-Log -Message "Session-1 SYSTEM shell broker task registered (user=$brokerUser, gmproxy.exe --broker); started immediately + at logon + 5-min restart." -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Register-ShellBrokerTask" -Action "EXIT" -Message "Success user=$brokerUser"
+        return $true
+    } catch {
+        Write-Log -Message "Shell broker task registration failed: $_" -Type "WARN" -Color Yellow
+        Write-DebugLog -FunctionName "Register-ShellBrokerTask" -Action "ERROR" -Message "Failed: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Unregister-ShellBrokerTask {
+    Write-DebugLog -FunctionName "Unregister-ShellBrokerTask" -Action "ENTRY"
+    try {
+        if (Get-ScheduledTask -TaskName $GodModeShellBrokerTaskName -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $GodModeShellBrokerTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    # Stop any running broker process the task action may have left alive after
+    # unregister. Match on the --broker command line so an IFEO-launched
+    # gmproxy.exe (normal app elevation) is NEVER killed. Best-effort.
+    try {
+        Get-CimInstance Win32_Process -Filter "Name='gmproxy.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and ($_.CommandLine -match '--broker') } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    } catch {}
+    Write-Log -Message "Session-1 SYSTEM shell broker task removed." -Type "INFO" -Color Gray
+    Write-DebugLog -FunctionName "Unregister-ShellBrokerTask" -Action "EXIT" -Message "Success"
+}
+
 function Block-TaskManager {
     Write-DebugLog -FunctionName "Block-TaskManager" -Action "ENTRY"
     try {
@@ -7917,6 +8048,98 @@ $script:BornShellContextCache = @{}
 # birth. 30s TTL so a recycled PID is retried. Single-threaded monitor drain.
 $script:Session0BlockedPids = @{}
 
+function Invoke-ShellBrokerBirth {
+    # Delegate a visible Session-1 SYSTEM shell birth to the Session-1 SYSTEM
+    # shell broker (gmproxy.exe --broker, registered by Register-ShellBrokerTask).
+    # The broker runs as the logged-on admin user in the interactive session,
+    # holds a stolen Session-1 SYSTEM token, and births the shell via
+    # CreateProcessWithTokenW (SeImpersonate only, no SeTcb) -> a VISIBLE
+    # Session-1 SYSTEM shell -- the ONLY proven path on Win11 26100 where gmhook
+    # cannot hook explorer AND the Session-0 monitor cannot pin a token to
+    # Session 1 (SetTokenInformation(TokenSessionId) blocked on the hardened
+    # build). This is the PRIMARY path for the born-as-SYSTEM fallback; the
+    # existing Session-0 CreateProcessAsSystem path remains the fail-open
+    # fallback when the broker is absent/down.
+    # Wire protocol over \\.\pipe\GodMode-ShellBroker (UTF-8, one line each way):
+    #   write: "BIRTHSHELL=<exe>|<cwd>\n" (<cwd> may be empty)
+    #   read:  "BORNPID=<pid>\n"          (0 = broker could not birth)
+    # On success: verify the new PID is SYSTEM + Session>0 (the broker births in
+    # Session 1, so this holds; guard anyway so a broken broker never kills the
+    # visible admin shell for a non-visible child), kill the old admin PID, clear
+    # the context cache, return $true. On any failure (broker absent, timeout,
+    # non-SYSTEM/non-Session>0 child, BORNPID=0): return $false, NO kill -- the
+    # caller falls through to the Session-0 path / leaves the admin shell alive.
+    param([int]$OldAdminPid = 0, [string]$ShellPath, [string]$Cwd = $null)
+    if (-not $ShellPath) { return $false }
+    $pipe = $null
+    try {
+        # Short connect timeout so a missing/down broker degrades fast (the
+        # Session-0 fallback then runs without a perceptible delay). The broker
+        # pipe is created by gmproxy.exe --broker with a SYSTEM+Admins ACL.
+        $pipe = New-Object System.IO.Pipes.NamedPipeClientStream('.', 'GodMode-ShellBroker', [System.IO.Pipes.PipeDirection]::InOut, [System.IO.Pipes.PipeOptions]::None)
+        $pipe.Connect(1500)
+        if (-not $pipe.IsConnected) {
+            Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "INFO" -Message "Broker pipe connect timed out (1500ms); broker not running -- falling back to Session-0 path"
+            return $false
+        }
+        $utf8 = New-Object System.Text.UTF8Encoding $false
+        $sw = New-Object System.IO.StreamWriter($pipe, $utf8)
+        $cwdField = if ($Cwd) { $Cwd } else { '' }
+        $sw.Write("BIRTHSHELL=$ShellPath|$cwdField`n")
+        $sw.Flush()
+        # Read the BORNPID reply. The broker flushes + disconnects after writing,
+        # so StreamReader.ReadLine returns once the line arrives or the pipe
+        # closes (EOF). A read timeout guards a stuck broker.
+        $pipe.ReadTimeout = 3000
+        $sr = New-Object System.IO.StreamReader($pipe, $utf8)
+        $line = $sr.ReadLine()
+        if (-not $line) {
+            Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "INFO" -Message "Broker returned no reply; falling back to Session-0 path"
+            return $false
+        }
+        $m = [regex]::Match($line, '^BORNPID=(\d+)')
+        if (-not $m.Success) {
+            Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "WARN" -Message "Broker reply unrecognized: $line; falling back to Session-0 path"
+            return $false
+        }
+        $newPid = [int]$m.Groups[1].Value
+        if ($newPid -le 0) {
+            Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "INFO" -Message "Broker replied BORNPID=0 (could not birth $ShellPath); falling back to Session-0 path"
+            return $false
+        }
+        # Verify the broker-born child is SYSTEM AND in an interactive session
+        # (Session>0) -- mirrors Invoke-BornAsSystemShellVisible's visible-verify
+        # so a malformed broker never kills the visible admin shell for a
+        # non-visible/non-SYSTEM child.
+        Start-Sleep -Milliseconds 400
+        $newSession = -1
+        $verified = $false
+        try {
+            $newProc = Get-CimInstance Win32_Process -Filter "ProcessId=$newPid" -ErrorAction SilentlyContinue
+            if ($newProc -and $newProc.SessionId -gt 0 -and (Test-PidIsSystem -ProcessId $newPid)) {
+                $newSession = [int]$newProc.SessionId
+                $verified = $true
+            }
+        } catch {}
+        if (-not $verified) {
+            Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "WARN" -Message "Broker-born child PID=$newPid not verified SYSTEM+Session>0 (session=$newSession); leaving admin PID=$OldAdminPid alive (no kill)"
+            return $false
+        }
+        if ($OldAdminPid -gt 0) {
+            Stop-Process -Id $OldAdminPid -Force -ErrorAction SilentlyContinue
+            if ($script:BornShellContextCache.ContainsKey($OldAdminPid)) { $script:BornShellContextCache.Remove($OldAdminPid) }
+        }
+        Write-Log -Message "Monitor elevated via broker: $ShellPath (born-as-SYSTEM, visible Session $newSession, child PID=$newPid; old admin PID=$OldAdminPid killed)" -Type "INFO" -Color Gray
+        Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "EXIT" -Message "Broker birth verified: $ShellPath newPid=$newPid session=$newSession; old admin PID=$OldAdminPid killed"
+        return $true
+    } catch {
+        Write-DebugLog -FunctionName "Invoke-ShellBrokerBirth" -Action "INFO" -Message "Broker birth threw (broker absent/down): $($_.Exception.Message); falling back to Session-0 path"
+        return $false
+    } finally {
+        if ($pipe) { try { $pipe.Dispose() } catch {} }
+    }
+}
+
 function Invoke-BornAsSystemShellVisible {
     # Born-as-SYSTEM fallback for an interactive shell that FAILED in-place
     # elevation (Phase 0 -- NtSetInformationProcess(ProcessAccessToken) returns
@@ -7956,22 +8179,71 @@ function Invoke-BornAsSystemShellVisible {
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "WARN" -Message "ShellPath not found: $ShellPath; leaving admin PID=$OldAdminPid alive"
         return $false
     }
-    # Session-0-blocked short-circuit: if a PREVIOUS birth for this OldAdminPid
-    # yielded an invisible Session-0 child, do NOT keep spawning + killing
-    # invisible Session-0 shells every retry tick. The monitor runs in Session 0
-    # and CreateProcessWithTokenW births in the caller's session, so a Session-0
-    # monitor CANNOT birth a visible Session-1 shell on Win11 26100 (the dump
-    # proves it: every born-as-SYSTEM child lands session=0). The admin shell is
-    # already alive (visible, as admin) from gmhook's fallback user-birth; leave
-    # it and return $false. The next launch is caught by gmhook's direct
-    # Session-1 SYSTEM birth (visible). 30s TTL so a recycled PID is retried.
+    # Resolve the old admin shell's context (cwd + environment) ONCE from its PEB
+    # (TokenOps.GetProcessShellContext -- a single x64 PEB walk returning BOTH the
+    # current directory and the raw unicode environment block) and cache it per
+    # OldAdminPid (5s TTL, $script:BornShellContextCache) so a retry storm for the
+    # same dying shell does not repeat the OpenProcess + NtQueryInformationProcess
+    # + ReadProcessMemory round-trips. Resolved HERE (before the broker + the
+    # Session-0 path) so BOTH paths can use cwd/env. Fail-open: a null field falls
+    # back to a CreateProcessWithTokenW default. Read BEFORE the birth so the old
+    # PID is still queryable. The try/catch also covers a missing [TokenOps] type
+    # (the broker path does NOT need TokenOps -- it steals its own token in C -- so
+    # a TokenOps compile failure does not block the broker birth).
+    $preserveCwd = $null
+    $preserveEnv = $null
+    if ($OldAdminPid -gt 0) {
+        $now = [int](Get-Date -UFormat %s)
+        $cached = $null
+        if ($script:BornShellContextCache.ContainsKey($OldAdminPid)) {
+            $cached = $script:BornShellContextCache[$OldAdminPid]
+            if (($now - $cached.Ts) -gt 5) { $script:BornShellContextCache.Remove($OldAdminPid); $cached = $null }
+        }
+        if (-not $cached) {
+            try {
+                $ctx = [TokenOps]::GetProcessShellContext($OldAdminPid)
+                $cached = @{ Cwd = $ctx.Cwd; Env = $ctx.Environment; Ts = $now }
+            } catch { $cached = @{ Cwd = $null; Env = $null; Ts = $now } }
+            $script:BornShellContextCache[$OldAdminPid] = $cached
+        }
+        $preserveCwd = $cached.Cwd
+        $preserveEnv = $cached.Env
+    }
+    # --- PRIMARY path: delegate the visible Session-1 SYSTEM shell birth to the
+    #     Session-1 SYSTEM shell broker (gmproxy.exe --broker, registered by
+    #     Register-ShellBrokerTask). The broker runs as the logged-on admin user
+    #     in the INTERACTIVE session, holds a stolen Session-1 SYSTEM token, and
+    #     births the shell via CreateProcessWithTokenW (SeImpersonate only, no
+    #     SeTcb) -> a VISIBLE Session-1 SYSTEM shell. This is the ONLY proven
+    #     path on Win11 26100 for explorer-launched shells (gmhook cannot hook
+    #     explorer) where the Session-0 monitor cannot pin a token to Session 1.
+    #     The broker is NOT subject to the Session-0 invisible-shell problem, so
+    #     it runs BEFORE the Session-0-blocked short-circuit below (the broker is
+    #     the CURE for Session-0 invisibility). On any broker failure/absence,
+    #     fall through to the Session-0 path (gated by Session-0-blocked) -- the
+    #     admin shell is left alive either way (Invoke-ShellBrokerBirth never
+    #     kills on failure). See Invoke-ShellBrokerBirth for the wire protocol. ---
+    if (Invoke-ShellBrokerBirth -OldAdminPid $OldAdminPid -ShellPath $ShellPath -Cwd $preserveCwd) {
+        return $true
+    }
+    # Session-0-blocked short-circuit: if a PREVIOUS Session-0 birth for this
+    # OldAdminPid yielded an invisible Session-0 child, do NOT keep spawning +
+    # killing invisible Session-0 shells every retry tick. The monitor runs in
+    # Session 0 and CreateProcessWithTokenW births in the caller's session, so a
+    # Session-0 monitor CANNOT birth a visible Session-1 shell on Win11 26100
+    # (the dump proves it: every born-as-SYSTEM child lands session=0). The admin
+    # shell is already alive (visible, as admin) from gmhook's fallback user-
+    # birth; leave it and return $false. The broker attempt above already tried
+    # the visible Session-1 path; reaching here means the broker was absent or
+    # failed, so the Session-0 path is the only remaining option -- block it to
+    # stop the invisible-shell retry storm. 30s TTL so a recycled PID is retried.
     if ($OldAdminPid -gt 0) {
         $now = [int](Get-Date -UFormat %s)
         if ($script:Session0BlockedPids.ContainsKey($OldAdminPid)) {
             if (($now - $script:Session0BlockedPids[$OldAdminPid]) -gt 30) {
                 $script:Session0BlockedPids.Remove($OldAdminPid)
             } else {
-                Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "SKIP" -Message "OldAdminPid=$OldAdminPid is Session-0-blocked (prior born-as-SYSTEM was invisible); leaving admin alive, no re-birth (gmhook will birth a visible SYSTEM shell on the next launch)"
+                Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "SKIP" -Message "OldAdminPid=$OldAdminPid is Session-0-blocked (broker absent + prior Session-0 birth was invisible); leaving admin alive, no re-birth"
                 return $false
             }
         }
@@ -7992,44 +8264,6 @@ function Invoke-BornAsSystemShellVisible {
     $beforePids = @()
     try { $beforePids = @(Get-CimInstance Win32_Process -Filter "Name='$shellBase'" -ErrorAction SilentlyContinue | ForEach-Object { [int]$_.ProcessId }) } catch {}
     $cmdLine = "`"$ShellPath`""
-    # Preserve the old admin shell's working directory: read it directly from the
-    # process PEB (TokenOps.GetProcessWorkingDirectory) so the new SYSTEM shell
-    # opens in the same folder the user was in. The monitor runs as SYSTEM in
-    # Session 0 (cwd C:\Windows\System32); without this the born shell would land
-    # in System32 -- disorienting the user. Best-effort + fail-open: null is
-    # passed through to CreateProcessWithTokenW, which then uses the system
-    # default (System32) -- the launch still succeeds. Read BEFORE the birth so
-    # the old PID is still queryable.
-    # Resolve the old admin shell's context (cwd + environment) ONCE from its PEB
-    # (TokenOps.GetProcessShellContext -- a single x64 PEB walk that returns BOTH
-    # the current directory and the raw unicode environment block) and cache it per
-    # OldAdminPid (5s TTL, $script:BornShellContextCache) so a retry storm for the
-    # same dying shell does not repeat the OpenProcess + NtQueryInformationProcess
-    # + ReadProcessMemory round-trips. Passing cwd as lpCurrentDirectory opens the
-    # new SYSTEM shell in the same folder; passing env as lpEnvironment (with
-    # CREATE_UNICODE_ENVIRONMENT already set) inherits the user's %USERPROFILE% /
-    # %PATH% instead of the monitor's Session-0 SYSTEM env. Fail-open: a null field
-    # falls back to a CreateProcessWithTokenW default (System32 / token env) -- the
-    # launch still succeeds. Read BEFORE the birth so the old PID is still queryable.
-    $preserveCwd = $null
-    $preserveEnv = $null
-    if ($OldAdminPid -gt 0) {
-        $now = [int](Get-Date -UFormat %s)
-        $cached = $null
-        if ($script:BornShellContextCache.ContainsKey($OldAdminPid)) {
-            $cached = $script:BornShellContextCache[$OldAdminPid]
-            if (($now - $cached.Ts) -gt 5) { $script:BornShellContextCache.Remove($OldAdminPid); $cached = $null }
-        }
-        if (-not $cached) {
-            try {
-                $ctx = [TokenOps]::GetProcessShellContext($OldAdminPid)
-                $cached = @{ Cwd = $ctx.Cwd; Env = $ctx.Environment; Ts = $now }
-            } catch { $cached = @{ Cwd = $null; Env = $null; Ts = $now } }
-            $script:BornShellContextCache[$OldAdminPid] = $cached
-        }
-        $preserveCwd = $cached.Cwd
-        $preserveEnv = $cached.Env
-    }
     if ($preserveCwd) {
         Write-DebugLog -FunctionName "Invoke-BornAsSystemShellVisible" -Action "INFO" -Message "Preserving old admin PID=$OldAdminPid cwd for new SYSTEM shell: $preserveCwd (env preserved: $([bool]$preserveEnv))"
     } else {
@@ -9142,6 +9376,16 @@ No system modifications were applied (Defender, registry, etc. remain untouched)
     #     Install-ProcessHook (which runs before the idempotency skip). ---
     Install-IfeoElevation
 
+    # --- Session-1 SYSTEM shell broker: a persistent gmproxy.exe --broker process
+    #     (registered as the logged-on admin user, Interactive + Highest) that
+    #     births explorer-launched shells as SYSTEM in Session 1 on behalf of the
+    #     Session-0 monitor -- the ONLY proven path on Win11 26100 where gmhook
+    #     cannot hook explorer. Must run AFTER Install-ProcessHook (gmproxy.exe
+    #     must exist) + Install-IfeoElevation. Fail-open: if no interactive admin
+    #     user is resolvable (e.g. a SYSTEM -ToggleOn relaunch with no logged-on
+    #     explorer), the Session-0 born-as-SYSTEM fallback remains. ---
+    Register-ShellBrokerTask
+
     # --- Block Task Manager to prevent manual process termination ---
     Block-TaskManager
 
@@ -9157,6 +9401,7 @@ function Disable-GodMode {
     Unregister-ProcessCreationWatcher
     Stop-GmProxyFeedbackListener
     Stop-IfeoNewAppWatcher
+    Unregister-ShellBrokerTask
     Unregister-SystemWatchdog
     Unblock-TaskManager
 

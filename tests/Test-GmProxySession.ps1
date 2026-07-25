@@ -1395,4 +1395,75 @@ Add-Assertion "Sess0Block: helper short-circuits a Session-0-blocked OldAdminPid
 Add-Assertion "Sess0Block: blocked set has a 30s TTL so a recycled PID is retried" ($vbsBody -match '\$script:Session0BlockedPids\[\$OldAdminPid\]\) -gt 30') "the blocked set has no TTL -- a recycled PID would stay blocked forever"
 Add-Assertion "Sess0Block: helper marks OldAdminPid blocked when the born child is invisible Session 0" ($vbsBody -match 'if \(\$OldAdminPid -gt 0\) \{ \$script:Session0BlockedPids\[\$OldAdminPid\] = \[int\]\(Get-Date -UFormat %s\)') "helper does not mark the PID blocked on an invisible birth -- the retry storm is not stopped"
 
+# Part H -- Session-1 SYSTEM shell broker for explorer-launched shells
+# (2026-07-25). The VM dump proved gmhook is deliberately NOT injected into
+# explorer (in-process IAT hooking of explorer's STARTUPINFOEX launches crashes
+# it in a restart loop), so gmhook's direct Session-1 SYSTEM birth never runs for
+# the common explorer-launched shell case (Start menu / Win+R / shortcut). The
+# Session-0 monitor cannot birth a visible Session-1 shell on Win11 26100
+# (SetTokenInformation(TokenSessionId) blocked on the hardened build). Fix: a
+# persistent gmproxy.exe --broker process launched as the logged-on admin user
+# in the INTERACTIVE session (Interactive + Highest) holds a stolen Session-1
+# SYSTEM token + CreateProcessWithTokenW (SeImpersonate only, no SeTcb) and
+# births shells as SYSTEM in Session 1 on behalf of the monitor over
+# \\.\pipe\GodMode-ShellBroker. The monitor's Invoke-BornAsSystemShellVisible
+# delegates to the broker FIRST; the Session-0 birth remains the fail-open
+# fallback. This is the ONLY proven path for explorer-launched shells. Additive.
+
+# --- gmproxy.c broker-mode assertions ---
+Add-Assertion "Broker: gmproxy.c --broker branch in wmain (before the IFEO launch path)" ($proxy.Contains('L"--broker"')) "gmproxy.c has no --broker branch -- the broker mode cannot be invoked"
+Add-Assertion "Broker: RunShellBroker() helper defined" ($proxy -match 'static void RunShellBroker\(') "RunShellBroker missing -- the broker loop has no implementation"
+Add-Assertion "Broker: named pipe GodMode-ShellBroker used (\\.\pipe\GodMode-ShellBroker)" ($proxy.Contains('GodMode-ShellBroker')) "the broker pipe name GodMode-ShellBroker is missing -- the monitor cannot delegate to the broker"
+Add-Assertion "Broker: pipe created with CreateNamedPipeW (server side)" ($proxy.Contains('CreateNamedPipeW')) "the broker does not create the pipe server -- no client can connect"
+Add-Assertion "Broker: ConnectNamedPipe loop serves one client per iteration" ($proxy.Contains('ConnectNamedPipe')) "the broker does not wait for client connections -- no request can be read"
+Add-Assertion "Broker: BIRTHSHELL=<exe>|<cwd> request wire-protocol parse" ($proxy.Contains('BIRTHSHELL=')) "the broker does not parse BIRTHSHELL= -- the monitor's request is ignored"
+Add-Assertion "Broker: BORNPID=<n> reply wire-protocol" ($proxy.Contains('BORNPID=')) "the broker does not reply BORNPID= -- the monitor cannot learn the born child PID"
+Add-Assertion "Broker: pipe DACL grants SYSTEM + Administrators (CreateWellKnownSid WinLocalSystemSid + WinBuiltinAdministratorsSid)" ($proxy.Contains('CreateWellKnownSid') -and $proxy.Contains('WinLocalSystemSid') -and $proxy.Contains('WinBuiltinAdministratorsSid')) "the broker pipe ACL does not grant SYSTEM + Administrators -- the Session-0 monitor (client) could not connect to the admin-user broker (server)"
+Add-Assertion "Broker: reuses FindSystemProcessForToken (Session-1 SYSTEM token donor)" ($proxy.Contains('FindSystemProcessForToken')) "the broker does not reuse FindSystemProcessForToken -- it cannot steal a Session-1 SYSTEM token"
+Add-Assertion "Broker: reuses StealSystemToken (DuplicateTokenEx primary)" ($proxy.Contains('StealSystemToken')) "the broker does not reuse StealSystemToken -- no SYSTEM token is acquired"
+Add-Assertion "Broker: env parity via GetEnvironmentStringsW + CREATE_UNICODE_ENVIRONMENT" ($proxy.Contains('GetEnvironmentStringsW') -and $proxy.Contains('CREATE_UNICODE_ENVIRONMENT')) "the broker does not pass the user env to the SYSTEM shell -- it would get SYSTEM's System32 profile"
+Add-Assertion "Broker: visible desktop WinSta0\\Default + CREATE_NEW_CONSOLE (interactive shell)" ($proxy.Contains('WinSta0\\Default') -and $proxy.Contains('CREATE_NEW_CONSOLE')) "the broker does not birth on the interactive desktop with a new console -- the shell would be invisible"
+Add-Assertion "Broker: CreateProcessWithTokenW + LOGON_WITH_PROFILE (SeImpersonate-only, no SeTcb needed)" ($proxy.Contains('CreateProcessWithTokenW') -and $proxy.Contains('LOGON_WITH_PROFILE')) "the broker does not launch via CreateProcessWithTokenW -- the Session-1 SYSTEM birth cannot happen"
+Add-Assertion "Broker: best-effort seclogon ensure (OpenSCManagerW + StartServiceW) so CreateProcessWithTokenW does not silently fail" ($proxy.Contains('OpenSCManagerW') -and $proxy.Contains('StartServiceW')) "the broker does not ensure seclogon is running -- a stopped seclogon would make every SYSTEM birth fail (1460/1058)"
+Add-Assertion "Broker: re-steals the token when the donor dies (IsOpenableSystemProcess re-validation)" ($proxy -match 'IsOpenableSystemProcess\(brokerSrcPid\)') "the broker does not re-validate the donor -- a dead winlogon would leave it with a stale token"
+
+# --- God-Mode-Windows.ps1 broker delegation + task assertions ---
+Add-Assertion "BrokerPS: Invoke-ShellBrokerBirth helper defined" ($gm -match 'function Invoke-ShellBrokerBirth') "Invoke-ShellBrokerBirth missing -- the monitor has no broker delegation path"
+Add-Assertion "BrokerPS: helper uses NamedPipeClientStream + GodMode-ShellBroker (client side)" ($gm.Contains('NamedPipeClientStream') -and $gm.Contains('GodMode-ShellBroker')) "the broker client does not use NamedPipeClientStream/GodMode-ShellBroker -- it cannot reach the broker"
+Add-Assertion "BrokerPS: helper writes BIRTHSHELL=<exe>|<cwd> over the pipe" ($gm.Contains('BIRTHSHELL=') -and $gm -match 'BIRTHSHELL=\$ShellPath\|\$cwdField') "the helper does not send a BIRTHSHELL= request -- the broker cannot know what to birth"
+Add-Assertion "BrokerPS: helper reads the BORNPID=<n> reply" ($gm.Contains('BORNPID=') -and $gm -match '\^BORNPID=\(\\d\+\)') "the helper does not parse the BORNPID= reply -- it cannot learn the born child PID"
+Add-Assertion "BrokerPS: Register-ShellBrokerTask helper defined" ($gm -match 'function Register-ShellBrokerTask') "Register-ShellBrokerTask missing -- the broker task cannot be installed"
+Add-Assertion "BrokerPS: Unregister-ShellBrokerTask helper defined" ($gm -match 'function Unregister-ShellBrokerTask') "Unregister-ShellBrokerTask missing -- Disable-GodMode cannot tear down the broker"
+Add-Assertion "BrokerPS: Enable-GodMode calls Register-ShellBrokerTask" ($gm -match '(?m)^\s+Register-ShellBrokerTask\s*\r?\n') "Enable-GodMode does not register the broker task -- the broker would not start at enable"
+Add-Assertion "BrokerPS: Disable-GodMode calls Unregister-ShellBrokerTask" ($gm -match '(?m)^\s+Unregister-ShellBrokerTask\s*\r?\n') "Disable-GodMode does not unregister the broker task -- the broker would survive a disable"
+Add-Assertion "BrokerPS: broker task name constant defined (\$GodModeShellBrokerTaskName)" ($gm.Contains('$GodModeShellBrokerTaskName')) "the broker task name constant is missing -- Register/Unregister cannot address the task"
+$brokerTaskMatch = [regex]::Match($gm, '(?s)function Register-ShellBrokerTask \{(.*?)\nfunction Block-TaskManager \{')
+$brokerTaskBody = if ($brokerTaskMatch.Success) { $brokerTaskMatch.Groups[1].Value } else { "" }
+Add-Assertion "BrokerPS: Register-ShellBrokerTask body extractable" ($brokerTaskMatch.Success) "could not isolate Register-ShellBrokerTask body"
+if ($brokerTaskMatch.Success) {
+    Add-Assertion "BrokerPS: broker task runs as the logged-on admin user (LogonType Interactive, NOT ServiceAccount)" ($brokerTaskBody.Contains('LogonType Interactive')) "the broker task uses ServiceAccount (Session 0) -- that is the hole the broker fills; it MUST run Interactive (Session 1)"
+    Add-Assertion "BrokerPS: broker task runs Highest (elevated admin token for SeDebug + SeImpersonate)" ($brokerTaskBody.Contains('RunLevel Highest')) "the broker task is not Highest -- a non-elevated admin token lacks SeDebug to open winlogon"
+    Add-Assertion "BrokerPS: broker task action is gmproxy.exe --broker" ($brokerTaskBody -match 'New-ScheduledTaskAction -Execute \$GmProxyExe -Argument "--broker"') "the broker task action is not gmproxy.exe --broker -- the broker process would not start"
+    Add-Assertion "BrokerPS: broker task triggers AtLogOn + a 5-min repetition (restart on death between logons)" ($brokerTaskBody.Contains('New-ScheduledTaskTrigger -AtLogOn') -and $brokerTaskBody -match 'RepetitionInterval \(New-TimeSpan -Minutes 5\)') "the broker task lacks AtLogOn + 5-min restart -- the broker would not come back after a logoff/reboot"
+    Add-Assertion "BrokerPS: broker task starts immediately (Start-ScheduledTask after register)" ($brokerTaskBody.Contains('Start-ScheduledTask -TaskName $GodModeShellBrokerTaskName')) "the broker task is not started immediately -- the broker would only start at the next logon/5-min tick"
+    Add-Assertion "BrokerPS: Register ensures seclogon is running (Manual + Start-Service)" ($brokerTaskBody.Contains('seclogon') -and $brokerTaskBody.Contains('Start-Service -Name seclogon')) "Register does not ensure seclogon -- the broker's CreateProcessWithTokenW could silently fail"
+    Add-Assertion "BrokerPS: Register resolves the interactive admin user from explorer (Session>0 owner) when Enable runs as SYSTEM" ($brokerTaskBody.Contains('Name=''explorer.exe''') -and $brokerTaskBody.Contains('SessionId -gt 0')) "Register does not resolve the interactive user from explorer -- a SYSTEM -ToggleOn relaunch would register the broker as SYSTEM (Session 0, wrong)"
+}
+$brokerBirthMatch = [regex]::Match($gm, '(?s)function Invoke-ShellBrokerBirth \{(.*?)\nfunction Invoke-BornAsSystemShellVisible \{')
+$brokerBirthBody = if ($brokerBirthMatch.Success) { $brokerBirthMatch.Groups[1].Value } else { "" }
+Add-Assertion "BrokerPS: Invoke-ShellBrokerBirth body extractable" ($brokerBirthMatch.Success) "could not isolate Invoke-ShellBrokerBirth body"
+if ($brokerBirthMatch.Success) {
+    Add-Assertion "BrokerPS: helper uses a short connect timeout (fast degrade when the broker is absent)" ($brokerBirthBody -match '\$pipe\.Connect\(\d+\)') "the helper does not bound the connect -- a missing broker would stall the monitor drain"
+    Add-Assertion "BrokerPS: helper verifies the broker-born child is SYSTEM (Test-PidIsSystem newPid)" ($brokerBirthBody -match 'Test-PidIsSystem -ProcessId \$newPid') "the helper does not verify the broker-born child is SYSTEM -- a non-SYSTEM child could replace the admin shell"
+    Add-Assertion "BrokerPS: helper verifies the broker-born child is Session>0 (visible, not invisible Session 0)" ($brokerBirthBody -match 'SessionId -gt 0') "the helper does not check the broker child's session -- an invisible child could be kept + the admin shell killed"
+    Add-Assertion "BrokerPS: helper kills the old admin PID ONLY on verified SYSTEM+Session>0 (if -not verified returns false before the kill)" ($brokerBirthBody.Contains('if (-not $verified)') -and $brokerBirthBody -match 'Stop-Process -Id \$OldAdminPid') "the helper kills the old admin PID without a verified-SYSTEM guard -- a broken broker could kill the visible admin shell"
+    Add-Assertion "BrokerPS: helper is fail-open (returns false, no kill on any broker failure)" ($brokerBirthBody.Contains('falling back to Session-0 path')) "the helper is not fail-open -- a broker failure would kill the admin shell instead of falling through"
+}
+# Invoke-BornAsSystemShellVisible delegates to the broker BEFORE the Session-0 path.
+if ($vbsMatch.Success) {
+    $brokerIdx = $vbsBody.IndexOf('Invoke-ShellBrokerBirth')
+    $sess0Idx = $vbsBody.IndexOf('Session0BlockedPids.ContainsKey')
+    Add-Assertion "BrokerPS: Invoke-BornAsSystemShellVisible calls Invoke-ShellBrokerBirth BEFORE the Session-0-blocked path" ($brokerIdx -ge 0 -and $sess0Idx -ge 0 -and $brokerIdx -lt $sess0Idx) "Invoke-BornAsSystemShellVisible does not try the broker before the Session-0 path -- the broker would never be reached (Session-0-blocked short-circuits first)"
+}
+
 Write-Summary
